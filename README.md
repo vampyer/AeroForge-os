@@ -38,7 +38,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`, a PCIe enumerator, then an **NVMe** driver in C++ (first storage target, needed for "reading files from a disk image") and an **xHCI** USB 3 driver with HID keyboard/mouse (real Ryzen boards have no PS/2).
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`, a PCIe enumerator, then an **NVMe** driver in C++ (first storage target, needed for "reading files from a disk image"), an **AHCI** driver for SATA drives, and an **xHCI** USB 3 driver with HID keyboard/mouse (real Ryzen boards have no PS/2).
 6. KASLR and SMEP/SMAP/UMIP hardening (Zen 2 and newer Ryzen CPUs support all three).
 
 ## Layout
