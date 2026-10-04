@@ -84,6 +84,20 @@ int32_t aero_nvme_init(const dhi_ops *ops, uint64_t bar0_phys, dhi_block_info *o
  * count * block_size must not exceed max_transfer. 0 = ok. */
 int32_t aero_nvme_read(int32_t ctrl, uint64_t lba, uint32_t count, uint64_t buf_phys);
 
+/* ---- AHCI (SATA) driver (drivers/ahci) ---- */
+
+/* Brings up the AHCI controller whose ABAR (BAR5) is at `abar_phys` and
+ * identifies every SATA disk on it. Fills up to `max` entries of `out` and
+ * returns how many disks were found (negative on controller error). Disk ids
+ * for aero_ahci_read are 0..n-1 across all controllers, in discovery order,
+ * starting at the value returned through `first_id`. */
+int32_t aero_ahci_init(const dhi_ops *ops, uint64_t abar_phys, dhi_block_info *out,
+                       int32_t max, int32_t *first_id);
+
+/* Reads `count` sectors starting at `lba` into the DMA buffer at `buf_phys`.
+ * count * block_size must not exceed max_transfer. 0 = ok. */
+int32_t aero_ahci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
 #ifdef __cplusplus
 }
 #endif

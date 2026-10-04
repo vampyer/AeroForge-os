@@ -6,7 +6,7 @@ A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Every CI run uploads the built ISO as a workflow artifact (Actions tab, "boot test" run, Artifacts).
 
-## What works today (milestone 0.3)
+## What works today (milestone 0.4)
 
 Boots on UEFI through Limine, brings up every CPU, and starts **aerosmss**, the first user
 process. aerosmss starts an `echod` service and three clients; the clients run in ring 3 on
@@ -15,6 +15,10 @@ different cores and do request/reply round trips with `echod` over IPC ports.
 Since 0.3 the list of programs aerosmss starts comes from `/system/session.cfg` on an NVMe
 disk: the kernel finds the NVMe controller on PCIe, brings it up through the C++ NVMe
 driver, reads the GPT partition table and mounts the FAT32 partition at `/`.
+
+Since 0.4 SATA drives work too: the C++ **AHCI** driver finds every ATA disk on the
+controller (CD/DVD drives are skipped), the kernel reads its MBR or GPT, and every further
+FAT32 volume is mounted at `/<device>`, for example `/sata0p1`.
 
 | Area | Status |
 |---|---|
@@ -28,11 +32,11 @@ driver, reads the GPT partition table and mounts the FAT32 partition at `/`.
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
-| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, and an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command) |
-| Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, mounted at `/`; `file_read` system call |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command) and an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) |
+| Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher` (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe disk image and checks every CPU, the mount, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and checks every CPU, both mounts, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -46,7 +50,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; an **AHCI** driver for SATA drives; an **xHCI** USB 3 driver with HID keyboard/mouse (real Ryzen boards have no PS/2).
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; AHCI interrupts, NCQ and writes; an **xHCI** USB 3 driver with HID keyboard/mouse (real Ryzen boards have no PS/2).
 6. Filesystems move to user-space servers behind IPC, as the design says; FAT32 writes, exFAT and NTFS (read-only on real drives at first).
 7. KASLR and SMEP/SMAP/UMIP hardening (Zen 2 and newer Ryzen CPUs support all three).
 
@@ -80,8 +84,10 @@ userland/                 user programs and libaero (Rust, no_std)
 drivers/include/dhi.h     the DHI contract (C ABI)
 drivers/ps2kbd/           PS/2 keyboard driver (C++)
 drivers/nvme/             NVMe driver (C++)
+drivers/ahci/             AHCI (SATA) driver (C++)
 tools/boot-test.sh        headless QEMU boot test
 tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/disk-files/
+tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 ```
 
 ## Building and running
@@ -100,7 +106,7 @@ Then:
 
 ```sh
 make                    # builds build/aeroforge.iso (fetches Limine binaries on first run)
-make disk               # (re)builds build/disk.img, attached to QEMU as an NVMe drive
+make disk               # (re)builds build/disk.img (NVMe drive) and build/sata.img (SATA drive)
 make run                # QEMU window; type into the AeroKernel shell
 make run-headless       # serial log on stdout, no window
 ./tools/boot-test.sh    # CI-style pass/fail boot

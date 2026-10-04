@@ -36,6 +36,7 @@ pub struct KeyEvent {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct BlockInfo {
     pub block_count: u64,
     pub block_size: u32,
@@ -62,6 +63,8 @@ extern "C" {
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
     pub fn aero_nvme_init(ops: *const DhiOps, bar0_phys: u64, out: *mut BlockInfo) -> i32;
     pub fn aero_nvme_read(ctrl: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
+    pub fn aero_ahci_init(ops: *const DhiOps, abar_phys: u64, out: *mut BlockInfo, max: i32, first_id: *mut i32) -> i32;
+    pub fn aero_ahci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
 }
 
 extern "C" fn dhi_log(msg: *const c_char) {

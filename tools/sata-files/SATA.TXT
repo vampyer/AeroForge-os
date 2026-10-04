@@ -1,0 +1,2 @@
+This file lives on the SATA test disk.
+AeroForge OS read it through the C++ AHCI driver.

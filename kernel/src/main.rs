@@ -173,16 +173,23 @@ extern "C" fn kmain() -> ! {
         Ok(n) => kok!("PCIe: {} function(s) found through ECAM", n),
         Err(e) => kprintln!("[WARN] PCIe: {}", e),
     }
-    let disks = block::probe_nvme();
+    let nvme = block::probe_nvme();
+    let sata = block::probe_ahci();
     for d in block::DEVICES.lock().iter() {
         console::print_colored(console::DIM, format_args!("       {}: {}\n", d.name(), d.describe()));
     }
-    if disks > 0 {
-        kok!("C++ NVMe driver attached through DHI v{}: {} controller(s)", dhi::ABI_VERSION, disks);
+    if nvme > 0 {
+        kok!("C++ NVMe driver attached through DHI v{}: {} controller(s)", dhi::ABI_VERSION, nvme);
     }
-    match vfs::mount_root() {
-        Some((dev, label)) => kok!("FAT32 volume \"{}\" on {} mounted at / (read-only)", label, dev),
-        None => kprintln!("[WARN] no FAT32 volume found, running without files"),
+    if sata > 0 {
+        kok!("C++ AHCI driver attached through DHI v{}: {} SATA disk(s)", dhi::ABI_VERSION, sata);
+    }
+    let mounts = vfs::mount_all();
+    for m in mounts {
+        kok!("FAT32 volume \"{}\" on {} mounted at {} (read-only)", m.vol.label, m.vol.dev.name(), m.path);
+    }
+    if mounts.is_empty() {
+        kprintln!("[WARN] no FAT32 volume found, running without files");
     }
 
     // ---- Scheduler ----
