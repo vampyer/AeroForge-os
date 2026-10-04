@@ -4,7 +4,7 @@
 
 A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C++
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
-[`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Prebuilt ISOs are attached to GitHub releases.
+[`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Every CI run uploads the built ISO as a workflow artifact (Actions tab, "boot test" run, Artifacts).
 
 ## What works today (milestone 0.3)
 
