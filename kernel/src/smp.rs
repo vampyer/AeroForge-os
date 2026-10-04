@@ -34,6 +34,7 @@ pub fn start_aps(mp: &MpResponse) -> u32 {
 
 extern "C" fn ap_entry(info: &MpInfo) -> ! {
     let index = info.extra_argument as usize;
+    crate::security::init_cpu(false);
     percpu::init_this_cpu(index, info.lapic_id);
     interrupts::load();
     sched::init_cpu();

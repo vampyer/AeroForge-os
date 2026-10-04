@@ -10,7 +10,7 @@ use core::sync::atomic::Ordering;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, console, memory, percpu, sched, vfs};
+use crate::{apic, console, percpu, sched, security, vfs};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -38,7 +38,6 @@ const E_INVAL: i64 = -6;
 const E_EXISTS: i64 = -7;
 
 const NO_HANDLE: u64 = u64::MAX;
-const USER_TOP: u64 = 0x0000_8000_0000_0000;
 
 /// Written to user memory by SYS_PORT_RECV.
 #[repr(C)]
@@ -48,30 +47,27 @@ struct RecvInfo {
     handle: u64,
 }
 
-/// Checks that [ptr, ptr+len) is mapped user memory in the current address space.
-fn user_range(ptr: u64, len: u64) -> Result<(), i64> {
-    let end = ptr.checked_add(len).ok_or(E_FAULT)?;
-    if end > USER_TOP {
-        return Err(E_FAULT);
-    }
-    let mut page = ptr & !(memory::PAGE_SIZE - 1);
-    while page < end {
-        memory::translate(page).ok_or(E_FAULT)?;
-        page += memory::PAGE_SIZE;
-    }
-    Ok(())
+// All user memory goes through security::copy_from_user / copy_to_user:
+// they check every page is mapped, user-accessible (and writable for
+// writes) and lift SMAP only for the copy itself.
+
+fn user_bytes(ptr: u64, len: u64) -> Result<Vec<u8>, i64> {
+    security::copy_from_user(ptr, len).ok_or(E_FAULT)
 }
 
-fn user_bytes<'a>(ptr: u64, len: u64) -> Result<&'a [u8], i64> {
-    user_range(ptr, len)?;
-    Ok(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
-}
-
-fn user_str<'a>(ptr: u64, len: u64) -> Result<&'a str, i64> {
+fn user_str(ptr: u64, len: u64) -> Result<String, i64> {
     if len > 255 {
         return Err(E_INVAL);
     }
-    core::str::from_utf8(user_bytes(ptr, len)?).map_err(|_| E_INVAL)
+    String::from_utf8(user_bytes(ptr, len)?).map_err(|_| E_INVAL)
+}
+
+fn check_writable(ptr: u64, len: u64) -> Result<(), i64> {
+    security::check_user(ptr, len, true).then_some(()).ok_or(E_FAULT)
+}
+
+fn to_user(ptr: u64, data: &[u8]) -> Result<(), i64> {
+    security::copy_to_user(ptr, data).then_some(()).ok_or(E_FAULT)
 }
 
 fn port_handle(proc_: &process::Process, h: u64, need: u32) -> Result<alloc::sync::Arc<Port>, i64> {
@@ -105,7 +101,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         }
         SYS_WRITE => {
             let bytes = user_bytes(a0, a1.min(4096))?;
-            let s = core::str::from_utf8(bytes).unwrap_or("<invalid utf-8>");
+            let s = core::str::from_utf8(&bytes).unwrap_or("<invalid utf-8>");
             crate::kprint!("{}", s);
             Ok(bytes.len() as u64)
         }
@@ -123,7 +119,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         SYS_UPTIME_MS => Ok(sched::ticks() * 1000 / apic::TIMER_HZ),
         SYS_SPAWN => {
             let name = user_str(a0, a1)?;
-            process::spawn(name, proc_.pid).map_err(|e| {
+            process::spawn(&name, proc_.pid).map_err(|e| {
                 console::print_colored(console::YELLOW, format_args!("[kernel] spawn {}: {}\n", name, e));
                 E_NOTFOUND
             })
@@ -136,15 +132,15 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             let port = port_handle(&proc_, a0, rights::RECV)?;
             let name = user_str(a1, a2)?;
             let mut names = NAMES.lock();
-            if names.contains_key(name) {
+            if names.contains_key(&name) {
                 return Err(E_EXISTS);
             }
-            names.insert(String::from(name), port);
+            names.insert(name, port);
             Ok(0)
         }
         SYS_PORT_LOOKUP => {
             let name = user_str(a0, a1)?;
-            let port = NAMES.lock().get(name).cloned().ok_or(E_NOTFOUND)?;
+            let port = NAMES.lock().get(&name).cloned().ok_or(E_NOTFOUND)?;
             // Looking a service up only ever grants the right to send to it.
             Ok(proc_.handles.lock().insert(Handle { object: Object::Port(port), rights: rights::SEND }))
         }
@@ -153,7 +149,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             if a2 as usize > MAX_MESSAGE {
                 return Err(E_INVAL);
             }
-            let data: Vec<u8> = user_bytes(a1, a2)?.to_vec();
+            let data: Vec<u8> = user_bytes(a1, a2)?;
             let moved = if a3 == NO_HANDLE {
                 None
             } else {
@@ -172,16 +168,21 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         }
         SYS_PORT_RECV => {
             let port = port_handle(&proc_, a0, rights::RECV)?;
-            user_range(a1, a2)?;
-            user_range(a3, core::mem::size_of::<RecvInfo>() as u64)?;
+            // Check both buffers before blocking, so a bad pointer can't lose a message.
+            check_writable(a1, a2)?;
+            check_writable(a3, core::mem::size_of::<RecvInfo>() as u64)?;
             let msg = port.recv();
             let n = msg.data.len().min(a2 as usize);
-            unsafe { core::ptr::copy_nonoverlapping(msg.data.as_ptr(), a1 as *mut u8, n) };
+            to_user(a1, &msg.data[..n])?;
             let handle = match msg.handle {
                 Some(h) => proc_.handles.lock().insert(h),
                 None => NO_HANDLE,
             };
-            unsafe { (a3 as *mut RecvInfo).write(RecvInfo { len: n as u64, sender_pid: msg.sender, handle }) };
+            let info = RecvInfo { len: n as u64, sender_pid: msg.sender, handle };
+            let raw = unsafe {
+                core::slice::from_raw_parts(&info as *const RecvInfo as *const u8, core::mem::size_of::<RecvInfo>())
+            };
+            to_user(a3, raw)?;
             Ok(n as u64)
         }
         SYS_HANDLE_DUP => {
@@ -198,9 +199,9 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         SYS_FILE_READ => {
             // Whole-file read into a user buffer; returns the bytes copied.
             let path = user_str(a0, a1)?;
-            user_range(a2, a3)?;
-            let data = vfs::read(path, a3 as usize).map_err(|_| E_NOTFOUND)?;
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), a2 as *mut u8, data.len()) };
+            check_writable(a2, a3)?;
+            let data = vfs::read(&path, a3 as usize).map_err(|_| E_NOTFOUND)?;
+            to_user(a2, &data)?;
             Ok(data.len() as u64)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),

@@ -150,6 +150,7 @@ pub fn load() {
 
 #[no_mangle]
 extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
+    crate::security::on_kernel_entry();
     let vector = frame.vector as u8;
     match vector {
         3 => {
@@ -178,6 +179,19 @@ extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
     }
 }
 
+/// Page-fault error code in words: what was attempted and why it failed.
+fn page_fault_reason(code: u64) -> &'static str {
+    let present = code & 1 != 0;
+    match (present, code & 2 != 0, code & 16 != 0) {
+        (true, _, true) => "execute in a no-execute page",
+        (true, true, false) => "write to a read-only page",
+        (true, false, false) => "access to a protected page",
+        (false, _, true) => "execute in an unmapped page",
+        (false, true, false) => "write to an unmapped page",
+        (false, false, false) => "read from an unmapped page",
+    }
+}
+
 fn exception(frame: &InterruptFrame) {
     let name = EXCEPTION_NAMES[frame.vector as usize];
     if frame.cs & 3 == 3 {
@@ -187,13 +201,23 @@ fn exception(frame: &InterruptFrame) {
         console::print_colored(console::RED, format_args!(
             "[kernel] {} (pid {}) killed: {} at rip {:#x}{}\n",
             pname, pid, name, frame.rip,
-            if frame.vector == 14 { alloc::format!(", address {:#x}", crate::arch::read_cr2()) } else { alloc::string::String::new() }
+            if frame.vector == 14 {
+                alloc::format!(", address {:#x} ({})", crate::arch::read_cr2(), page_fault_reason(frame.error_code))
+            } else {
+                alloc::string::String::new()
+            }
         ));
         if let Some(p) = t.process.as_ref() {
             p.exit_code.store(-(frame.vector as i64) - 1000, Ordering::SeqCst);
         }
         drop(t);
         sched::exit_current();
+    }
+    if frame.vector == 14 || frame.vector == 8 {
+        let addr = crate::arch::read_cr2();
+        if crate::kstack::is_guard(addr) {
+            panic!("kernel stack overflow: hit the guard page at {:#x}\n  rip {:#x}  rsp {:#x}", addr, frame.rip, frame.rsp);
+        }
     }
     if frame.vector == 14 {
         panic!(

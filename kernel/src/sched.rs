@@ -8,7 +8,6 @@
 //! - Every lock the scheduler touches is an `IrqMutex`, so code holding one
 //!   can never be preempted into a deadlock.
 
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -20,6 +19,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::interrupts::InterruptFrame;
 use crate::process::Process;
 use crate::sync::IrqMutex;
+use crate::kstack::KernelStack;
 use crate::{arch, gdt, memory, percpu};
 
 const KSTACK_SIZE: usize = 32 * 1024;
@@ -53,7 +53,7 @@ pub struct Thread {
     pub cpu: usize,
     state: AtomicU8,
     idle: bool,
-    kstack: Box<[u8]>,
+    kstack: KernelStack,
     saved_rsp: UnsafeCell<u64>,
     pml4: u64,
     wake_at: AtomicU64,
@@ -80,7 +80,7 @@ impl Thread {
     }
 
     fn kstack_top(&self) -> u64 {
-        (self.kstack.as_ptr() as u64 + self.kstack.len() as u64) & !0xF
+        self.kstack.top() & !0xF
     }
 
     pub fn pid(&self) -> u64 {
@@ -173,7 +173,7 @@ pub fn init_cpu() {
         cpu: cpu.index,
         state: AtomicU8::new(State::Running as u8),
         idle: true,
-        kstack: Box::new([]),
+        kstack: KernelStack::empty(),
         saved_rsp: UnsafeCell::new(0),
         pml4: memory::kernel_pml4(),
         wake_at: AtomicU64::new(0),
@@ -197,7 +197,7 @@ fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread
         cpu,
         state: AtomicU8::new(State::Ready as u8),
         idle: false,
-        kstack: alloc::vec![0u8; KSTACK_SIZE].into_boxed_slice(),
+        kstack: KernelStack::new(KSTACK_SIZE as u64).expect("out of memory for a kernel stack"),
         saved_rsp: UnsafeCell::new(0),
         pml4,
         wake_at: AtomicU64::new(0),

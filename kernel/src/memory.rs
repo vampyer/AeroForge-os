@@ -27,6 +27,7 @@ pub mod flags {
     pub const WRITE_THROUGH: u64 = 1 << 3;
     pub const NO_CACHE: u64 = 1 << 4;
     pub const HUGE: u64 = 1 << 7;
+    pub const NO_EXECUTE: u64 = 1 << 63;
 }
 use flags::*;
 
@@ -411,8 +412,108 @@ pub fn translate_in(pml4: u64, virt: u64) -> Option<u64> {
     Some(table_phys | (virt & 0xFFF))
 }
 
-pub fn translate(virt: u64) -> Option<u64> {
-    translate_in(arch::read_cr3() & ADDR_MASK, virt)
+/// Removes a 4 KiB mapping and returns the frame it pointed to.
+pub fn unmap_page(pml4: u64, virt: u64) -> Option<u64> {
+    let idx = indices(virt);
+    let mut table_phys = pml4;
+    for &i in &idx[..3] {
+        let e = table(table_phys)[i];
+        if e & PRESENT == 0 || e & HUGE != 0 {
+            return None;
+        }
+        table_phys = e & ADDR_MASK;
+    }
+    let pt = table(table_phys);
+    let e = pt[idx[3]];
+    if e & PRESENT == 0 {
+        return None;
+    }
+    pt[idx[3]] = 0;
+    unsafe { arch::invlpg(virt) };
+    Some(e & ADDR_MASK)
+}
+
+/// What a page allows once every level of the walk is taken into account.
+#[derive(Clone, Copy, Debug)]
+pub struct Access {
+    pub user: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// Effective access rights of the page holding `virt`, or None if unmapped.
+pub fn access_in(pml4: u64, virt: u64) -> Option<Access> {
+    let idx = indices(virt);
+    let mut table_phys = pml4;
+    let mut a = Access { user: true, writable: true, executable: true };
+    for (level, &i) in idx.iter().enumerate() {
+        let e = table(table_phys)[i];
+        if e & PRESENT == 0 {
+            return None;
+        }
+        a.user &= e & USER != 0;
+        a.writable &= e & WRITABLE != 0;
+        a.executable &= e & NO_EXECUTE == 0;
+        if level == 3 || (level > 0 && e & HUGE != 0) {
+            return Some(a);
+        }
+        table_phys = e & ADDR_MASK;
+    }
+    Some(a)
+}
+
+pub fn access(virt: u64) -> Option<Access> {
+    access_in(arch::read_cr3() & ADDR_MASK, virt)
+}
+
+/// Rewrites the permission bits of every 4 KiB page in [start, end) of the
+/// kernel's own mappings. Returns how many pages were changed; pages inside
+/// huge mappings are left alone and counted in the second value.
+pub fn protect_kernel_range(start: u64, end: u64, writable: bool, executable: bool) -> (usize, usize) {
+    let (mut done, mut huge) = (0, 0);
+    let mut v = start & !(PAGE_SIZE - 1);
+    while v < end {
+        let idx = indices(v);
+        let mut table_phys = kernel_pml4();
+        let mut leaf = None;
+        for (level, &i) in idx.iter().enumerate() {
+            let e = table(table_phys)[i];
+            if e & PRESENT == 0 {
+                break;
+            }
+            if level == 3 {
+                leaf = Some((table_phys, i));
+            } else if e & HUGE != 0 {
+                huge += 1;
+                break;
+            }
+            table_phys = e & ADDR_MASK;
+        }
+        if let Some((t, i)) = leaf {
+            let e = &mut table(t)[i];
+            *e = (*e & !(WRITABLE | NO_EXECUTE)) | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
+            unsafe { arch::invlpg(v) };
+            done += 1;
+        }
+        v += PAGE_SIZE;
+    }
+    (done, huge)
+}
+
+/// Sets NX on whole top-level slots of the kernel half: everything in the
+/// slot inherits it. Returns how many slots were marked.
+pub fn no_execute_kernel_slots(except: u64) -> usize {
+    let keep = indices(except)[0];
+    let pml4 = table(kernel_pml4());
+    let mut n = 0;
+    for (i, e) in pml4.iter_mut().enumerate().skip(256) {
+        if i != keep && *e & PRESENT != 0 && *e & NO_EXECUTE == 0 {
+            *e |= NO_EXECUTE;
+            n += 1;
+        }
+    }
+    unsafe { arch::write_cr3(arch::read_cr3()) };
+    n
 }
 
 /// Makes a physical range reachable through the HHDM (firmware tables and
@@ -431,10 +532,10 @@ fn map_physical_with(phys: u64, len: u64, flags: u64) -> u64 {
 }
 
 pub fn map_physical(phys: u64, len: u64) -> u64 {
-    map_physical_with(phys, len, 0)
+    map_physical_with(phys, len, NO_EXECUTE)
 }
 
 /// Uncached mapping for device registers.
 pub fn map_mmio(phys: u64, len: u64) -> u64 {
-    map_physical_with(phys, len, WRITABLE | NO_CACHE | WRITE_THROUGH)
+    map_physical_with(phys, len, WRITABLE | NO_CACHE | WRITE_THROUGH | NO_EXECUTE)
 }

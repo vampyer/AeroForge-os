@@ -3,6 +3,7 @@
 use crate::memory::{self, flags};
 
 const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -45,7 +46,11 @@ pub fn load(image: &[u8], pml4: u64) -> Result<u64, &'static str> {
             return Err("segment past end of file");
         }
 
-        let pte = flags::USER | if pflags & PF_W != 0 { flags::WRITABLE } else { 0 };
+        if pflags & PF_W != 0 && pflags & PF_X != 0 {
+            return Err("segment is both writable and executable (W^X)");
+        }
+        let nx = if pflags & PF_X == 0 && crate::security::nx_enabled() { flags::NO_EXECUTE } else { 0 };
+        let pte = flags::USER | nx | if pflags & PF_W != 0 { flags::WRITABLE } else { 0 };
         let start = vaddr & !(memory::PAGE_SIZE - 1);
         let end = (vaddr + memsz + memory::PAGE_SIZE - 1) & !(memory::PAGE_SIZE - 1);
         let mut page = start;
