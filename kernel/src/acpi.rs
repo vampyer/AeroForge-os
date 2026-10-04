@@ -43,6 +43,8 @@ pub struct AcpiInfo {
     pub ioapic_gsi_base: u32,
     /// ISA IRQ -> (global system interrupt, MPS INTI flags)
     pub overrides: Vec<(u8, u32, u16)>,
+    /// PCIe ECAM: (base address, first bus, last bus) for segment 0
+    pub ecam: Option<(u64, u8, u8)>,
 }
 
 pub static INFO: Mutex<Option<AcpiInfo>> = Mutex::new(None);
@@ -78,6 +80,7 @@ pub fn init(rsdp_addr: u64) -> Result<(), &'static str> {
         ioapic_address: 0,
         ioapic_gsi_base: 0,
         overrides: Vec::new(),
+        ecam: None,
     };
 
     unsafe {
@@ -91,6 +94,15 @@ pub fn init(rsdp_addr: u64) -> Result<(), &'static str> {
             info.tables.push(t.signature);
             if &t.signature == b"APIC" {
                 parse_madt(tv, t.length, &mut info);
+            }
+            if &t.signature == b"MCFG" && t.length as usize >= 36 + 8 + 16 {
+                // Header, 8 reserved bytes, then 16-byte allocation entries.
+                let e = tv + 44;
+                let base = read_unaligned(e as *const u64);
+                let segment = read_unaligned((e + 8) as *const u16);
+                if segment == 0 {
+                    info.ecam = Some((base, *((e + 10) as *const u8), *((e + 11) as *const u8)));
+                }
             }
         }
     }

@@ -4,11 +4,15 @@ A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`../AeroForge-OS-Design.md`](../AeroForge-OS-Design.md).
 
-## What works today (milestone 0.2)
+## What works today (milestone 0.3)
 
 Boots on UEFI through Limine, brings up every CPU, and starts **aerosmss**, the first user
 process. aerosmss starts an `echod` service and three clients; the clients run in ring 3 on
 different cores and do request/reply round trips with `echod` over IPC ports.
+
+Since 0.3 the list of programs aerosmss starts comes from `/system/session.cfg` on an NVMe
+disk: the kernel finds the NVMe controller on PCIe, brings it up through the C++ NVMe
+driver, reads the GPT partition table and mounts the FAT32 partition at `/`.
 
 | Area | Status |
 |---|---|
@@ -21,15 +25,17 @@ different cores and do request/reply round trips with `echod` over IPC ports.
 | Scheduler | Preemptive round robin with one run queue per CPU, idle thread per CPU, sleep, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
-| C++ drivers | PS/2 keyboard driver in freestanding C++20 behind `drivers/include/dhi.h` |
-| Userland | `libaero` system call library, `aerosmss`, `echod`, `client`, `crasher` (Rust, `no_std`) |
-| Shell | `ps`, `sched`, `run <prog>`, `ports`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless and checks every CPU and the whole IPC demo |
+| PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, and an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command) |
+| Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, mounted at `/`; `file_read` system call |
+| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher` (Rust, `no_std`) |
+| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
+| Test | `tools/boot-test.sh` boots headless with an NVMe disk image and checks every CPU, the mount, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
 `exit`, `write`, `yield`, `getpid`, `sleep_ms`, `cpu_id`, `uptime_ms`, `spawn`, `port_create`,
-`port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`.
+`port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`, `file_read`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1
@@ -38,8 +44,9 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`, a PCIe enumerator, then an **NVMe** driver in C++ (first storage target, needed for "reading files from a disk image"), an **AHCI** driver for SATA drives, and an **xHCI** USB 3 driver with HID keyboard/mouse (real Ryzen boards have no PS/2).
-6. KASLR and SMEP/SMAP/UMIP hardening (Zen 2 and newer Ryzen CPUs support all three).
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; an **AHCI** driver for SATA drives; an **xHCI** USB 3 driver with HID keyboard/mouse (real Ryzen boards have no PS/2).
+6. Filesystems move to user-space servers behind IPC, as the design says; FAT32 writes, exFAT and NTFS (read-only on real drives at first).
+7. KASLR and SMEP/SMAP/UMIP hardening (Zen 2 and newer Ryzen CPUs support all three).
 
 ## Layout
 
@@ -58,6 +65,8 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
   src/{process,elf}.rs    processes, handle tables, ELF loading
   src/{ipc,syscall}.rs    IPC ports, name service, system call table
   src/{acpi,smp}.rs       firmware tables, application processors
+  src/pci.rs              PCIe enumeration
+  src/{block,fat,vfs}.rs  block devices and partitions, FAT32, the mount at /
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
   src/{console,fb,serial}.rs    output: serial, framebuffer, desktop art
@@ -67,19 +76,21 @@ userland/                 user programs and libaero (Rust, no_std)
   src/bin/aerosmss.rs     session manager, first process
   src/bin/{echod,client,crasher}.rs   IPC demo service and clients, fault demo
 drivers/include/dhi.h     the DHI contract (C ABI)
-drivers/ps2kbd/           first C++ driver
+drivers/ps2kbd/           PS/2 keyboard driver (C++)
+drivers/nvme/             NVMe driver (C++)
 tools/boot-test.sh        headless QEMU boot test
+tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/disk-files/
 ```
 
 ## Building and running
 
 Requirements: Rust stable with the `x86_64-unknown-none` target, `clang++` and `llvm-ar`,
-`xorriso`, `git`, QEMU (`qemu-system-x86_64`) and OVMF UEFI firmware.
+`xorriso`, `git`, `gdisk`, `dosfstools`, `mtools`, QEMU (`qemu-system-x86_64`) and OVMF UEFI firmware.
 
 On Ubuntu/Debian:
 
 ```sh
-sudo apt install clang llvm lld xorriso qemu-system-x86 ovmf
+sudo apt install clang llvm lld xorriso gdisk dosfstools mtools qemu-system-x86 ovmf
 rustup target add x86_64-unknown-none
 ```
 
@@ -87,6 +98,7 @@ Then:
 
 ```sh
 make                    # builds build/aeroforge.iso (fetches Limine binaries on first run)
+make disk               # (re)builds build/disk.img, attached to QEMU as an NVMe drive
 make run                # QEMU window; type into the AeroKernel shell
 make run-headless       # serial log on stdout, no window
 ./tools/boot-test.sh    # CI-style pass/fail boot

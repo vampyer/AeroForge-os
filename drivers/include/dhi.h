@@ -19,7 +19,14 @@
 extern "C" {
 #endif
 
-#define DHI_ABI_VERSION 1u
+#define DHI_ABI_VERSION 2u
+
+/* A physically contiguous, kernel-owned buffer a device can DMA into. */
+typedef struct dhi_dma {
+    uint64_t phys;
+    void    *virt;
+    uint64_t size;
+} dhi_dma;
 
 /* Services the Rust kernel hands to every driver at init. */
 typedef struct dhi_ops {
@@ -28,6 +35,11 @@ typedef struct dhi_ops {
     void    (*log)(const char *msg);            /* NUL-terminated, kernel log */
     uint8_t (*port_in8)(uint16_t port);
     void    (*port_out8)(uint16_t port, uint8_t value);
+    /* ABI 2 */
+    int32_t (*dma_alloc)(uint64_t size, dhi_dma *out);  /* zeroed, page aligned; 0 = ok */
+    void    (*dma_free)(const dhi_dma *buf);
+    volatile void *(*map_mmio)(uint64_t phys, uint64_t size); /* uncached */
+    void    (*delay_us)(uint32_t us);
 } dhi_ops;
 
 /* Key event produced by input drivers. */
@@ -51,6 +63,26 @@ int32_t aero_ps2kbd_init(const dhi_ops *ops);
 /* Call from the IRQ1 handler. Returns 1 and fills `out` if a key event
  * was decoded, 0 if the byte was consumed without an event. */
 int32_t aero_ps2kbd_on_irq(dhi_key_event *out);
+
+/* ---- NVMe driver (drivers/nvme) ---- */
+
+typedef struct dhi_block_info {
+    uint64_t block_count;
+    uint32_t block_size;
+    uint32_t max_transfer;   /* bytes per read call */
+    char     model[41];
+    char     serial[21];
+    char     firmware[9];
+    uint8_t  _pad;
+} dhi_block_info;
+
+/* Brings up the controller at `bar0_phys` (bus mastering already enabled)
+ * and its first namespace. Returns a controller id >= 0, or a negative error. */
+int32_t aero_nvme_init(const dhi_ops *ops, uint64_t bar0_phys, dhi_block_info *out);
+
+/* Reads `count` blocks starting at `lba` into the DMA buffer at `buf_phys`.
+ * count * block_size must not exceed max_transfer. 0 = ok. */
+int32_t aero_nvme_read(int32_t ctrl, uint64_t lba, uint32_t count, uint64_t buf_phys);
 
 #ifdef __cplusplus
 }

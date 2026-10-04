@@ -1,0 +1,4 @@
+Welcome to AeroForge OS.
+
+This file has a long name with spaces, stored as VFAT long-file-name
+entries. Lookups are case-insensitive, the way Windows programs expect.

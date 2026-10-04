@@ -10,7 +10,7 @@ use core::sync::atomic::Ordering;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, console, memory, percpu, sched};
+use crate::{apic, console, memory, percpu, sched, vfs};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -27,6 +27,7 @@ pub const SYS_PORT_SEND: u64 = 11;
 pub const SYS_PORT_RECV: u64 = 12;
 pub const SYS_HANDLE_CLOSE: u64 = 13;
 pub const SYS_HANDLE_DUP: u64 = 14;
+pub const SYS_FILE_READ: u64 = 15;
 
 const E_BADHANDLE: i64 = -1;
 const E_FAULT: i64 = -2;
@@ -67,7 +68,7 @@ fn user_bytes<'a>(ptr: u64, len: u64) -> Result<&'a [u8], i64> {
 }
 
 fn user_str<'a>(ptr: u64, len: u64) -> Result<&'a str, i64> {
-    if len > 64 {
+    if len > 255 {
         return Err(E_INVAL);
     }
     core::str::from_utf8(user_bytes(ptr, len)?).map_err(|_| E_INVAL)
@@ -193,6 +194,14 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             }
             let dup = Handle { object: h.object.clone(), rights };
             Ok(table.insert(dup))
+        }
+        SYS_FILE_READ => {
+            // Whole-file read into a user buffer; returns the bytes copied.
+            let path = user_str(a0, a1)?;
+            user_range(a2, a3)?;
+            let data = vfs::read(path, a3 as usize).map_err(|_| E_NOTFOUND)?;
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), a2 as *mut u8, data.len()) };
+            Ok(data.len() as u64)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
         _ => Err(E_INVAL),

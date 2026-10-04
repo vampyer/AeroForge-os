@@ -8,9 +8,11 @@ extern crate alloc;
 mod acpi;
 mod apic;
 mod arch;
+mod block;
 mod console;
 mod dhi;
 mod elf;
+mod fat;
 mod fb;
 mod gdt;
 mod interrupts;
@@ -18,6 +20,7 @@ mod ipc;
 mod limine;
 mod memory;
 mod modules;
+mod pci;
 mod percpu;
 mod pic;
 mod process;
@@ -27,6 +30,7 @@ mod shell;
 mod smp;
 mod sync;
 mod syscall;
+mod vfs;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 
@@ -162,6 +166,23 @@ extern "C" fn kmain() -> ! {
         kok!("C++ PS/2 keyboard driver attached through DHI v{}, IRQ1 -> vector {}", dhi::ABI_VERSION, interrupts::VECTOR_KEYBOARD);
     } else {
         kprintln!("[WARN] PS/2 keyboard driver init failed ({})", rc);
+    }
+
+    // ---- PCIe and storage ----
+    match pci::init() {
+        Ok(n) => kok!("PCIe: {} function(s) found through ECAM", n),
+        Err(e) => kprintln!("[WARN] PCIe: {}", e),
+    }
+    let disks = block::probe_nvme();
+    for d in block::DEVICES.lock().iter() {
+        console::print_colored(console::DIM, format_args!("       {}: {}\n", d.name(), d.describe()));
+    }
+    if disks > 0 {
+        kok!("C++ NVMe driver attached through DHI v{}: {} controller(s)", dhi::ABI_VERSION, disks);
+    }
+    match vfs::mount_root() {
+        Some((dev, label)) => kok!("FAT32 volume \"{}\" on {} mounted at / (read-only)", label, dev),
+        None => kprintln!("[WARN] no FAT32 volume found, running without files"),
     }
 
     // ---- Scheduler ----

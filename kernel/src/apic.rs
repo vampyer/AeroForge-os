@@ -23,6 +23,7 @@ const REG_TIMER_DIVIDE: u64 = 0x3E0;
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 static TICKS_PER_PERIOD: AtomicU32 = AtomicU32::new(0);
+static TSC_PER_US: AtomicU64 = AtomicU64::new(1000);
 
 fn read(reg: u64) -> u32 {
     unsafe { ((LAPIC_BASE.load(Ordering::Relaxed) + reg) as *const u32).read_volatile() }
@@ -80,8 +81,10 @@ fn calibrate() -> u32 {
         outb(0x61, g);
         outb(0x61, g | 1);
         write(REG_TIMER_INITIAL, u32::MAX);
+        let tsc0 = arch::rdtsc();
         while inb(0x61) & 0x20 == 0 {}
         let elapsed = u32::MAX - read(REG_TIMER_CURRENT);
+        TSC_PER_US.store(((arch::rdtsc() - tsc0) / 10_000).max(1), Ordering::SeqCst);
         write(REG_TIMER_INITIAL, 0);
         elapsed
     }
@@ -149,4 +152,12 @@ pub fn route_isa_irq(irq: u8, vector: u8, lapic_id: u32) {
     }
     ioapic_write(0x10 + 2 * pin + 1, lapic_id << 24);
     ioapic_write(0x10 + 2 * pin, low);
+}
+
+/// Busy-waits using the TSC (calibrated against the PIT at boot).
+pub fn delay_us(us: u64) {
+    let end = arch::rdtsc() + us * TSC_PER_US.load(Ordering::Relaxed);
+    while arch::rdtsc() < end {
+        core::hint::spin_loop();
+    }
 }

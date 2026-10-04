@@ -5,7 +5,7 @@ use alloc::string::String;
 use core::sync::atomic::Ordering;
 
 use crate::console::{self, CYAN, YELLOW};
-use crate::{acpi, apic, arch, interrupts, ipc, kprint, kprintln, memory, modules, percpu, process, sched, smp};
+use crate::{acpi, apic, arch, block, interrupts, ipc, kprint, kprintln, memory, modules, pci, percpu, process, sched, smp, vfs};
 
 /// Kernel thread entry.
 pub fn run(_: u64) {
@@ -69,6 +69,11 @@ impl Shell {
                 kprintln!("  sched       per-CPU run queues and context switches");
                 kprintln!("  run <prog>  start a user program ({})", program_list());
                 kprintln!("  ports       published IPC ports");
+                kprintln!("  lspci       PCIe devices");
+                kprintln!("  disks       disks and partitions");
+                kprintln!("  ls [path]   list a directory on the mounted disk");
+                kprintln!("  cat <path>  print a text file");
+                kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
                 kprintln!("  mem         buddy allocator, slab heap and paging");
                 kprintln!("  cpu         processor and SMP status");
                 kprintln!("  acpi        firmware tables found");
@@ -77,7 +82,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.2, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.3, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
@@ -111,6 +116,50 @@ impl Shell {
                         name, port.id, port.sent.load(Ordering::Relaxed), port.queued());
                 }
             }
+            "lspci" => {
+                for d in pci::devices() {
+                    kprintln!("  {:02x}:{:02x}.{}  {:04x}:{:04x}  class {:02x}{:02x}{:02x}  {}",
+                        d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass, d.prog_if, d.kind());
+                }
+            }
+            "disks" => {
+                for d in block::DEVICES.lock().iter() {
+                    let root = if vfs::root_device() == Some(d.name()) { "  [mounted at /]" } else { "" };
+                    kprintln!("  {:<9} {}{}", d.name(), d.describe(), root);
+                }
+            }
+            "ls" => {
+                let path = if arg.is_empty() { "/" } else { arg };
+                match vfs::list(path) {
+                    Ok(entries) => {
+                        for e in entries {
+                            if e.is_dir {
+                                console::print_colored(CYAN, format_args!("  {:>9}  {}/\n", "<dir>", e.name));
+                            } else {
+                                kprintln!("  {:>9}  {}", e.size, e.name);
+                            }
+                        }
+                    }
+                    Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", path, e)),
+                }
+            }
+            "cat" => match vfs::read(arg, 16 * 1024) {
+                Ok(data) => {
+                    let text = core::str::from_utf8(&data).unwrap_or("<binary file>");
+                    for line in text.lines() {
+                        kprintln!("  {}", line);
+                    }
+                }
+                Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
+            },
+            "wc" => match vfs::read(arg, usize::MAX) {
+                Ok(data) => {
+                    let lines = data.iter().filter(|&&b| b == b'\n').count();
+                    let hash = data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+                    kprintln!("  {} bytes, {} lines, fnv1a {:016x}  {}", data.len(), lines, hash, arg);
+                }
+                Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
+            },
             "mem" => {
                 let (total, free) = {
                     let b = memory::BUDDY.lock();

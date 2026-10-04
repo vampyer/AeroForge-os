@@ -2,6 +2,7 @@
 #   make            build the UEFI boot ISO (build/aeroforge.iso)
 #   make run        boot it in QEMU with a window
 #   make run-headless   boot with serial on stdout, no display (CI)
+#   make disk       rebuild the NVMe disk image (build/disk.img)
 #   make clean
 
 LIMINE_BRANCH ?= v9.x-binary
@@ -17,7 +18,7 @@ PROGRAMS := aerosmss echod client crasher
 ISO    := $(BUILD)/aeroforge.iso
 LIMINE := $(BUILD)/limine
 
-.PHONY: all kernel userland iso run run-headless clean
+.PHONY: all kernel userland iso disk run run-headless clean
 all: iso
 
 kernel:
@@ -43,18 +44,26 @@ iso: kernel userland $(LIMINE)/BOOTX64.EFI
 		$(BUILD)/iso_root -o $(ISO) 2>/dev/null
 	@echo "Built $(ISO)"
 
+disk:
+	./tools/make-disk.sh
+
+$(BUILD)/disk.img:
+	./tools/make-disk.sh
+
 $(BUILD)/vars.fd:
 	mkdir -p $(BUILD)
 	cp $(OVMF_VARS) $@
 
 OVMF_ARGS = -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
             -drive if=pflash,format=raw,file=$(BUILD)/vars.fd
+NVME_ARGS = -drive file=$(BUILD)/disk.img,if=none,id=nvm,format=raw \
+            -device nvme,serial=AERO0001,drive=nvm
 
-run: iso $(BUILD)/vars.fd
-	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) -cdrom $(ISO) -serial stdio
+run: iso $(BUILD)/vars.fd $(BUILD)/disk.img
+	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio
 
-run-headless: iso $(BUILD)/vars.fd
-	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) -cdrom $(ISO) -serial stdio -display none
+run-headless: iso $(BUILD)/vars.fd $(BUILD)/disk.img
+	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio -display none
 
 clean:
 	rm -rf $(BUILD)

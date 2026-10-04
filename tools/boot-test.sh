@@ -11,12 +11,14 @@ TIMEOUT=${TIMEOUT:-120}
 LOG=build/boot-test.log
 
 make iso >/dev/null
+./tools/make-disk.sh >/dev/null
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG"
 
 qemu-system-x86_64 -M q35 -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file=build/test-vars.fd \
+    -drive file=build/disk.img,if=none,id=nvm,format=raw -device nvme,serial=AERO0001,drive=nvm \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none &
 QEMU_PID=$!
 trap 'kill $QEMU_PID 2>/dev/null || true' EXIT
@@ -30,7 +32,9 @@ for _ in $(seq "$TIMEOUT"); do
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { echo "FAIL: not all CPUs came online"; exit 1; }
         grep -q "\[aerosmss\] all services up" "$LOG" || { echo "FAIL: aerosmss did not finish startup"; exit 1; }
-        echo "PASS: AeroKernel booted, user processes completed IPC round trips"; exit 0
+        grep -q "mounted at /" "$LOG" || { echo "FAIL: NVMe FAT32 volume not mounted"; exit 1; }
+        grep -q "read /system/session.cfg" "$LOG" || { echo "FAIL: aerosmss did not read its config from disk"; exit 1; }
+        echo "PASS: booted, mounted the NVMe disk, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

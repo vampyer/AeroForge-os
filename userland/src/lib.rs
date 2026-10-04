@@ -22,6 +22,7 @@ pub mod sys {
     pub const PORT_RECV: u64 = 12;
     pub const HANDLE_CLOSE: u64 = 13;
     pub const HANDLE_DUP: u64 = 14;
+    pub const FILE_READ: u64 = 15;
 }
 
 pub mod rights {
@@ -74,6 +75,14 @@ pub fn uptime_ms() -> u64 {
 
 pub fn spawn(program: &str) -> Result<u64, i64> {
     check(unsafe { syscall(sys::SPAWN, program.as_ptr() as u64, program.len() as u64, 0, 0) })
+}
+
+/// Reads a whole file (up to `buf.len()` bytes) from the mounted disk.
+pub fn read_file(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
+    check(unsafe {
+        syscall(sys::FILE_READ, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    })
+    .map(|n| n as usize)
 }
 
 /// A handle to a kernel object, closed when dropped.
