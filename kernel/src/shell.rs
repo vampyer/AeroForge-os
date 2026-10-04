@@ -82,7 +82,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.3, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.4, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
@@ -124,8 +124,10 @@ impl Shell {
             }
             "disks" => {
                 for d in block::DEVICES.lock().iter() {
-                    let root = if vfs::root_device() == Some(d.name()) { "  [mounted at /]" } else { "" };
-                    kprintln!("  {:<9} {}{}", d.name(), d.describe(), root);
+                    match vfs::mount_point_of(d.name()) {
+                        Some(at) => kprintln!("  {:<9} {}  [mounted at {}]", d.name(), d.describe(), at),
+                        None => kprintln!("  {:<9} {}", d.name(), d.describe()),
+                    }
                 }
             }
             "ls" => {

@@ -29,6 +29,13 @@ pub struct DirEntry {
     cluster: u32,
 }
 
+impl DirEntry {
+    /// A directory entry standing for another volume's mount point.
+    pub fn mount_point(name: &str) -> Self {
+        Self { name: String::from(name), is_dir: true, size: 0, cluster: 0 }
+    }
+}
+
 const END_OF_CHAIN: u32 = 0x0FFF_FFF8;
 
 impl FatVolume {

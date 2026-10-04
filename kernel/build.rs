@@ -3,7 +3,7 @@
 
 use std::{env, path::PathBuf, process::Command};
 
-const CXX_DRIVERS: &[&str] = &["ps2kbd/ps2kbd.cpp", "nvme/nvme.cpp"];
+const CXX_DRIVERS: &[&str] = &["ps2kbd/ps2kbd.cpp", "nvme/nvme.cpp", "ahci/ahci.cpp"];
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

@@ -20,11 +20,19 @@ pub trait BlockDevice: Send + Sync {
 
 pub static DEVICES: IrqMutex<Vec<Arc<dyn BlockDevice>>> = IrqMutex::new(Vec::new());
 
-// ------------------------------------------------------------------- NVMe
+// ------------------------------------------------------ driver-backed disks
 
-pub struct Nvme {
+/// Which C++ driver (and which of its disks) backs a `DriverDisk`.
+#[derive(Clone, Copy)]
+enum Backend {
+    Nvme(i32),
+    Ahci(i32),
+}
+
+/// A whole disk served by one of the C++ storage drivers.
+pub struct DriverDisk {
     name: String,
-    ctrl: i32,
+    backend: Backend,
     block_size: u32,
     block_count: u64,
     max_transfer: u32,
@@ -33,10 +41,10 @@ pub struct Nvme {
     bounce: IrqMutex<DmaBuf>,
 }
 
-unsafe impl Send for Nvme {}
-unsafe impl Sync for Nvme {}
+unsafe impl Send for DriverDisk {}
+unsafe impl Sync for DriverDisk {}
 
-impl BlockDevice for Nvme {
+impl BlockDevice for DriverDisk {
     fn name(&self) -> &str {
         &self.name
     }
@@ -52,8 +60,14 @@ impl BlockDevice for Nvme {
         let bounce = self.bounce.lock();
         for chunk in buf.chunks_mut(self.max_transfer as usize) {
             let blocks = (chunk.len() / bs) as u32;
-            if unsafe { dhi::aero_nvme_read(self.ctrl, lba, blocks, bounce.phys) } != 0 {
-                return Err("NVMe read failed");
+            let rc = unsafe {
+                match self.backend {
+                    Backend::Nvme(c) => dhi::aero_nvme_read(c, lba, blocks, bounce.phys),
+                    Backend::Ahci(d) => dhi::aero_ahci_read(d, lba, blocks, bounce.phys),
+                }
+            };
+            if rc != 0 {
+                return Err("disk read failed");
             }
             unsafe { core::ptr::copy_nonoverlapping(bounce.virt, chunk.as_mut_ptr(), chunk.len()) };
             lba += blocks as u64;
@@ -61,10 +75,32 @@ impl BlockDevice for Nvme {
         Ok(())
     }
     fn describe(&self) -> String {
-        format!("{} sectors x {} B = {} MiB, NVMe \"{}\" serial {}",
+        let bus = match self.backend {
+            Backend::Nvme(_) => "NVMe",
+            Backend::Ahci(_) => "SATA",
+        };
+        format!("{} sectors x {} B = {} MiB, {} \"{}\" serial {}",
             self.block_count, self.block_size, self.block_count * self.block_size as u64 / (1024 * 1024),
-            self.model, self.serial)
+            bus, self.model, self.serial)
     }
+}
+
+fn add_disk(name: String, backend: Backend, info: &BlockInfo) -> bool {
+    let mut bounce = DmaBuf { phys: 0, virt: core::ptr::null_mut(), size: 0 };
+    if (dhi::OPS.dma_alloc)(info.max_transfer as u64, &mut bounce) != 0 {
+        return false;
+    }
+    register_with_partitions(Arc::new(DriverDisk {
+        name,
+        backend,
+        block_size: info.block_size,
+        block_count: info.block_count,
+        max_transfer: info.max_transfer,
+        model: String::from(dhi::c_field(&info.model)),
+        serial: String::from(dhi::c_field(&info.serial)),
+        bounce: IrqMutex::new(bounce),
+    }));
+    true
 }
 
 /// Finds NVMe controllers on PCIe and brings each one up through the C++ driver.
@@ -79,22 +115,33 @@ pub fn probe_nvme() -> usize {
             console::print_colored(console::YELLOW, format_args!("[WARN] NVMe at {:02x}:{:02x}.{}: init failed ({})\n", dev.bus, dev.dev, dev.func, ctrl));
             continue;
         }
-        let mut bounce = DmaBuf { phys: 0, virt: core::ptr::null_mut(), size: 0 };
-        if (dhi::OPS.dma_alloc)(info.max_transfer as u64, &mut bounce) != 0 {
+        if add_disk(format!("nvme{}", ctrl), Backend::Nvme(ctrl), &info) {
+            found += 1;
+        }
+    }
+    found
+}
+
+/// Finds AHCI (SATA) controllers and registers every ATA disk attached to them.
+pub fn probe_ahci() -> usize {
+    const MAX: usize = 8;
+    let mut found = 0;
+    for dev in pci::devices().iter().filter(|d| d.class == 0x01 && d.subclass == 0x06 && d.prog_if == 0x01) {
+        let Some(abar) = dev.bar(5) else { continue };
+        dev.enable_mmio_and_dma();
+        let mut infos = [BlockInfo::zeroed(); MAX];
+        let mut first = 0i32;
+        let n = unsafe { dhi::aero_ahci_init(&dhi::OPS, abar, infos.as_mut_ptr(), MAX as i32, &mut first) };
+        if n < 0 {
+            console::print_colored(console::YELLOW, format_args!("[WARN] AHCI at {:02x}:{:02x}.{}: init failed ({})\n", dev.bus, dev.dev, dev.func, n));
             continue;
         }
-        let nvme: Arc<dyn BlockDevice> = Arc::new(Nvme {
-            name: format!("nvme{}", ctrl),
-            ctrl,
-            block_size: info.block_size,
-            block_count: info.block_count,
-            max_transfer: info.max_transfer,
-            model: String::from(dhi::c_field(&info.model)),
-            serial: String::from(dhi::c_field(&info.serial)),
-            bounce: IrqMutex::new(bounce),
-        });
-        register_with_partitions(nvme);
-        found += 1;
+        for (i, info) in infos.iter().take(n as usize).enumerate() {
+            let id = first + i as i32;
+            if add_disk(format!("sata{}", id), Backend::Ahci(id), info) {
+                found += 1;
+            }
+        }
     }
     found
 }

@@ -2,7 +2,7 @@
 #   make            build the UEFI boot ISO (build/aeroforge.iso)
 #   make run        boot it in QEMU with a window
 #   make run-headless   boot with serial on stdout, no display (CI)
-#   make disk       rebuild the NVMe disk image (build/disk.img)
+#   make disk       rebuild the NVMe and SATA disk images (build/disk.img, build/sata.img)
 #   make clean
 
 LIMINE_BRANCH ?= v9.x-binary
@@ -46,9 +46,13 @@ iso: kernel userland $(LIMINE)/BOOTX64.EFI
 
 disk:
 	./tools/make-disk.sh
+	./tools/make-sata-disk.sh
 
 $(BUILD)/disk.img:
 	./tools/make-disk.sh
+
+$(BUILD)/sata.img:
+	./tools/make-sata-disk.sh
 
 $(BUILD)/vars.fd:
 	mkdir -p $(BUILD)
@@ -57,12 +61,14 @@ $(BUILD)/vars.fd:
 OVMF_ARGS = -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
             -drive if=pflash,format=raw,file=$(BUILD)/vars.fd
 NVME_ARGS = -drive file=$(BUILD)/disk.img,if=none,id=nvm,format=raw \
-            -device nvme,serial=AERO0001,drive=nvm
+            -device nvme,serial=AERO0001,drive=nvm \
+            -drive file=$(BUILD)/sata.img,if=none,id=sata,format=raw \
+            -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1
 
-run: iso $(BUILD)/vars.fd $(BUILD)/disk.img
+run: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img
 	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio
 
-run-headless: iso $(BUILD)/vars.fd $(BUILD)/disk.img
+run-headless: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img
 	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio -display none
 
 clean:
