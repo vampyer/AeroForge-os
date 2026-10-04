@@ -1,5 +1,5 @@
 /*
- * AeroForge Driver Host Interface (DHI), ABI version 1.
+ * AeroForge Driver Host Interface (DHI), ABI version 2.
  *
  * The one boundary between the Rust kernel core and C++ drivers.
  * Rules (design doc section 1.3):
@@ -97,6 +97,41 @@ int32_t aero_ahci_init(const dhi_ops *ops, uint64_t abar_phys, dhi_block_info *o
 /* Reads `count` sectors starting at `lba` into the DMA buffer at `buf_phys`.
  * count * block_size must not exceed max_transfer. 0 = ok. */
 int32_t aero_ahci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
+/* ---- xHCI (USB 3) driver (drivers/xhci) ---- */
+
+#define DHI_INPUT_KEY   1u
+#define DHI_INPUT_MOUSE 2u
+
+/* One input event from a USB HID device. For keys, key.scancode holds the
+ * HID usage id (keyboard page), not a PS/2 scancode. */
+typedef struct dhi_input_event {
+    uint8_t  kind;      /* DHI_INPUT_* */
+    uint8_t  buttons;   /* mouse: bit 0 left, 1 right, 2 middle */
+    int16_t  dx, dy;    /* mouse: relative motion */
+    uint16_t _pad;
+    dhi_key_event key;  /* keyboard: press events only */
+} dhi_input_event;
+
+/* What the driver learned about one USB device. */
+typedef struct dhi_usb_device {
+    uint16_t vendor, product;
+    uint8_t  port, speed, slot, dev_class;   /* speed: 1 FS, 2 LS, 3 HS, 4 SS, 5 SS+ */
+    uint8_t  iface_class, iface_subclass, iface_protocol, _pad;
+    char     name[32];                       /* product string, ASCII */
+} dhi_usb_device;
+
+/* Resets the controller whose registers (BAR0) are at `mmio_phys`, enumerates
+ * the devices on its root ports and starts HID boot keyboards and mice.
+ * Returns a controller id >= 0 and the device count through `devices`. */
+int32_t aero_xhci_init(const dhi_ops *ops, uint64_t mmio_phys, int32_t *devices);
+
+/* Drains the controller's event ring. Fills up to `max` input events and
+ * returns how many. Call regularly (the driver polls; no interrupts yet). */
+int32_t aero_xhci_poll(int32_t ctrl, dhi_input_event *out, int32_t max);
+
+/* Describes device `index` (0..devices-1) of a controller. 0 = ok. */
+int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device *out);
 
 #ifdef __cplusplus
 }

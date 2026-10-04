@@ -5,7 +5,7 @@ use alloc::string::String;
 use core::sync::atomic::Ordering;
 
 use crate::console::{self, CYAN, YELLOW};
-use crate::{acpi, apic, arch, block, interrupts, ipc, kprint, kprintln, memory, modules, pci, percpu, process, sched, smp, vfs};
+use crate::{acpi, apic, arch, block, dhi, interrupts, ipc, kprint, kprintln, memory, modules, pci, percpu, process, sched, smp, usb, vfs};
 
 /// Kernel thread entry.
 pub fn run(_: u64) {
@@ -70,6 +70,8 @@ impl Shell {
                 kprintln!("  run <prog>  start a user program ({})", program_list());
                 kprintln!("  ports       published IPC ports");
                 kprintln!("  lspci       PCIe devices");
+                kprintln!("  lsusb       USB controllers and devices");
+                kprintln!("  mouse       USB mouse pointer position and buttons");
                 kprintln!("  disks       disks and partitions");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
@@ -82,7 +84,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.4, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.5, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
@@ -121,6 +123,28 @@ impl Shell {
                     kprintln!("  {:02x}:{:02x}.{}  {:04x}:{:04x}  class {:02x}{:02x}{:02x}  {}",
                         d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass, d.prog_if, d.kind());
                 }
+            }
+            "lsusb" => {
+                let ctrls = usb::CONTROLLERS.lock();
+                if ctrls.is_empty() {
+                    kprintln!("  no USB controllers");
+                }
+                for c in ctrls.iter() {
+                    kprintln!("  xHCI controller {} at {}: {} device(s)", c.id, c.location, c.devices.len());
+                    for d in &c.devices {
+                        kprintln!("    port {:<2} slot {:<2} {:04x}:{:04x}  {:<9} {:<13} {}",
+                            d.port, d.slot, d.vendor, d.product, usb::speed_name(d.speed), usb::class_name(d),
+                            dhi::c_field(&d.name));
+                    }
+                }
+            }
+            "mouse" => {
+                use core::sync::atomic::Ordering::Relaxed;
+                let b = usb::MOUSE_BUTTONS.load(Relaxed);
+                kprintln!("  pointer at ({}, {}), buttons [{}{}{}], {} mouse report(s), {} USB key report(s)",
+                    usb::MOUSE_X.load(Relaxed), usb::MOUSE_Y.load(Relaxed),
+                    if b & 1 != 0 { 'L' } else { '-' }, if b & 4 != 0 { 'M' } else { '-' }, if b & 2 != 0 { 'R' } else { '-' },
+                    usb::MOUSE_EVENTS.load(Relaxed), usb::KEY_EVENTS.load(Relaxed));
             }
             "disks" => {
                 for d in block::DEVICES.lock().iter() {

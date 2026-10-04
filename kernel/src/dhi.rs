@@ -58,6 +58,43 @@ pub fn c_field(bytes: &[u8]) -> &str {
     core::str::from_utf8(&bytes[..end]).unwrap_or("?").trim()
 }
 
+pub const INPUT_KEY: u8 = 1;
+pub const INPUT_MOUSE: u8 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct InputEvent {
+    pub kind: u8,
+    pub buttons: u8,
+    pub dx: i16,
+    pub dy: i16,
+    pub _pad: u16,
+    pub key: KeyEvent,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UsbDevice {
+    pub vendor: u16,
+    pub product: u16,
+    pub port: u8,
+    pub speed: u8,
+    pub slot: u8,
+    pub dev_class: u8,
+    pub iface_class: u8,
+    pub iface_subclass: u8,
+    pub iface_protocol: u8,
+    pub _pad: u8,
+    pub name: [u8; 32],
+}
+
+impl UsbDevice {
+    pub const fn zeroed() -> Self {
+        Self { vendor: 0, product: 0, port: 0, speed: 0, slot: 0, dev_class: 0, iface_class: 0,
+            iface_subclass: 0, iface_protocol: 0, _pad: 0, name: [0; 32] }
+    }
+}
+
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
@@ -65,6 +102,9 @@ extern "C" {
     pub fn aero_nvme_read(ctrl: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_ahci_init(ops: *const DhiOps, abar_phys: u64, out: *mut BlockInfo, max: i32, first_id: *mut i32) -> i32;
     pub fn aero_ahci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
+    pub fn aero_xhci_init(ops: *const DhiOps, mmio_phys: u64, devices: *mut i32) -> i32;
+    pub fn aero_xhci_poll(ctrl: i32, out: *mut InputEvent, max: i32) -> i32;
+    pub fn aero_xhci_device(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
 }
 
 extern "C" fn dhi_log(msg: *const c_char) {

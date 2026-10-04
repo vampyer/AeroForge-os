@@ -104,7 +104,7 @@ static KEYS: KeyQueue = KeyQueue {
     tail: AtomicUsize::new(0),
 };
 
-fn push_key(c: u8) {
+pub fn push_key(c: u8) {
     let head = KEYS.head.load(Ordering::Relaxed);
     let next = (head + 1) % 256;
     if next != KEYS.tail.load(Ordering::Acquire) {
