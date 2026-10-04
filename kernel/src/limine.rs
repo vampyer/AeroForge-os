@@ -174,3 +174,27 @@ pub fn cstr(p: *const u8) -> &'static str {
         core::str::from_utf8(core::slice::from_raw_parts(p, len)).unwrap_or("?")
     }
 }
+
+pub const MODULE: [u64; 4] = id(0x3e7e279702be32af, 0xca1c4f3bd1280cee);
+
+#[repr(C)]
+pub struct File {
+    pub revision: u64,
+    pub address: *const u8,
+    pub size: u64,
+    pub path: *const u8,
+    pub string: *const u8,
+}
+
+#[repr(C)]
+pub struct ModuleResponse {
+    pub revision: u64,
+    pub count: u64,
+    pub modules: *const *const File,
+}
+
+impl ModuleResponse {
+    pub fn files(&self) -> impl Iterator<Item = &'static File> + '_ {
+        (0..self.count as usize).map(move |i| unsafe { &**self.modules.add(i) })
+    }
+}

@@ -12,23 +12,29 @@ QEMU_FLAGS    ?= -M q35 -m 512M -smp 4 -no-reboot -no-shutdown
 
 BUILD  := build
 KERNEL := kernel/target/x86_64-unknown-none/release/aerokernel
+USERBIN := userland/target/x86_64-unknown-none/release
+PROGRAMS := aerosmss echod client crasher
 ISO    := $(BUILD)/aeroforge.iso
 LIMINE := $(BUILD)/limine
 
-.PHONY: all kernel iso run run-headless clean
+.PHONY: all kernel userland iso run run-headless clean
 all: iso
 
 kernel:
 	cd kernel && cargo build --release
 
+userland:
+	cd userland && cargo build --release
+
 $(LIMINE)/BOOTX64.EFI:
 	rm -rf $(LIMINE)
 	git clone --depth 1 --branch $(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git $(LIMINE)
 
-iso: kernel $(LIMINE)/BOOTX64.EFI
+iso: kernel userland $(LIMINE)/BOOTX64.EFI
 	rm -rf $(BUILD)/iso_root
-	mkdir -p $(BUILD)/iso_root/boot/limine $(BUILD)/iso_root/EFI/BOOT
+	mkdir -p $(BUILD)/iso_root/boot/limine $(BUILD)/iso_root/boot/bin $(BUILD)/iso_root/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso_root/boot/aerokernel
+	for p in $(PROGRAMS); do cp $(USERBIN)/$$p $(BUILD)/iso_root/boot/bin/; done
 	cp boot/limine.conf $(LIMINE)/limine-uefi-cd.bin $(BUILD)/iso_root/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(BUILD)/iso_root/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J \
@@ -53,3 +59,4 @@ run-headless: iso $(BUILD)/vars.fd
 clean:
 	rm -rf $(BUILD)
 	cd kernel && cargo clean
+	cd userland && cargo clean

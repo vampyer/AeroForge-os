@@ -6,20 +6,30 @@
 extern crate alloc;
 
 mod acpi;
+mod apic;
 mod arch;
 mod console;
 mod dhi;
+mod elf;
 mod fb;
 mod gdt;
 mod interrupts;
+mod ipc;
 mod limine;
 mod memory;
+mod modules;
+mod percpu;
 mod pic;
+mod process;
+mod sched;
 mod serial;
 mod shell;
 mod smp;
+mod sync;
+mod syscall;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 
@@ -64,6 +74,10 @@ static RSDP_REQ: Request<RsdpResponse> = Request::new(limine::RSDP);
 static KERNEL_ADDR_REQ: Request<ExecutableAddressResponse> = Request::new(limine::EXECUTABLE_ADDRESS);
 
 #[used]
+#[link_section = ".limine_requests"]
+static MODULE_REQ: Request<ModuleResponse> = Request::new(limine::MODULE);
+
+#[used]
 #[link_section = ".limine_requests_end"]
 static REQUESTS_END_MARKER: [u64; 2] = limine::REQUESTS_END;
 
@@ -98,32 +112,29 @@ extern "C" fn kmain() -> ! {
     }
     kok!("Serial console on COM1 (115200 8N1)");
 
-    gdt::init();
-    kok!("GDT loaded, TSS with double-fault IST stack");
-
-    interrupts::init();
-    kok!("IDT loaded: 32 exception vectors + 16 IRQ vectors");
-    unsafe { core::arch::asm!("int3") };
-    if interrupts::BREAKPOINTS.load(Ordering::Relaxed) == 1 {
-        kok!("Exception path verified (breakpoint handled, execution resumed)");
-    }
-
-    // ---- Memory ----
+    // ---- Memory: everything after this may allocate ----
     let hhdm = HHDM_REQ.response().expect("no HHDM response").offset;
     let memmap = MEMMAP_REQ.response().expect("no memory map");
-    let report = memory::init_frames(hhdm, memmap);
-    kok!("Physical memory: {} MiB usable in {} regions ({} map entries)",
-        report.usable_bytes / (1024 * 1024), report.regions, memmap.count);
+    let report = memory::init(hhdm, memmap);
+    kok!("Buddy page allocator: {} MiB usable in {} regions ({} KiB metadata)",
+        report.usable_bytes / (1024 * 1024), report.regions, report.meta_bytes / 1024);
     if let Some(k) = KERNEL_ADDR_REQ.response() {
         console::print_colored(console::DIM, format_args!(
             "       kernel image at phys {:#x} -> virt {:#x}\n", k.physical_base, k.virtual_base));
     }
-
-    match memory::init_heap() {
-        Ok(()) => kok!("Paging: mapped {} KiB kernel heap at {:#x}", memory::HEAP_SIZE / 1024, memory::HEAP_START),
-        Err(e) => panic!("heap setup failed: {}", e),
-    }
     heap_self_test();
+
+    // ---- CPU tables ----
+    let bsp_lapic = MP_REQ.response().map_or(0, |m| m.bsp_lapic_id);
+    percpu::init_this_cpu(0, bsp_lapic);
+    kok!("Per-CPU data via GS, GDT with ring-3 segments, TSS with double-fault IST");
+
+    interrupts::init();
+    kok!("IDT loaded: 256 vectors, syscall gate int 0x80 open to ring 3");
+    unsafe { core::arch::asm!("int3") };
+    if interrupts::BREAKPOINTS.load(Ordering::Relaxed) == 1 {
+        kok!("Exception path verified (breakpoint handled, execution resumed)");
+    }
 
     // ---- Firmware ----
     match RSDP_REQ.response().map(|r| acpi::init(r.address)) {
@@ -138,52 +149,55 @@ extern "C" fn kmain() -> ! {
         None => kprintln!("[WARN] ACPI: no RSDP from bootloader"),
     }
 
-    // ---- Interrupt sources and the first C++ driver ----
-    pic::init(&[0, 1]);
-    pic::init_timer();
-    kok!("PIC remapped to vectors 32-47, PIT timer at {} Hz", pic::TIMER_HZ);
-
+    // ---- Interrupt controllers, timer, first C++ driver ----
+    let khz = apic::init_bsp();
+    kok!("Local APIC enabled, 8259 PIC masked, timer calibrated against the PIT ({} MHz bus clock)", khz);
+    match apic::init_ioapic() {
+        Ok(pins) => kok!("I/O APIC: {} redirection entries", pins),
+        Err(e) => panic!("I/O APIC: {}", e),
+    }
     let rc = unsafe { dhi::aero_ps2kbd_init(&dhi::OPS) };
     if rc == 0 {
-        kok!("C++ PS/2 keyboard driver attached through DHI v{}", dhi::ABI_VERSION);
+        apic::route_isa_irq(1, interrupts::VECTOR_KEYBOARD, bsp_lapic);
+        kok!("C++ PS/2 keyboard driver attached through DHI v{}, IRQ1 -> vector {}", dhi::ABI_VERSION, interrupts::VECTOR_KEYBOARD);
     } else {
         kprintln!("[WARN] PS/2 keyboard driver init failed ({})", rc);
     }
 
+    // ---- Scheduler ----
+    sched::init_cpu();
+    apic::start_timer(interrupts::VECTOR_TIMER);
     arch::enable_interrupts();
-    let start = interrupts::TICKS.load(Ordering::Relaxed);
-    while interrupts::TICKS.load(Ordering::Relaxed) < start + 10 {
+    let start = sched::ticks();
+    while sched::ticks() < start + 5 {
         arch::hlt();
     }
-    kok!("Interrupts enabled, timer ticking");
+    kok!("Scheduler running on cpu0, LAPIC timer at {} Hz", apic::TIMER_HZ);
 
-    // ---- SMP ----
     if let Some(mp) = MP_REQ.response() {
         let online = smp::start_aps(mp);
-        kok!("SMP: {} of {} CPU(s) online", online, mp.cpu_count);
+        kok!("SMP: {} of {} CPU(s) online, each with its own run queue", online, mp.cpu_count);
     }
+
+    let n = modules::init(MODULE_REQ.response());
+    kok!("{} user program(s) loaded by the bootloader", n);
 
     kprintln!();
     console::print_colored(console::GREEN, format_args!("AeroKernel is up."));
-    kprintln!(" Type 'help' for commands.");
+    kprintln!(" Starting aerosmss, the session manager. Type 'help' for commands.");
+    kprintln!();
 
-    let mut shell = shell::Shell::new();
-    shell.prompt();
-    let mut last_second = u64::MAX;
-    loop {
-        while let Some(c) = interrupts::pop_key() {
-            shell.on_key(c);
-        }
-        let secs = interrupts::TICKS.load(Ordering::Relaxed) / pic::TIMER_HZ as u64;
-        if secs != last_second {
-            last_second = secs;
-            update_tray(secs);
-        }
-        arch::hlt();
+    match process::spawn("aerosmss", 0) {
+        Ok(pid) => console::print_colored(console::DIM, format_args!("[kernel] aerosmss started as pid {}\n", pid)),
+        Err(e) => kprintln!("[WARN] could not start aerosmss: {}", e),
     }
+    sched::spawn_kernel("shell", shell::run, 0, Some(0));
+
+    // The boot thread is now cpu0's idle thread.
+    sched::idle_loop();
 }
 
-fn update_tray(secs: u64) {
+pub fn update_tray(secs: u64) {
     let mut buf = [0u8; 64];
     let mut w = Cursor { buf: &mut buf, len: 0 };
     let _ = core::fmt::write(&mut w, format_args!(
@@ -219,10 +233,13 @@ fn heap_self_test() {
     }
     let mut s = String::new();
     s.push_str("AeroForge");
-    let ok = *boxed == 0xAE20_F026 && sum == 49_995_000 && map[&255] == 65_025 && s.len() == 9;
+    let big: Vec<u8> = alloc::vec![7u8; 256 * 1024]; // > 2 KiB: straight from the buddy allocator
+    let ok = *boxed == 0xAE20_F026 && sum == 49_995_000 && map[&255] == 65_025 && s.len() == 9
+        && big.iter().all(|&b| b == 7);
     drop(v);
+    drop(big);
     if ok {
-        kok!("Heap self-test passed (Box, Vec of 10k, BTreeMap, String)");
+        kok!("Slab heap self-test passed (Box, Vec of 10k, BTreeMap, String, 256 KiB buffer)");
     } else {
         panic!("heap self-test failed");
     }

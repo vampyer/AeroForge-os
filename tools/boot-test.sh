@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Boots the ISO headless in QEMU and passes if the kernel reaches its prompt
-# with every CPU online. Intended for CI (design doc, Phase 0).
+# Boots the ISO headless in QEMU and passes if every CPU comes online and the
+# user-mode IPC demo completes (aerosmss starts echod and three clients, each
+# client finishes its round trips). Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,10 +25,12 @@ for _ in $(seq "$TIMEOUT"); do
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         echo "FAIL: kernel panic"; sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG"; exit 1
     fi
-    if grep -q "AeroKernel is up" "$LOG" 2>/dev/null; then
+    if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ]; then
+        sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { echo "FAIL: not all CPUs came online"; exit 1; }
-        echo "PASS: AeroKernel booted"; exit 0
+        grep -q "\[aerosmss\] all services up" "$LOG" || { echo "FAIL: aerosmss did not finish startup"; exit 1; }
+        echo "PASS: AeroKernel booted, user processes completed IPC round trips"; exit 0
     fi
     sleep 1
 done

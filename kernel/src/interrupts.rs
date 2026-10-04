@@ -1,6 +1,6 @@
-//! IDT, exception handlers and hardware IRQ dispatch.
+//! IDT, exception handlers and interrupt dispatch.
 //!
-//! Each vector has a tiny assembly stub that pushes a uniform frame and
+//! Every vector has a tiny assembly stub that pushes a uniform frame and
 //! calls `isr_dispatch` in Rust, so this works on stable Rust without the
 //! unstable `x86-interrupt` calling convention.
 
@@ -9,92 +9,22 @@ use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU64, AtomicUsize, AtomicU8, Ordering};
 
-use crate::{arch, dhi, gdt, pic};
+use crate::{apic, console, dhi, gdt, sched, syscall};
 
-pub const IRQ_BASE: u8 = 32;
-pub const IRQ_TIMER: u8 = IRQ_BASE;
-pub const IRQ_KEYBOARD: u8 = IRQ_BASE + 1;
-const STUB_COUNT: usize = 48;
+pub const VECTOR_TIMER: u8 = 32;
+pub const VECTOR_KEYBOARD: u8 = 33;
+pub const VECTOR_SYSCALL: u8 = 0x80;
+pub const VECTOR_RESCHEDULE: u8 = 0xF0;
 
-global_asm!(
-    r#"
-.section .text
-.macro ISR_NOERR n
-isr_stub_\n:
-    push 0
-    push \n
-    jmp isr_common
-.endm
-.macro ISR_ERR n
-isr_stub_\n:
-    push \n
-    jmp isr_common
-.endm
-
-.irp n, 0,1,2,3,4,5,6,7,9,15,16,18,19,20,22,23,24,25,26,27,28,31
-ISR_NOERR \n
-.endr
-.irp n, 8,10,11,12,13,14,17,21,29,30
-ISR_ERR \n
-.endr
-.irp n, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
-ISR_NOERR \n
-.endr
-
-isr_common:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    mov rdi, rsp
-    cld
-    call isr_dispatch
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    add rsp, 16
-    iretq
-
-.section .rodata
-.balign 8
-.global isr_stub_table
-isr_stub_table:
-.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
-    .quad isr_stub_\n
-.endr
-"#
-);
+global_asm!(include_str!(concat!(env!("OUT_DIR"), "/isr_stubs.s")));
 
 extern "C" {
-    static isr_stub_table: [u64; STUB_COUNT];
+    static isr_stub_table: [u64; 256];
 }
 
 /// Register state saved by `isr_common`, lowest address first.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct InterruptFrame {
     pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
     pub r11: u64, pub r10: u64, pub r9: u64, pub r8: u64,
@@ -107,6 +37,16 @@ pub struct InterruptFrame {
     pub rflags: u64,
     pub rsp: u64,
     pub ss: u64,
+}
+
+impl InterruptFrame {
+    pub const fn zeroed() -> Self {
+        Self {
+            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+            rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+            vector: 0, error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -124,12 +64,12 @@ struct IdtEntry {
 impl IdtEntry {
     const EMPTY: Self = Self { offset_lo: 0, selector: 0, ist: 0, attributes: 0, offset_mid: 0, offset_hi: 0, _zero: 0 };
 
-    fn interrupt_gate(handler: u64, ist: u8) -> Self {
+    fn gate(handler: u64, ist: u8, dpl: u8) -> Self {
         Self {
             offset_lo: handler as u16,
             selector: gdt::KERNEL_CODE,
             ist,
-            attributes: 0x8E, // present, DPL0, 64-bit interrupt gate
+            attributes: 0x8E | (dpl << 5), // present, 64-bit interrupt gate
             offset_mid: (handler >> 16) as u16,
             offset_hi: (handler >> 32) as u32,
             _zero: 0,
@@ -149,10 +89,9 @@ const EXCEPTION_NAMES: [&str; 32] = [
     "Security", "Reserved",
 ];
 
-pub static TICKS: AtomicU64 = AtomicU64::new(0);
 pub static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
 
-/// Single-producer (IRQ1) / single-consumer (main loop) key queue.
+/// Single-producer (keyboard IRQ) / single-consumer (shell thread) key queue.
 struct KeyQueue {
     buf: [AtomicU8; 256],
     head: AtomicUsize,
@@ -190,7 +129,9 @@ pub fn init() {
         let stubs = &*addr_of!(isr_stub_table);
         for (vector, &stub) in stubs.iter().enumerate() {
             let ist = if vector == 8 { gdt::DOUBLE_FAULT_IST } else { 0 };
-            idt[vector] = IdtEntry::interrupt_gate(stub, ist);
+            // Only the syscall gate (and int3, for debuggers) may be raised from ring 3.
+            let dpl = if vector == VECTOR_SYSCALL as usize || vector == 3 { 3 } else { 0 };
+            idt[vector] = IdtEntry::gate(stub, ist, dpl);
         }
     }
     load();
@@ -216,27 +157,48 @@ extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
             crate::kprintln!("       #BP breakpoint caught at {:#x}, resuming", frame.rip);
         }
         0..=31 => exception(frame),
-        IRQ_TIMER => {
-            TICKS.fetch_add(1, Ordering::Relaxed);
-            pic::end_of_interrupt(0);
+        VECTOR_TIMER => {
+            apic::eoi();
+            sched::on_tick();
         }
-        IRQ_KEYBOARD => {
+        VECTOR_KEYBOARD => {
             let mut ev = dhi::KeyEvent::default();
             if unsafe { dhi::aero_ps2kbd_on_irq(&mut ev) } == 1 && ev.pressed == 1 && ev.ascii != 0 {
                 push_key(ev.ascii);
             }
-            pic::end_of_interrupt(1);
+            apic::eoi();
         }
-        v => pic::end_of_interrupt(v - IRQ_BASE),
+        VECTOR_SYSCALL => syscall::dispatch(frame),
+        VECTOR_RESCHEDULE => {
+            apic::eoi();
+            sched::schedule();
+        }
+        apic::SPURIOUS_VECTOR => {}
+        _ => apic::eoi(),
     }
 }
 
-fn exception(frame: &InterruptFrame) -> ! {
+fn exception(frame: &InterruptFrame) {
     let name = EXCEPTION_NAMES[frame.vector as usize];
+    if frame.cs & 3 == 3 {
+        // A user process faulted: kill it, keep the system running.
+        let t = sched::current();
+        let (pid, pname) = t.process.as_ref().map_or((0, "?"), |p| (p.pid, p.name.as_str()));
+        console::print_colored(console::RED, format_args!(
+            "[kernel] {} (pid {}) killed: {} at rip {:#x}{}\n",
+            pname, pid, name, frame.rip,
+            if frame.vector == 14 { alloc::format!(", address {:#x}", crate::arch::read_cr2()) } else { alloc::string::String::new() }
+        ));
+        if let Some(p) = t.process.as_ref() {
+            p.exit_code.store(-(frame.vector as i64) - 1000, Ordering::SeqCst);
+        }
+        drop(t);
+        sched::exit_current();
+    }
     if frame.vector == 14 {
         panic!(
             "CPU exception #{} {} (error {:#x})\n  faulting address {:#x}\n  rip {:#x}  rsp {:#x}",
-            frame.vector, name, frame.error_code, arch::read_cr2(), frame.rip, frame.rsp
+            frame.vector, name, frame.error_code, crate::arch::read_cr2(), frame.rip, frame.rsp
         );
     }
     panic!(

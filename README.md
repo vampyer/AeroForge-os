@@ -4,51 +4,68 @@ A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`../AeroForge-OS-Design.md`](../AeroForge-OS-Design.md).
 
-## What works today (milestone 0.1)
+## What works today (milestone 0.2)
 
-Boots on UEFI through Limine, in QEMU, to an Aero-style console with a working shell.
+Boots on UEFI through Limine, brings up every CPU, and starts **aerosmss**, the first user
+process. aerosmss starts an `echod` service and three clients; the clients run in ring 3 on
+different cores and do request/reply round trips with `echod` over IPC ports.
 
 | Area | Status |
 |---|---|
-| Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000` |
+| Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
 | Consoles | COM1 serial log + framebuffer console drawn on a procedural Aero-style desktop |
-| CPU tables | GDT with ring-0 and ring-3 segments, TSS with a dedicated double-fault stack |
-| Interrupts | IDT with all 32 exceptions + 16 IRQs, assembly stubs into one Rust dispatcher; exceptions print a report and panic, `#BP` resumes |
-| Memory | Frame allocator over the Limine memory map, a 4-level page-table mapper and walker, an 8 MiB kernel heap at `0xffffe00000000000` (so `Box`, `Vec`, `BTreeMap`, `String` work) |
-| Firmware | ACPI RSDP, XSDT and MADT parsing (CPU and I/O APIC counts) |
-| Timers / IRQs | 8259 PIC remapped to 32-47, 8254 PIT at 100 Hz |
-| SMP | All application processors released and checked in (4 of 4 in QEMU); they idle until a scheduler exists |
-| C++ drivers | PS/2 keyboard driver in freestanding C++20 (`-fno-exceptions -fno-rtti`) talking to the kernel only through `drivers/include/dhi.h` |
-| Shell | `help`, `about`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless and fails on panic or missing CPUs |
+| Memory | Binary **buddy** page allocator (4 KiB to 4 MiB blocks, coalescing), **slab** heap (16 B to 2 KiB size classes, larger requests straight from the buddy), per-process address spaces sharing the kernel half |
+| CPU tables | Per-CPU GDT and TSS (`rsp0` updated on every switch), double-fault IST stack, per-CPU data through GS with `swapgs` on ring transitions |
+| Interrupts | 256-vector IDT generated at build time, exceptions from ring 3 kill only the faulting process |
+| Interrupt controllers | Local APIC (per-CPU periodic timer, calibrated against the PIT) and I/O APIC with MADT overrides; the 8259 PIC is masked |
+| Scheduler | Preemptive round robin with one run queue per CPU, idle thread per CPU, sleep, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
+| Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
+| Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
+| C++ drivers | PS/2 keyboard driver in freestanding C++20 behind `drivers/include/dhi.h` |
+| Userland | `libaero` system call library, `aerosmss`, `echod`, `client`, `crasher` (Rust, `no_std`) |
+| Shell | `ps`, `sched`, `run <prog>`, `ports`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
+| Test | `tools/boot-test.sh` boots headless and checks every CPU and the whole IPC demo |
 
-### Not done yet (rest of roadmap Phase 1)
+### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
-These are the next steps, in roughly this order:
+`exit`, `write`, `yield`, `getpid`, `sleep_ms`, `cpu_id`, `uptime_ms`, `spawn`, `port_create`,
+`port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`.
+The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
-1. Buddy + slab allocators and per-process address spaces (replacing the bump/free-list frame allocator).
-2. LAPIC/x2APIC timer and IOAPIC (replacing PIC/PIT), HPET/TSC calibration.
-3. Scheduler with per-CPU run queues, kernel threads, then ring 3 user mode and the `syscall` gate.
-4. Object manager, handles as capabilities, IPC ports, futexes, events.
-5. ACPICA port (the current table walker is a stopgap and never touches AML).
-6. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; then virtio-blk and NVMe/AHCI drivers in C++.
-7. KASLR, SMEP/SMAP/UMIP hardening.
+### Still to do in Phase 1
+
+1. Fast `syscall`/`sysret` entry, FPU/SSE state saving (user code is soft-float for now), and thread creation inside a process.
+2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
+3. Futexes and event objects, and `wait()` for child processes.
+4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`, then virtio-blk and NVMe/AHCI drivers in C++ (needed for "reading files from a disk image").
+6. KASLR and SMEP/SMAP/UMIP hardening (Zen 2 and newer Ryzen CPUs support all three).
 
 ## Layout
 
 ```
 boot/limine.conf          boot menu
 kernel/                   AeroKernel (Rust, no_std, stable toolchain)
-  build.rs                compiles the C++ drivers and links them in
+  build.rs                compiles the C++ drivers, generates the ISR stubs
   linker.ld               higher-half layout, Limine request sections
   src/main.rs             boot sequence (kmain)
   src/limine.rs           Limine protocol bindings (no external crate)
-  src/{gdt,interrupts,pic}.rs   CPU tables, IDT + ISR stubs, PIC/PIT
-  src/memory.rs           frames, page tables, heap
+  src/memory.rs           buddy allocator, slab heap, page tables, address spaces
+  src/{gdt,percpu}.rs     per-CPU GDT/TSS and GS-based per-CPU data
+  src/interrupts.rs       IDT and dispatch (isr_stubs.s.in is the entry template)
+  src/{apic,pic}.rs       LAPIC timer, IPIs, I/O APIC; legacy PIC masking
+  src/sched.rs            threads, per-CPU run queues, context switch
+  src/{process,elf}.rs    processes, handle tables, ELF loading
+  src/{ipc,syscall}.rs    IPC ports, name service, system call table
   src/{acpi,smp}.rs       firmware tables, application processors
+  src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
   src/{console,fb,serial}.rs    output: serial, framebuffer, desktop art
-  src/shell.rs            kernel-mode command prompt
+  src/shell.rs            kernel-mode command prompt (a kernel thread)
+userland/                 user programs and libaero (Rust, no_std)
+  src/lib.rs              system call wrappers, println!, handles
+  src/bin/aerosmss.rs     session manager, first process
+  src/bin/{echod,client,crasher}.rs   IPC demo service and clients, fault demo
 drivers/include/dhi.h     the DHI contract (C ABI)
 drivers/ps2kbd/           first C++ driver
 tools/boot-test.sh        headless QEMU boot test
@@ -81,4 +98,6 @@ the QEMU window through WSLg. OVMF paths can be overridden with
 
 The ISO also boots on real UEFI PCs from a USB stick (write it with Rufus in DD mode or
 `dd`), with CSM/legacy boot off and Secure Boot off. Expect a PS/2-only keyboard until the
-USB (xHCI) driver lands.
+USB (xHCI) driver lands. On a Ryzen desktop with only USB keyboards, typing into the shell
+works only if the firmware's USB legacy support emulates PS/2. Booting and the IPC demo
+don't need a keyboard.

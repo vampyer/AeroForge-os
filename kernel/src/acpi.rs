@@ -39,6 +39,10 @@ pub struct AcpiInfo {
     pub lapic_count: usize,
     pub ioapic_count: usize,
     pub lapic_address: u32,
+    pub ioapic_address: u32,
+    pub ioapic_gsi_base: u32,
+    /// ISA IRQ -> (global system interrupt, MPS INTI flags)
+    pub overrides: Vec<(u8, u32, u16)>,
 }
 
 pub static INFO: Mutex<Option<AcpiInfo>> = Mutex::new(None);
@@ -71,6 +75,9 @@ pub fn init(rsdp_addr: u64) -> Result<(), &'static str> {
         lapic_count: 0,
         ioapic_count: 0,
         lapic_address: 0,
+        ioapic_address: 0,
+        ioapic_gsi_base: 0,
+        overrides: Vec::new(),
     };
 
     unsafe {
@@ -110,7 +117,19 @@ unsafe fn parse_madt(v: u64, len: u32, info: &mut AcpiInfo) {
                     info.lapic_count += 1; // enabled or online-capable
                 }
             }
-            1 => info.ioapic_count += 1,
+            1 => {
+                if info.ioapic_count == 0 {
+                    info.ioapic_address = read_unaligned((p + 4) as *const u32);
+                    info.ioapic_gsi_base = read_unaligned((p + 8) as *const u32);
+                }
+                info.ioapic_count += 1;
+            }
+            2 => {
+                let irq = *((p + 3) as *const u8);
+                let gsi = read_unaligned((p + 4) as *const u32);
+                let flags = read_unaligned((p + 8) as *const u16);
+                info.overrides.push((irq, gsi, flags));
+            }
             9 => info.lapic_count += 1, // x2APIC entry
             _ => {}
         }

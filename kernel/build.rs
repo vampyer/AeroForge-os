@@ -14,6 +14,7 @@ fn main() {
 
     println!("cargo:rustc-link-arg=-T{}", manifest.join("linker.ld").display());
     println!("cargo:rerun-if-changed=linker.ld");
+    println!("cargo:rerun-if-changed=src/isr_stubs.s.in");
     println!("cargo:rerun-if-changed=../drivers");
 
     let mut objects = Vec::new();
@@ -57,6 +58,22 @@ fn main() {
         .expect("failed to run llvm-ar (set AR)");
     assert!(status.success(), "archiving C++ drivers failed");
 
+    std::fs::write(out.join("isr_stubs.s"), isr_stubs()).unwrap();
+
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=aerodrivers");
+}
+
+/// Interrupt entry stubs for all 256 vectors, plus the common save/restore
+/// path. Generated so the vector lists can't get out of step by hand.
+fn isr_stubs() -> String {
+    const WITH_ERROR_CODE: [u32; 10] = [8, 10, 11, 12, 13, 14, 17, 21, 29, 30];
+    let join = |v: Vec<u32>| v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let no_err = join((0..256).filter(|n| !WITH_ERROR_CODE.contains(n)).collect());
+    let err = join(WITH_ERROR_CODE.to_vec());
+    let all = join((0..256).collect());
+    include_str!("src/isr_stubs.s.in")
+        .replace("@NOERR@", &no_err)
+        .replace("@ERR@", &err)
+        .replace("@ALL@", &all)
 }

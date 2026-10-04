@@ -1,0 +1,79 @@
+// Interrupt entry stubs (template; build.rs fills in the vector lists).
+.section .text
+.macro ISR_NOERR n
+isr_stub_\n:
+    push 0
+    push \n
+    jmp isr_common
+.endm
+.macro ISR_ERR n
+isr_stub_\n:
+    push \n
+    jmp isr_common
+.endm
+
+.irp n, @NOERR@
+ISR_NOERR \n
+.endr
+.irp n, @ERR@
+ISR_ERR \n
+.endr
+
+// Common entry. Stack on arrival: vector, error code, then the CPU's frame.
+isr_common:
+    // Coming from ring 3? Then swap in the kernel's GS base (per-CPU data).
+    test qword ptr [rsp + 24], 3
+    jz 1f
+    swapgs
+1:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    cld
+    call isr_dispatch
+
+// Also the first "return" of a brand-new user thread (see sched::spawn_user).
+.global isr_exit
+isr_exit:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+
+.section .rodata
+.balign 8
+.global isr_stub_table
+isr_stub_table:
+.irp n, @ALL@
+    .quad isr_stub_\n
+.endr

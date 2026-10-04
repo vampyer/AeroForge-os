@@ -115,3 +115,24 @@ pub fn cpu_brand(buf: &mut [u8; 48]) -> &str {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(48);
     core::str::from_utf8(&buf[..end]).unwrap_or("?").trim()
 }
+
+pub const MSR_APIC_BASE: u32 = 0x1B;
+pub const MSR_GS_BASE: u32 = 0xC000_0101;
+pub const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+#[inline]
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    ((hi as u64) << 32) | lo as u64
+}
+
+#[inline]
+pub unsafe fn wrmsr(msr: u32, v: u64) {
+    asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32, options(nostack, preserves_flags));
+}
+
+#[inline]
+pub unsafe fn write_cr3(v: u64) {
+    asm!("mov cr3, {}", in(reg) v, options(nostack, preserves_flags));
+}
