@@ -20,9 +20,7 @@ rm -f "$PART"
 truncate -s $((SECTORS * 512)) "$PART"
 mkfs.fat -F 32 -s 1 -n AEROFORGE "$PART" >/dev/null
 mcopy -s -i "$PART" tools/disk-files/* ::/
-if [ -f ../AeroForge-OS-Design.md ]; then
-    mcopy -i "$PART" ../AeroForge-OS-Design.md ::/docs/
-fi
+mcopy -i "$PART" docs/AeroForge-OS-Design.md ::/docs/
 dd if="$PART" of="$IMG.tmp" bs=512 seek=2048 conv=notrunc status=none
 rm -f "$PART"
 mv "$IMG.tmp" "$IMG"

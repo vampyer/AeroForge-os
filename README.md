@@ -1,8 +1,10 @@
 # AeroForge OS
 
+[![boot test](https://github.com/vampyer/AeroForge-os/actions/workflows/boot-test.yml/badge.svg)](https://github.com/vampyer/AeroForge-os/actions/workflows/boot-test.yml)
+
 A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C++
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
-[`../AeroForge-OS-Design.md`](../AeroForge-OS-Design.md).
+[`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Prebuilt ISOs are attached to GitHub releases.
 
 ## What works today (milestone 0.3)
 
