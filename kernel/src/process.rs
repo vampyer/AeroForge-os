@@ -21,6 +21,7 @@ pub mod rights {
 #[derive(Clone)]
 pub enum Object {
     Port(Arc<Port>),
+    Socket(Arc<crate::net::UserSocket>),
 }
 
 #[derive(Clone)]
