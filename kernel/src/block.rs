@@ -199,12 +199,17 @@ pub fn probe_nvme() -> usize {
 pub fn probe_ahci() -> usize {
     const MAX: usize = 8;
     let mut found = 0;
+    let mut controller = 0;
     for dev in pci::devices().iter().filter(|d| d.class == 0x01 && d.subclass == 0x06 && d.prog_if == 0x01) {
         let Some(abar) = dev.bar(5) else { continue };
         dev.enable_mmio_and_dma();
+        // One MSI for the whole controller, to the boot CPU; it signals one
+        // interrupt source per disk so every disk's thread can sleep.
+        let name = format!("ahci{} ({:02x}:{:02x}.{})", controller, dev.bus, dev.dev, dev.func);
+        let irq = dhi::irq_sources(MAX).and_then(|(src, handler)| crate::msi::attach(dev, &name, handler, 0).map(|kind| (src, kind)));
         let mut infos = [BlockInfo::zeroed(); MAX];
         let mut first = 0i32;
-        let n = unsafe { dhi::aero_ahci_init(&dhi::OPS, abar, infos.as_mut_ptr(), MAX as i32, &mut first) };
+        let n = unsafe { dhi::aero_ahci_init(&dhi::OPS, abar, irq.map_or(dhi::NO_IRQ, |(src, _)| src), infos.as_mut_ptr(), MAX as i32, &mut first) };
         if n < 0 {
             console::print_colored(console::YELLOW, format_args!("[WARN] AHCI at {:02x}:{:02x}.{}: init failed ({})\n", dev.bus, dev.dev, dev.func, n));
             continue;
@@ -215,6 +220,11 @@ pub fn probe_ahci() -> usize {
                 found += 1;
             }
         }
+        match irq {
+            Some((_, kind)) => console::print_colored(console::DIM, format_args!("       ahci{}: {} completion interrupts on\n", controller, kind)),
+            None => console::print_colored(console::YELLOW, format_args!("[WARN] ahci{}: no MSI-X or MSI, I/O is polled\n", controller)),
+        }
+        controller += 1;
     }
     found
 }

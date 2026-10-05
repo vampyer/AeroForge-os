@@ -165,7 +165,7 @@ extern "C" {
     pub fn aero_nvme_read(ctrl: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_nvme_write(ctrl: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_nvme_flush(ctrl: i32) -> i32;
-    pub fn aero_ahci_init(ops: *const DhiOps, abar_phys: u64, out: *mut BlockInfo, max: i32, first_id: *mut i32) -> i32;
+    pub fn aero_ahci_init(ops: *const DhiOps, abar_phys: u64, irq_first: u32, out: *mut BlockInfo, max: i32, first_id: *mut i32) -> i32;
     pub fn aero_ahci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_ahci_write(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_ahci_flush(disk: i32) -> i32;
@@ -246,24 +246,48 @@ extern "C" fn dhi_delay_us(us: u32) {
     apic::delay_us(us as u64);
 }
 
-/// Interrupt sources drivers wait on through `irq_wait`; each one belongs to
-/// a device whose MSI-X/MSI handler signals it.
-pub const IRQ_SOURCES: usize = 8;
+/// Interrupt sources drivers wait on through `irq_wait`. A device's MSI-X/MSI
+/// handler signals a group of them: one source per disk on a controller that
+/// has a single interrupt for all its ports (AHCI), so each disk's thread
+/// sleeps on its own source. A waiter woken for another port's completion
+/// just checks its own command again.
+pub const IRQ_SOURCES: usize = 32;
 static IRQ_EVENTS: [sched::Event; IRQ_SOURCES] = [const { sched::Event::new() }; IRQ_SOURCES];
+static IRQ_GROUP_LEN: [AtomicUsize; IRQ_SOURCES] = [const { AtomicUsize::new(1) }; IRQ_SOURCES];
 static IRQ_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+fn group_handler<const FIRST: usize>() {
+    let len = IRQ_GROUP_LEN[FIRST].load(Ordering::Relaxed);
+    for e in &IRQ_EVENTS[FIRST..(FIRST + len).min(IRQ_SOURCES)] {
+        e.signal();
+    }
+}
+
 const IRQ_HANDLERS: [fn(); IRQ_SOURCES] = [
-    || IRQ_EVENTS[0].signal(), || IRQ_EVENTS[1].signal(), || IRQ_EVENTS[2].signal(), || IRQ_EVENTS[3].signal(),
-    || IRQ_EVENTS[4].signal(), || IRQ_EVENTS[5].signal(), || IRQ_EVENTS[6].signal(), || IRQ_EVENTS[7].signal(),
+    group_handler::<0>, group_handler::<1>, group_handler::<2>, group_handler::<3>, group_handler::<4>, group_handler::<5>, group_handler::<6>, group_handler::<7>,
+    group_handler::<8>, group_handler::<9>, group_handler::<10>, group_handler::<11>, group_handler::<12>, group_handler::<13>, group_handler::<14>, group_handler::<15>,
+    group_handler::<16>, group_handler::<17>, group_handler::<18>, group_handler::<19>, group_handler::<20>, group_handler::<21>, group_handler::<22>, group_handler::<23>,
+    group_handler::<24>, group_handler::<25>, group_handler::<26>, group_handler::<27>, group_handler::<28>, group_handler::<29>, group_handler::<30>, group_handler::<31>,
 ];
 
 /// `irq_source` value for a driver that polls.
 pub const NO_IRQ: u32 = u32::MAX;
 
-/// Reserves an interrupt source: its number for the driver and the handler
-/// to give `msi::attach`.
+/// Reserves `count` consecutive interrupt sources: the first one's number
+/// for the driver, and the handler to give `msi::attach`, which signals all
+/// of them.
+pub fn irq_sources(count: usize) -> Option<(u32, fn())> {
+    let first = IRQ_NEXT.fetch_add(count, Ordering::SeqCst);
+    if count == 0 || first + count > IRQ_SOURCES {
+        return None;
+    }
+    IRQ_GROUP_LEN[first].store(count, Ordering::Relaxed);
+    Some((first as u32, IRQ_HANDLERS[first]))
+}
+
+/// One interrupt source, for a device with a single waiter.
 pub fn irq_source() -> Option<(u32, fn())> {
-    let n = IRQ_NEXT.fetch_add(1, Ordering::SeqCst);
-    (n < IRQ_SOURCES).then(|| (n as u32, IRQ_HANDLERS[n]))
+    irq_sources(1)
 }
 
 extern "C" fn dhi_irq_wait(source: u32) {
