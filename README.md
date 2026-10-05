@@ -131,6 +131,14 @@ ones. The boot test attaches two simulated pads (`tools/fakepad`), an Xbox style
 one behind a hub next to a volume-key interface that must be left alone. Xbox One (GIP) pads,
 the Xbox 360 wireless receiver's protocol, and plugging in after start-up come later.
 
+Since 0.15 user programs can read the gamepads: system call 18 (`gamepad::read` in libaero)
+gives a pad's name, link and raw buttons, hat and axes, and the same pad in the Xbox 360 layout
+games expect (XInput button bits, sticks from -32767 to 32767 with up positive, triggers from 0
+to 255). For Xbox style USB pads that layout is exact; for other pads it is a guess (buttons 1 to
+11 as A B X Y LB RB Back Start LS RS Guide, the hat as the d-pad) until a controller mapping
+database like SDL's arrives, and `exact` tells programs which. The `padtest` program prints every
+pad that way, and the boot test checks its output for all four simulated pads.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -147,7 +155,7 @@ the Xbox 360 wireless receiver's protocol, and plugging in after start-up come l
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
-| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound) (Rust, `no_std`) |
+| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
 | Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), the security audit and self-test, the config read and the whole IPC demo |
 

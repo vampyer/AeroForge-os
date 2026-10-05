@@ -10,7 +10,7 @@ use core::sync::atomic::Ordering;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, console, percpu, sched, security, sound, vfs};
+use crate::{apic, console, gamepad, percpu, sched, security, sound, vfs};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -30,6 +30,7 @@ pub const SYS_HANDLE_DUP: u64 = 14;
 pub const SYS_FILE_READ: u64 = 15;
 pub const SYS_AUDIO_WRITE: u64 = 16;
 pub const SYS_AUDIO_QUEUED: u64 = 17;
+pub const SYS_GAMEPAD_READ: u64 = 18;
 
 const E_BADHANDLE: i64 = -1;
 const E_FAULT: i64 = -2;
@@ -220,6 +221,12 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 return Err(E_NOTFOUND);
             }
             Ok(sound::queued(proc_.pid) as u64)
+        }
+        SYS_GAMEPAD_READ => {
+            // Gamepad a0's state into a gamepad::State at a1; returns how many gamepads there are.
+            let (state, count) = gamepad::read(a0 as usize).ok_or(E_NOTFOUND)?;
+            to_user(a1, state.as_bytes())?;
+            Ok(count as u64)
         }
         _ => Err(E_INVAL),
     }

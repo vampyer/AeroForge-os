@@ -25,6 +25,7 @@ pub mod sys {
     pub const FILE_READ: u64 = 15;
     pub const AUDIO_WRITE: u64 = 16;
     pub const AUDIO_QUEUED: u64 = 17;
+    pub const GAMEPAD_READ: u64 = 18;
 }
 
 pub mod rights {
@@ -124,6 +125,77 @@ pub mod audio {
         while queued().is_ok_and(|n| n > 0) {
             sleep_ms(10);
         }
+    }
+}
+
+/// Gamepads (Bluetooth and USB). Each read gives the pad's raw state and
+/// the same pad in the Xbox 360 layout; `exact` says whether that layout is
+/// known (XInput pads) or guessed.
+pub mod gamepad {
+    use super::*;
+
+    pub const DPAD_UP: u16 = 0x0001;
+    pub const DPAD_DOWN: u16 = 0x0002;
+    pub const DPAD_LEFT: u16 = 0x0004;
+    pub const DPAD_RIGHT: u16 = 0x0008;
+    pub const START: u16 = 0x0010;
+    pub const BACK: u16 = 0x0020;
+    pub const LEFT_THUMB: u16 = 0x0040;
+    pub const RIGHT_THUMB: u16 = 0x0080;
+    pub const LEFT_SHOULDER: u16 = 0x0100;
+    pub const RIGHT_SHOULDER: u16 = 0x0200;
+    pub const GUIDE: u16 = 0x0400;
+    pub const A: u16 = 0x1000;
+    pub const B: u16 = 0x2000;
+    pub const X: u16 = 0x4000;
+    pub const Y: u16 = 0x8000;
+
+    /// Button bits with their usual names, in display order.
+    pub const BUTTON_NAMES: [(u16, &str); 11] = [(A, "A"), (B, "B"), (X, "X"), (Y, "Y"), (LEFT_SHOULDER, "LB"),
+        (RIGHT_SHOULDER, "RB"), (BACK, "Back"), (START, "Start"), (LEFT_THUMB, "LS"), (RIGHT_THUMB, "RS"),
+        (GUIDE, "Guide")];
+
+    /// Same layout as the kernel's gamepad::State.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct State {
+        pub name: [u8; 32],
+        pub connected: u8,
+        /// 1 = Bluetooth, 2 = USB.
+        pub link: u8,
+        /// 1 if the Xbox layout fields are exact, 0 if guessed.
+        pub exact: u8,
+        /// Raw hat: 0 = up, clockwise to 7 = up-left, 8 = centred.
+        pub hat: u8,
+        /// Raw buttons: bit n = button n + 1.
+        pub buttons: u32,
+        pub reports: u32,
+        /// Raw axes present (bit per X Y Z Rx Ry Rz Gas Brake).
+        pub axis_mask: u8,
+        pub _pad: [u8; 3],
+        /// Raw axes, -127 to 127.
+        pub axes: [i16; 8],
+        /// Xbox layout: the constants above.
+        pub xbuttons: u16,
+        pub left_trigger: u8,
+        pub right_trigger: u8,
+        /// Left X, left Y, right X, right Y: -32767 to 32767, up positive.
+        pub thumbs: [i16; 4],
+    }
+
+    impl State {
+        pub fn name(&self) -> &str {
+            let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+            core::str::from_utf8(&self.name[..end]).unwrap_or("?")
+        }
+    }
+
+    /// Reads gamepad `index` (0, 1, ...). Returns its state and how many
+    /// gamepads there are; Err when there is no such gamepad.
+    pub fn read(index: usize) -> Result<(State, usize), i64> {
+        let mut s = core::mem::MaybeUninit::<State>::zeroed();
+        let n = check(unsafe { syscall(sys::GAMEPAD_READ, index as u64, s.as_mut_ptr() as u64, 0, 0) })?;
+        Ok((unsafe { s.assume_init() }, n as usize))
     }
 }
 

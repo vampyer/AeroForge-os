@@ -109,6 +109,9 @@ pub struct Gamepad {
     /// For a USB gamepad, where it is plugged in ("USB 0 port 4"); `adapter`
     /// and `address` then mean nothing.
     pub usb: Option<String>,
+    /// True when the buttons and axes follow the Xbox 360 layout (a USB
+    /// XInput pad, whose reports the xHCI driver translates).
+    pub xinput: bool,
 }
 
 struct ScanJob {
@@ -802,7 +805,7 @@ impl Host {
                     p.axes = axes;
                 }
                 None => pads.push(Gamepad { adapter: self.index, address, name: name.clone(), connected: true,
-                    layout: layout.clone(), axes, reports: 0, pad: hid::Pad::default(), usb: None }),
+                    layout: layout.clone(), axes, reports: 0, pad: hid::Pad::default(), usb: None, xinput: false }),
             }
         }
         crate::kok!("{}: gamepad {} \"{}\" connected ({})", self.name, addr_string(&address), name, layout);
