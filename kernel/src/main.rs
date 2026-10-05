@@ -32,6 +32,7 @@ mod shell;
 mod smp;
 mod sync;
 mod syscall;
+mod usb;
 mod vfs;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
@@ -192,6 +193,10 @@ extern "C" fn kmain() -> ! {
     if sata > 0 {
         kok!("C++ AHCI driver attached through DHI v{}: {} SATA disk(s)", dhi::ABI_VERSION, sata);
     }
+    let (xhci, usb_devices) = usb::probe();
+    if xhci > 0 {
+        kok!("C++ xHCI driver attached through DHI v{}: {} controller(s), {} USB device(s)", dhi::ABI_VERSION, xhci, usb_devices);
+    }
     let mounts = vfs::mount_all();
     for m in mounts {
         kok!("FAT32 volume \"{}\" on {} mounted at {} (read-only)", m.vol.label, m.vol.dev.name(), m.path);
@@ -229,6 +234,9 @@ extern "C" fn kmain() -> ! {
     match process::spawn("aerosmss", 0) {
         Ok(pid) => console::print_colored(console::DIM, format_args!("[kernel] aerosmss started as pid {}\n", pid)),
         Err(e) => kprintln!("[WARN] could not start aerosmss: {}", e),
+    }
+    if xhci > 0 {
+        sched::spawn_kernel("usbpoll", usb::poll_thread, 0, Some(1 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
     }
     sched::spawn_kernel("shell", shell::run, 0, Some(0));
 

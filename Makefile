@@ -63,7 +63,8 @@ OVMF_ARGS = -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 NVME_ARGS = -drive file=$(BUILD)/disk.img,if=none,id=nvm,format=raw \
             -device nvme,serial=AERO0001,drive=nvm \
             -drive file=$(BUILD)/sata.img,if=none,id=sata,format=raw \
-            -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1
+            -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1 \
+            -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0
 
 run: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img
 	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio
