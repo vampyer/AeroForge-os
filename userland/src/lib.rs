@@ -44,6 +44,8 @@ pub mod sys {
     pub const PROCESS_WAIT: u64 = 29;
     pub const THREAD_ID: u64 = 30;
     pub const THREAD_PRIORITY: u64 = 31;
+    pub const SLEEP_US: u64 = 32;
+    pub const CLOCK_US: u64 = 33;
 }
 
 pub mod rights {
@@ -62,6 +64,7 @@ pub const E_FULL: i64 = -5;
 pub const E_INVAL: i64 = -6;
 pub const E_EXISTS: i64 = -7;
 pub const E_AGAIN: i64 = -8;
+pub const E_TIMEDOUT: i64 = -9;
 
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -95,6 +98,17 @@ pub fn getpid() -> u64 {
 
 pub fn sleep_ms(ms: u64) {
     unsafe { syscall(sys::SLEEP_MS, ms, 0, 0, 0) };
+}
+
+/// Sleeps for `us` microseconds (precise to the timer, not a 10 ms tick).
+pub fn sleep_us(us: u64) {
+    unsafe { syscall(sys::SLEEP_US, us, 0, 0, 0) };
+}
+
+/// Microseconds since boot. For frame pacing: remember a deadline,
+/// `sleep_us(deadline - clock_us())`.
+pub fn clock_us() -> u64 {
+    unsafe { syscall(sys::CLOCK_US, 0, 0, 0, 0) as u64 }
 }
 
 pub fn cpu_id() -> u64 {

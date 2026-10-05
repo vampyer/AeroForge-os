@@ -2,6 +2,10 @@
 //!
 //! - Each CPU has its own ready queue, sleep list and idle thread; the LAPIC
 //!   timer preempts the running thread every tick (round robin).
+//! - Time comes from the TSC in microseconds (`apic::micros`). The timer is
+//!   one-shot and is re-armed for the next tick or the earliest sleeper's
+//!   wake-up time, whichever is sooner, so a 2 ms sleep takes 2 ms rather
+//!   than a whole 10 ms tick.
 //! - User threads move between CPUs: a CPU about to go idle takes a waiting
 //!   user thread from the busiest other CPU's ready queue (work stealing).
 //!   A thread is only taken once the CPU that last ran it has finished
@@ -73,6 +77,7 @@ pub struct Thread {
     kstack: KernelStack,
     saved_rsp: UnsafeCell<u64>,
     pml4: u64,
+    /// When a sleeping thread is due to wake, in `apic::micros` time.
     wake_at: AtomicU64,
     pub runtime_ticks: AtomicU64,
     /// Saved floating point and vector registers; user threads only.
@@ -186,16 +191,43 @@ pub struct RunQueue {
     idle: Option<Arc<Thread>>,
     sleepers: Vec<Arc<Thread>>,
     zombie: Option<Arc<Thread>>,
+    /// When this CPU's next time-slice tick is due (`apic::micros` time).
+    tick_due: u64,
     pub switches: u64,
 }
 
 impl RunQueue {
     pub fn new() -> Self {
-        Self { ready: ReadyQueues::new(), current: None, idle: None, sleepers: Vec::new(), zombie: None, switches: 0 }
+        Self { ready: ReadyQueues::new(), current: None, idle: None, sleepers: Vec::new(), zombie: None, tick_due: 0, switches: 0 }
     }
 
     pub fn load(&self) -> usize {
         self.ready.len() + self.current.as_ref().map_or(0, |c| !c.idle as usize)
+    }
+
+    /// Moves sleepers whose time has come to the ready queue. True if one
+    /// of them should take the CPU from the running thread.
+    fn wake_due(&mut self, now: u64) -> bool {
+        let mut preempt = false;
+        let mut i = 0;
+        while i < self.sleepers.len() {
+            if self.sleepers[i].wake_at.load(Ordering::Relaxed) <= now {
+                let t = self.sleepers.swap_remove(i);
+                t.set_state(State::Ready);
+                preempt |= outranks(&t, self);
+                self.ready.push(t);
+            } else {
+                i += 1;
+            }
+        }
+        preempt
+    }
+
+    /// Sets this CPU's timer for the next tick or the earliest sleeper,
+    /// whichever comes first.
+    fn arm_timer(&self, now: u64) {
+        let next = self.sleepers.iter().map(|t| t.wake_at.load(Ordering::Relaxed)).fold(self.tick_due, u64::min);
+        crate::apic::arm_timer(next.saturating_sub(now));
     }
 }
 
@@ -203,12 +235,15 @@ impl RunQueue {
 pub static THREADS: IrqMutex<BTreeMap<u64, Arc<Thread>>> = IrqMutex::new(BTreeMap::new());
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CPU: AtomicUsize = AtomicUsize::new(0);
-pub static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Threads moved to another CPU by work stealing.
 pub static MIGRATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Microseconds per scheduler tick (the time slice).
+pub const TICK_US: u64 = 1_000_000 / crate::apic::TIMER_HZ;
+
+/// Time since boot in ticks (`apic::TIMER_HZ` per second).
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    crate::apic::micros() / TICK_US
 }
 
 global_asm!(
@@ -380,17 +415,9 @@ pub fn schedule() {
     }
     let (save_to, load, prev_on_cpu) = {
         let mut rq = cpu.rq.lock();
-        let now = ticks();
-        let mut i = 0;
-        while i < rq.sleepers.len() {
-            if rq.sleepers[i].wake_at.load(Ordering::Relaxed) <= now {
-                let t = rq.sleepers.swap_remove(i);
-                t.set_state(State::Ready);
-                rq.ready.push(t);
-            } else {
-                i += 1;
-            }
-        }
+        let now = crate::apic::micros();
+        rq.wake_due(now);
+        rq.arm_timer(now);
 
         let prev = rq.current.take().expect("no current thread");
         if prev.state() == State::Running && !prev.idle {
@@ -467,30 +494,62 @@ fn steal(me: &percpu::PerCpu) {
     }
 }
 
-/// Called from the timer interrupt on every CPU.
-pub fn on_tick() {
+/// Called from the timer interrupt on every CPU. When a tick is due the
+/// running thread's time slice is over; otherwise the interrupt is for a
+/// sleeper, which only takes the CPU if it outranks the running thread.
+pub fn on_timer() {
     let cpu = percpu::this();
-    if cpu.index == 0 {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = crate::apic::micros();
+    let reschedule = {
+        let mut rq = cpu.rq.lock();
+        if now >= rq.tick_due {
+            // Stay on the 10 ms grid unless we fell more than a tick behind.
+            rq.tick_due = if rq.tick_due + TICK_US > now { rq.tick_due + TICK_US } else { now + TICK_US };
+            if let Some(cur) = rq.current.as_ref() {
+                cur.runtime_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+            cpu.ticks.fetch_add(1, Ordering::Relaxed);
+            true
+        } else if rq.wake_due(now) {
+            true
+        } else {
+            rq.arm_timer(now);
+            false
+        }
+    };
+    if reschedule {
+        schedule();
     }
-    cpu.ticks.fetch_add(1, Ordering::Relaxed);
-    if let Some(cur) = cpu.rq.lock().current.as_ref() {
-        cur.runtime_ticks.fetch_add(1, Ordering::Relaxed);
-    }
-    schedule();
+}
+
+/// Puts the current thread on this CPU's sleep list until `until_us`
+/// (`apic::micros` time) and marks it sleeping. Like
+/// `mark_current_blocked`, the caller calls `schedule` next with
+/// interrupts still disabled; `wake_sleeper` (or `wake_waiter`) ends
+/// the sleep early.
+pub fn mark_current_sleeping(until_us: u64) -> Arc<Thread> {
+    let mut rq = percpu::this().rq.lock();
+    let cur = rq.current.clone().unwrap();
+    cur.wake_at.store(until_us, Ordering::Relaxed);
+    cur.set_state(State::Sleeping);
+    rq.sleepers.push(cur.clone());
+    cur
+}
+
+/// Sleeps until `until_us` in `apic::micros` time.
+pub fn sleep_until(until_us: u64) {
+    arch::without_interrupts(|| {
+        mark_current_sleeping(until_us);
+        schedule();
+    });
+}
+
+pub fn sleep_us(us: u64) {
+    sleep_until(crate::apic::micros().saturating_add(us));
 }
 
 pub fn sleep_ticks(n: u64) {
-    arch::without_interrupts(|| {
-        {
-            let mut rq = percpu::this().rq.lock();
-            let cur = rq.current.clone().unwrap();
-            cur.wake_at.store(ticks() + n.max(1), Ordering::Relaxed);
-            cur.set_state(State::Sleeping);
-            rq.sleepers.push(cur);
-        }
-        schedule();
-    });
+    sleep_us(n.saturating_mul(TICK_US));
 }
 
 /// Sleeps up to `n` ticks, unless `flag` is set (checked under the run
@@ -503,7 +562,7 @@ fn sleep_ticks_unless(n: u64, flag: &AtomicBool) {
                 return;
             }
             let cur = rq.current.clone().unwrap();
-            cur.wake_at.store(ticks() + n.max(1), Ordering::Relaxed);
+            cur.wake_at.store(crate::apic::micros() + n.max(1) * TICK_US, Ordering::Relaxed);
             cur.set_state(State::Sleeping);
             rq.sleepers.push(cur);
         }
@@ -614,6 +673,12 @@ pub fn wake(t: &Arc<Thread>) {
     }
 }
 
+/// Wakes a thread waiting with or without a timeout (blocked or sleeping).
+pub fn wake_waiter(t: &Arc<Thread>) {
+    wake(t);
+    wake_sleeper(t);
+}
+
 /// Sets the priority of thread `t` (one of the PRIO_ constants). A thread
 /// waiting in a ready queue moves to its new level there.
 pub fn set_priority(t: &Arc<Thread>, priority: u8) {
@@ -676,27 +741,29 @@ pub fn killed() -> bool {
     current().process.as_ref().is_some_and(|p| p.exiting.load(Ordering::SeqCst))
 }
 
-/// Undoes `mark_current_blocked` for a thread that changed its mind before
-/// calling `schedule` (and may meanwhile have been woken onto the ready queue).
+/// Undoes `mark_current_blocked` (or `mark_current_sleeping`) for a thread
+/// that changed its mind before calling `schedule` (and may meanwhile have
+/// been woken onto the ready queue).
 pub fn unblock_current() {
     let cpu = percpu::this();
     let mut rq = cpu.rq.lock();
     let cur = rq.current.clone().unwrap();
-    if cur.state() == State::Ready {
-        rq.ready.remove(&cur);
+    match cur.state() {
+        State::Ready => rq.ready.remove(&cur),
+        State::Sleeping => rq.sleepers.retain(|s| !Arc::ptr_eq(s, &cur)),
+        _ => {}
     }
     cur.set_state(State::Running);
 }
 
 /// Gets every thread of process `pid` moving towards its exit: blocked
-/// threads are woken (their wait loops see `killed()`), sleepers wake at
-/// the next tick, and threads in ring 3 die at their next interrupt.
+/// and sleeping threads are woken (their wait loops see `killed()`), and
+/// threads in ring 3 die at their next interrupt.
 /// The caller has already set the process's `exiting` flag.
 pub fn kill_threads_of(pid: u64) {
     let victims: Vec<Arc<Thread>> = THREADS.lock().values().filter(|t| t.pid() == pid).cloned().collect();
     for t in victims {
-        t.wake_at.store(0, Ordering::Relaxed);
-        wake(&t);
+        wake_waiter(&t);
         if t.cpu() != percpu::this().index {
             if let Some(cpu) = percpu::get(t.cpu()) {
                 crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);

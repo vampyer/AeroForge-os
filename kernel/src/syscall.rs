@@ -149,6 +149,8 @@ pub const SYS_FUTEX_WAKE: u64 = 28;
 pub const SYS_PROCESS_WAIT: u64 = 29;
 pub const SYS_THREAD_ID: u64 = 30;
 pub const SYS_THREAD_PRIORITY: u64 = 31;
+pub const SYS_SLEEP_US: u64 = 32;
+pub const SYS_CLOCK_US: u64 = 33;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -164,6 +166,7 @@ const E_FULL: i64 = -5;
 const E_INVAL: i64 = -6;
 const E_EXISTS: i64 = -7;
 const E_AGAIN: i64 = -8;
+const E_TIMEDOUT: i64 = -9;
 
 const NO_HANDLE: u64 = u64::MAX;
 
@@ -299,9 +302,12 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         SYS_FUTEX_WAIT => {
             let pid = proc_.pid;
             drop(proc_);
-            futex::wait(pid, a0, a1 as u32).map(|_| 0).map_err(|e| match e {
+            // a2: timeout in microseconds, 0 for none.
+            let deadline = (a2 != 0).then(|| apic::micros().saturating_add(a2));
+            futex::wait(pid, a0, a1 as u32, deadline).map(|_| 0).map_err(|e| match e {
                 futex::WaitError::Again => E_AGAIN,
                 futex::WaitError::Fault => E_FAULT,
+                futex::WaitError::TimedOut => E_TIMEDOUT,
             })
         }
         SYS_FUTEX_WAKE => {
@@ -332,9 +338,15 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         SYS_GETPID => Ok(proc_.pid),
         SYS_SLEEP_MS => {
             drop(proc_);
-            sched::sleep_ticks(a0 * apic::TIMER_HZ / 1000);
+            sched::sleep_us(a0.saturating_mul(1000));
             Ok(0)
         }
+        SYS_SLEEP_US => {
+            drop(proc_);
+            sched::sleep_us(a0);
+            Ok(0)
+        }
+        SYS_CLOCK_US => Ok(apic::micros()),
         SYS_CPU_ID => Ok(percpu::this().index as u64),
         SYS_UPTIME_MS => Ok(sched::ticks() * 1000 / apic::TIMER_HZ),
         SYS_SPAWN => {

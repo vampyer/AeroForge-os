@@ -1,10 +1,14 @@
 //! priotest: a high-priority thread must run ahead of busy normal ones.
 //!
 //! It times a fixed piece of floating point work three ways: alone on an
-//! otherwise quiet machine; in a normal thread while eight normal threads
-//! spin on the four CPUs (it then gets about a third of a CPU); and in a
+//! otherwise quiet machine; in a normal thread while sixteen normal threads
+//! spin on the four CPUs (it then gets about a fifth of a CPU, and at
+//! least a quarter even when only an idle CPU balances and the spinners
+//! end up unevenly spread); and in a
 //! high-priority thread against the same spinners, which should take about
-//! as long as alone. It also checks the kernel refuses priorities above
+//! as long as alone. The work takes about 200 ms alone and is timed with
+//! the microsecond clock, so a few ticks of noise cannot flip the result
+//! (at 40 ms on a fast CI runner they once did). It also checks the kernel refuses priorities above
 //! `High` and threads of other programs.
 
 #![no_std]
@@ -21,8 +25,8 @@ use aero::{println, sys};
 
 aero::entry!(main);
 
-const SPINNERS: usize = 8;
-const STEPS: u32 = 4_000_000;
+const SPINNERS: usize = 16;
+const STEPS: u32 = 12_000_000;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -41,9 +45,9 @@ fn timed(p: Priority) -> (u64, u64) {
         if thread::set_priority(p).is_err() {
             return (u64::MAX, 0);
         }
-        let t0 = aero::uptime_ms();
+        let t0 = aero::clock_us();
         let r = work();
-        (aero::uptime_ms() - t0, r)
+        ((aero::clock_us() - t0) / 1000, r)
     })
     .expect("spawn")
     .join()
