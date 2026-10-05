@@ -189,6 +189,7 @@ pub fn poll_thread(_: u64) {
                 if let Some(c) = CONTROLLERS.lock().iter_mut().find(|c| c.id == id) {
                     c.devices = devices;
                 }
+                crate::block::sync_usb(id);
             }
             if PADS.lock().iter().any(|p| p.ctrl == id) {
                 drain_pads(id);

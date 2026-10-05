@@ -3,21 +3,27 @@
 # tools/usb-files/ and the design doc. QEMU attaches it as a USB stick
 # (usb-storage on the xHCI controller), so it tests USB mass storage. Needs
 # mkfs.fat (dosfstools), mtools and python3.
+# With arguments it builds another stick instead: make-usb-disk.sh <image>
+# <volume label> <files directory> (the boot test plugs one in later).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMG=build/usb.img
-PART=build/usb-part.img
+IMG=${1:-build/usb.img}
+LABEL=${2:-USBSTICK}
+FILES=${3:-tools/usb-files}
+PART=$IMG.part
 START=2048
 SECTORS=$((64 * 1024 * 2 - START))
 mkdir -p build
 
 rm -f "$PART"
 truncate -s $((SECTORS * 512)) "$PART"
-mkfs.fat -F 32 -s 1 -n USBSTICK "$PART" >/dev/null 2>&1
-mcopy -s -i "$PART" tools/usb-files/* ::/
-# A multi-cluster file bigger than one USB transfer, for checksum tests.
-mcopy -i "$PART" docs/AeroForge-OS-Design.md ::/
+mkfs.fat -F 32 -s 1 -n "$LABEL" "$PART" >/dev/null 2>&1
+mcopy -s -i "$PART" "$FILES"/* ::/
+if [ $# -eq 0 ]; then
+    # A multi-cluster file bigger than one USB transfer, for checksum tests.
+    mcopy -i "$PART" docs/AeroForge-OS-Design.md ::/
+fi
 
 truncate -s 0 "$IMG.tmp"
 truncate -s 64M "$IMG.tmp"

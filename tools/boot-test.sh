@@ -22,7 +22,8 @@
 # then the 'padtest' program must read all four gamepads through the
 # gamepad system call, in the Xbox layout; last, both USB pads unplug
 # themselves and plug back in (hot-plug on a root port and behind the hub),
-# and 'padtest' must read them again.
+# and 'padtest' must read them again; a second USB stick plugged into the
+# hub must be mounted and readable, and unmounted when it is pulled out.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -36,6 +37,7 @@ make iso >/dev/null
 ./tools/make-disk.sh >/dev/null
 ./tools/make-sata-disk.sh >/dev/null 2>&1
 ./tools/make-usb-disk.sh >/dev/null 2>&1
+./tools/make-usb-disk.sh build/usb2.img HOTSTICK tools/usb2-files >/dev/null 2>&1
 cc -O2 -Wall -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser -lm
 FAKEBT_LOG=build/fakebt.log
 build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin 2>"$FAKEBT_LOG" &
@@ -80,6 +82,7 @@ fail() {
 }
 
 type_keys() { python3 tools/qemu-type.py build/qemu-monitor.sock "$1"; }
+monitor() { python3 tools/qemu-monitor.py build/qemu-monitor.sock "$@" >/dev/null; }
 STAGE=0
 
 for _ in $(seq "$TIMEOUT"); do
@@ -116,13 +119,24 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; kill -USR1 $XPAD_PID $HIDPAD_PID; STAGE=14
     elif [ $STAGE = 14 ] && grep -q 'gamepad "Controller" plugged in on' "$LOG" && grep -q 'gamepad "Generic USB Joystick" plugged in on' "$LOG"; then
         sleep 3; type_keys $'run padtest\n'; STAGE=15
+    elif [ $STAGE = 15 ] && [ "$(grep -c "\[padtest\] [0-9]* gamepad(s)" "$LOG")" -ge 2 ]; then
+        # A second USB stick is plugged into the hub while the system runs...
+        monitor "drive_add 0 if=none,id=stick2,file=build/usb2.img,format=raw" \
+            "device_add usb-storage,bus=xhci.0,port=1.4,drive=stick2,id=stick2,serial=AEROUSB2"; STAGE=16
+    elif [ $STAGE = 16 ] && grep -q "mounted at /usb1p1" "$LOG"; then
+        sleep 1; type_keys $'cat /usb1p1/hot.txt\n'; STAGE=17
+    elif [ $STAGE = 17 ] && grep -q "This stick was plugged in while AeroForge was running" "$LOG"; then
+        # ...read, and pulled out again.
+        sleep 1; monitor "device_del stick2"; STAGE=18
+    elif [ $STAGE = 18 ] && grep -q "USB disk usb1 unplugged" "$LOG"; then
+        sleep 1; type_keys $'ls /usb1p1\n'; STAGE=19
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 15 ] && [ "$(grep -c "\[padtest\] [0-9]* gamepad(s)" "$LOG")" -ge 2 ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = 19 ] && grep -q "  /usb1p1: " "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -181,8 +195,12 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "xhci: hub [0-9]* port 3, slot [0-9]*: 0079:0006 \"Generic USB Joystick\" unplugged" "$LOG" || { fail "unplugging the HID pad from the hub went unnoticed" "$FAKEPAD_LOG"; }
         [ "$(grep -c "\[padtest\] .*\"Controller\" (USB, Xbox layout): A Y LB Start" "$LOG")" -ge 2 ] && [ "$(grep -c "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS" "$LOG")" -ge 2 ] \
             && [ "$(grep -c "\[padtest\] 4 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
+        grep -q "USB disk usb1 plugged in: .*USB \"QEMU QEMU HARDDISK\" serial AEROUSB2" "$LOG" || { fail "the USB stick plugged in later was not registered"; }
+        grep -q "FAT32 volume \"HOTSTICK\" on usb1p1 mounted at /usb1p1" "$LOG" || { fail "the USB stick plugged in later was not mounted"; }
+        grep -q "USB disk usb1 unplugged, /usb1p1 unmounted" "$LOG" || { fail "the unplugged USB stick was not unmounted"; }
+        grep -q "  /usb1p1: " "$LOG" || { fail "the unplugged USB stick's files were still reachable"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read and unmounted a USB stick plugged in while running, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

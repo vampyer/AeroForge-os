@@ -146,8 +146,15 @@ Bluetooth adapters, disks), and an unplugged one (with everything behind it, for
 back its slot and memory. The kernel notices through a change counter (`aero_xhci_generation`),
 refreshes `lsusb`, and marks unplugged gamepads as not connected; a pad plugged back into the
 same port takes its old place in the list. The simulated pads unplug and replug themselves in
-the boot test, one on a root port and one behind the hub. USB disks plugged in later are not
-mounted yet, and an adapter's Bluetooth host does not restart after a replug.
+the boot test, one on a root port and one behind the hub. An adapter's Bluetooth host does not
+restart after a replug yet.
+
+Since 0.17 a USB stick or drive plugged in while AeroForge runs is registered (the first free
+`usbN` name), its partitions are read and its FAT32 volumes mounted at `/usbNp1` and so on;
+pulling it out unmounts them and removes the disk. The mount list can change at run time now
+(lookups hold a reference to their volume, so a read in progress finishes safely). The boot test
+plugs a second stick into the hub through the QEMU monitor, reads a file from it and pulls it out
+again (`tools/qemu-monitor.py`).
 
 | Area | Status |
 |---|---|
