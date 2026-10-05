@@ -170,6 +170,7 @@ extern "C" {
     pub fn aero_xhci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_xhci_bt(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
     pub fn aero_xhci_pad(ctrl: i32, index: i32, out: *mut UsbDevice, desc: *mut u8, max: u32) -> i32;
+    pub fn aero_xhci_generation(ctrl: i32) -> u32;
     pub fn aero_xhci_pad_report(ctrl: i32, pad: *mut i32, data: *mut u8, max: u32) -> i32;
     pub fn aero_xhci_bt_send(bt: i32, kind: u8, data: *const u8, len: u32) -> i32;
     pub fn aero_xhci_bt_recv(bt: i32, kind: *mut u8, data: *mut u8, max: u32) -> i32;

@@ -50,32 +50,57 @@ pub fn probe() -> (usize, usize) {
                 "[WARN] xHCI at {:02x}:{:02x}.{}: init failed ({})\n", dev.bus, dev.dev, dev.func, id));
             continue;
         }
-        let devices = (0..count)
-            .filter_map(|i| {
-                let mut d = UsbDevice::zeroed();
-                (unsafe { dhi::aero_xhci_device(id, i, &mut d) } == 0).then_some(d)
-            })
-            .collect();
-        find_pads(id, &alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.dev, dev.func));
-        CONTROLLERS.lock().push(Controller {
-            id,
-            location: alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.dev, dev.func),
-            devices,
-        });
+        let location = alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.dev, dev.func);
+        sync_pads(id, &location, false);
+        CONTROLLERS.lock().push(Controller { id, location, devices: read_devices(id) });
         ctrls += 1;
         total += count as usize;
     }
     (ctrls, total)
 }
 
-/// Adds the controller's gamepads to the gamepad list.
-fn find_pads(ctrl: i32, location: &str) {
+/// The controller's devices (entries of unplugged ones are skipped).
+fn read_devices(ctrl: i32) -> Vec<UsbDevice> {
+    let mut devices = Vec::new();
+    for i in 0.. {
+        let mut d = UsbDevice::zeroed();
+        match unsafe { dhi::aero_xhci_device(ctrl, i, &mut d) } {
+            0 => devices.push(d),
+            1 => {}
+            _ => break,
+        }
+    }
+    devices
+}
+
+/// Brings the gamepad list up to date with the controller's gamepads:
+/// adds new ones (a pad plugged in again where it was before keeps its
+/// entry) and marks unplugged ones as not connected.
+fn sync_pads(ctrl: i32, location: &str, hotplug: bool) {
     let mut desc = alloc::vec![0u8; 1024];
     for index in 0.. {
         let mut d = UsbDevice::zeroed();
         let n = unsafe { dhi::aero_xhci_pad(ctrl, index, &mut d, desc.as_mut_ptr(), desc.len() as u32) };
-        if n < 0 {
+        if n == -1 {
             break;
+        }
+        let known = PADS.lock().iter().position(|p| p.ctrl == ctrl && p.index == index);
+        if n < 0 {
+            if let Some(i) = known {
+                let pad = PADS.lock().remove(i);
+                let mut gamepads = bt::GAMEPADS.lock();
+                if let Some(g) = gamepads.iter_mut().find(|g| g.usb.as_deref() == Some(pad.location.as_str())) {
+                    g.connected = false;
+                    g.pad = hid::Pad::default();
+                    let name = g.name.clone();
+                    drop(gamepads);
+                    crate::kok!("gamepad \"{}\" unplugged from {}", name, pad.location);
+                }
+            }
+            continue;
+        }
+        if known.is_some() {
+            continue;
         }
         let layout = hid::parse(&desc[..n as usize]);
         let name = String::from(dhi::c_field(&d.name));
@@ -84,11 +109,20 @@ fn find_pads(ctrl: i32, location: &str) {
         } else {
             alloc::format!("USB {} port {}", location, d.port)
         };
-        let kind = if d.iface_class == 0xFF { "Xbox 360 style " } else { "" };
-        crate::kok!("{}gamepad \"{}\" on {} ({})", kind, name, place, layout.summary());
-        bt::GAMEPADS.lock().push(bt::Gamepad { adapter: usize::MAX, address: [0; 6], name, connected: true,
-            layout: layout.summary(), axes: layout.axis_mask(), reports: 0, pad: hid::Pad::default(),
-            usb: Some(place.clone()), xinput: d.iface_class == 0xFF });
+        let xinput = d.iface_class == 0xFF;
+        let kind = if xinput { "Xbox 360 style " } else { "" };
+        crate::kok!("{}gamepad \"{}\" {} {} ({})", kind, name, if hotplug { "plugged in on" } else { "on" }, place,
+            layout.summary());
+        {
+            let mut gamepads = bt::GAMEPADS.lock();
+            let entry = bt::Gamepad { adapter: usize::MAX, address: [0; 6], name, connected: true,
+                layout: layout.summary(), axes: layout.axis_mask(), reports: 0, pad: hid::Pad::default(),
+                usb: Some(place.clone()), xinput };
+            match gamepads.iter_mut().find(|g| g.usb.as_deref() == Some(place.as_str())) {
+                Some(g) => *g = entry,
+                None => gamepads.push(entry),
+            }
+        }
         PADS.lock().push(Pad { ctrl, index, location: place, layout });
     }
 }
@@ -116,13 +150,13 @@ fn drain_pads(ctrl: i32) {
 /// Kernel thread: drains every controller's events about every 10 ms.
 pub fn poll_thread(_: u64) {
     let ids: Vec<i32> = CONTROLLERS.lock().iter().map(|c| c.id).collect();
-    let pads: Vec<i32> = PADS.lock().iter().map(|p| p.ctrl).collect();
+    let mut generations: Vec<u32> = ids.iter().map(|&id| unsafe { dhi::aero_xhci_generation(id) }).collect();
     let (w, h) = console::CONSOLE.lock().screen_size().unwrap_or((1280, 800));
     MOUSE_X.store(w as i32 / 2, Ordering::Relaxed);
     MOUSE_Y.store(h as i32 / 2, Ordering::Relaxed);
     let mut events = [InputEvent::default(); 32];
     loop {
-        for &id in &ids {
+        for (k, &id) in ids.iter().enumerate() {
             let n = unsafe { dhi::aero_xhci_poll(id, events.as_mut_ptr(), events.len() as i32) };
             for ev in &events[..n.max(0) as usize] {
                 match ev.kind {
@@ -143,7 +177,20 @@ pub fn poll_thread(_: u64) {
                     _ => {}
                 }
             }
-            if pads.contains(&id) {
+            let generation = unsafe { dhi::aero_xhci_generation(id) };
+            if generations[k] != generation {
+                // Something was plugged in or unplugged.
+                generations[k] = generation;
+                let location = CONTROLLERS.lock().iter().find(|c| c.id == id).map(|c| c.location.clone());
+                if let Some(location) = location {
+                    sync_pads(id, &location, true);
+                }
+                let devices = read_devices(id);
+                if let Some(c) = CONTROLLERS.lock().iter_mut().find(|c| c.id == id) {
+                    c.devices = devices;
+                }
+            }
+            if PADS.lock().iter().any(|p| p.ctrl == id) {
                 drain_pads(id);
             }
         }

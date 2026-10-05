@@ -19,8 +19,10 @@
 # report again. Two simulated USB gamepads (tools/fakepad), an Xbox 360 style
 # one and a HID one behind the hub, must show up in 'gamepad' with their
 # input decoded, and the Xbox style one must get its player 1 LED command;
-# last, the 'padtest' program must read all four gamepads through the
-# gamepad system call, in the Xbox layout.
+# then the 'padtest' program must read all four gamepads through the
+# gamepad system call, in the Xbox layout; last, both USB pads unplug
+# themselves and plug back in (hot-plug on a root port and behind the hub),
+# and 'padtest' must read them again.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -106,13 +108,21 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; type_keys $'gamepad\n'; STAGE=11
     elif [ $STAGE = 11 ] && [ "$(grep -c '"BLE Pad" on hci0' "$LOG")" -ge 2 ]; then
         sleep 1; type_keys $'run padtest\n'; STAGE=12
+    elif [ $STAGE = 12 ] && grep -q "\[padtest\] [0-9]* gamepad(s)" "$LOG"; then
+        # Hot-plug: the simulated pads unplug themselves (one on a root port, one behind the hub)...
+        kill -USR1 $XPAD_PID $HIDPAD_PID; STAGE=13
+    elif [ $STAGE = 13 ] && grep -q 'gamepad "Controller" unplugged' "$LOG" && grep -q 'gamepad "Generic USB Joystick" unplugged' "$LOG"; then
+        # ...and plug themselves in again.
+        sleep 1; kill -USR1 $XPAD_PID $HIDPAD_PID; STAGE=14
+    elif [ $STAGE = 14 ] && grep -q 'gamepad "Controller" plugged in on' "$LOG" && grep -q 'gamepad "Generic USB Joystick" plugged in on' "$LOG"; then
+        sleep 3; type_keys $'run padtest\n'; STAGE=15
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 12 ] && grep -q "\[padtest\] [0-9]* gamepad(s)" "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = 15 ] && [ "$(grep -c "\[padtest\] [0-9]* gamepad(s)" "$LOG")" -ge 2 ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -167,8 +177,12 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS, d-pad left, left stick -32766 +0, right stick +32766 +0, triggers 0 0" "$LOG" \
             || { fail "the gamepad system call did not give the HID pad"; }
         grep -q "\[padtest\] 4 gamepad(s)" "$LOG" || { fail "the gamepad system call did not list all four gamepads"; }
+        grep -q "xhci: port 8, slot [0-9]*: 045e:028e \"Controller\" unplugged" "$LOG" || { fail "unplugging the Xbox style pad from its root port went unnoticed" "$FAKEPAD_LOG"; }
+        grep -q "xhci: hub [0-9]* port 3, slot [0-9]*: 0079:0006 \"Generic USB Joystick\" unplugged" "$LOG" || { fail "unplugging the HID pad from the hub went unnoticed" "$FAKEPAD_LOG"; }
+        [ "$(grep -c "\[padtest\] .*\"Controller\" (USB, Xbox layout): A Y LB Start" "$LOG")" -ge 2 ] && [ "$(grep -c "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS" "$LOG")" -ge 2 ] \
+            && [ "$(grep -c "\[padtest\] 4 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
