@@ -1,0 +1,2 @@
+Hello from a USB stick!
+AeroForge OS read this file over USB: xHCI, bulk-only transport, SCSI READ(10).

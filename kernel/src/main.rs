@@ -198,6 +198,13 @@ extern "C" fn kmain() -> ! {
     if xhci > 0 {
         kok!("C++ xHCI driver attached through DHI v{}: {} controller(s), {} USB device(s)", dhi::ABI_VERSION, xhci, usb_devices);
     }
+    let usb_disks = block::probe_usb();
+    for d in block::DEVICES.lock().iter().filter(|d| d.name().starts_with("usb")) {
+        console::print_colored(console::DIM, format_args!("       {}: {}\n", d.name(), d.describe()));
+    }
+    if usb_disks > 0 {
+        kok!("USB mass storage: {} disk(s)", usb_disks);
+    }
     let nics = net::probe();
     for n in net::NICS.lock().iter() {
         console::print_colored(console::DIM, format_args!("       {}: Intel {:04x}:{:04x} ({} driver) at {}, MAC {}, link {}\n",

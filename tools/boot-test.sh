@@ -2,7 +2,7 @@
 # Boots the ISO headless in QEMU and passes if every CPU comes online and the
 # user-mode IPC demo completes (aerosmss starts echod and three clients, each
 # client finishes its round trips), and both the NVMe (GPT) and SATA (MBR)
-# test disks get mounted, and a USB keyboard and mouse get set up behind a USB hub, and the
+# test disks and a USB stick get mounted, and a USB keyboard and mouse get set up behind a USB hub, and the
 # Intel igb card gets an address over DHCP and pings the gateway (a second,
 # e1000e card must come up with a link). Intended for CI (design doc, Phase 0).
 set -euo pipefail
@@ -16,6 +16,7 @@ LOG=build/boot-test.log
 make iso >/dev/null
 ./tools/make-disk.sh >/dev/null
 ./tools/make-sata-disk.sh >/dev/null 2>&1
+./tools/make-usb-disk.sh >/dev/null 2>&1
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG"
 
@@ -26,6 +27,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive file=build/sata.img,if=none,id=sata,format=raw -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1 \
     -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
     -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
+    -drive file=build/usb.img,if=none,id=stick,format=raw -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
     -nic user,model=igb -nic user,model=e1000e \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none &
 QEMU_PID=$!
@@ -43,8 +45,9 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[aerosmss\] all services up" "$LOG" || { echo "FAIL: aerosmss did not finish startup"; exit 1; }
         grep -q "mounted at /" "$LOG" || { echo "FAIL: NVMe FAT32 volume not mounted"; exit 1; }
         grep -q "mounted at /sata0p1" "$LOG" || { echo "FAIL: SATA FAT32 volume not mounted"; exit 1; }
-        grep -q "hub 1 port 1, .*HID boot keyboard" "$LOG" || { echo "FAIL: USB keyboard behind the hub not set up"; exit 1; }
-        grep -q "hub 1 port 2, .*HID boot mouse" "$LOG" || { echo "FAIL: USB mouse behind the hub not set up"; exit 1; }
+        grep -q "mounted at /usb0p1" "$LOG" || { echo "FAIL: USB stick FAT32 volume not mounted"; exit 1; }
+        grep -q "hub [0-9]* port 1, .*HID boot keyboard" "$LOG" || { echo "FAIL: USB keyboard behind the hub not set up"; exit 1; }
+        grep -q "hub [0-9]* port 2, .*HID boot mouse" "$LOG" || { echo "FAIL: USB mouse behind the hub not set up"; exit 1; }
         grep -q "Security audit passed" "$LOG" || { echo "FAIL: kernel security audit did not pass"; exit 1; }
         grep -q "SMEP on, SMAP on" "$LOG" || { echo "FAIL: SMEP/SMAP not enabled"; exit 1; }
         grep -q "attacks blocked, system call checks OK" "$LOG" || { echo "FAIL: sectest: a bad pointer got through a system call"; exit 1; }
@@ -55,7 +58,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "DHCP: eth0 got 10.0.2.15/24, gateway 10.0.2.2" "$LOG" || { echo "FAIL: no DHCP lease"; exit 1; }
         grep -q "ping 10.0.2.2: reply from 10.0.2.2" "$LOG" || { echo "FAIL: no ping reply from the gateway"; exit 1; }
         grep -q "read /system/session.cfg" "$LOG" || { echo "FAIL: aerosmss did not read its config from disk"; exit 1; }
-        echo "PASS: booted, mounted the NVMe and SATA disks, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

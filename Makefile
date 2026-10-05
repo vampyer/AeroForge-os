@@ -2,7 +2,7 @@
 #   make            build the UEFI boot ISO (build/aeroforge.iso)
 #   make run        boot it in QEMU with a window
 #   make run-headless   boot with serial on stdout, no display (CI)
-#   make disk       rebuild the NVMe and SATA disk images (build/disk.img, build/sata.img)
+#   make disk       rebuild the NVMe, SATA and USB disk images (build/disk.img, build/sata.img, build/usb.img)
 #   make clean
 
 LIMINE_BRANCH ?= v9.x-binary
@@ -47,12 +47,16 @@ iso: kernel userland $(LIMINE)/BOOTX64.EFI
 disk:
 	./tools/make-disk.sh
 	./tools/make-sata-disk.sh
+	./tools/make-usb-disk.sh
 
 $(BUILD)/disk.img:
 	./tools/make-disk.sh
 
 $(BUILD)/sata.img:
 	./tools/make-sata-disk.sh
+
+$(BUILD)/usb.img:
+	./tools/make-usb-disk.sh
 
 $(BUILD)/vars.fd:
 	mkdir -p $(BUILD)
@@ -66,12 +70,14 @@ NVME_ARGS = -drive file=$(BUILD)/disk.img,if=none,id=nvm,format=raw \
             -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1 \
             -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
             -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
+            -drive file=$(BUILD)/usb.img,if=none,id=stick,format=raw \
+            -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
             -nic user,model=igb
 
-run: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img
+run: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img $(BUILD)/usb.img
 	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio
 
-run-headless: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img
+run-headless: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img $(BUILD)/usb.img
 	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio -display none
 
 clean:

@@ -86,7 +86,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.6, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.7, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
