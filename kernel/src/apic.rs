@@ -155,6 +155,11 @@ pub fn route_isa_irq(irq: u8, vector: u8, lapic_id: u32) {
 }
 
 /// Busy-waits using the TSC (calibrated against the PIT at boot).
+/// Microseconds since boot, from the TSC: finer than the 10 ms timer tick.
+pub fn micros() -> u64 {
+    arch::rdtsc() / TSC_PER_US.load(Ordering::Relaxed)
+}
+
 pub fn delay_us(us: u64) {
     let end = arch::rdtsc() + us * TSC_PER_US.load(Ordering::Relaxed);
     while arch::rdtsc() < end {

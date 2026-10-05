@@ -18,7 +18,11 @@ constexpr uint32_t kCtrl    = 0x0000;
 constexpr uint32_t kStatus  = 0x0008;
 constexpr uint32_t kCtrlExt = 0x0018;
 constexpr uint32_t kMdic    = 0x0020;
-constexpr uint32_t kImc     = 0x1528;  // interrupt mask clear (igb/igc location)
+// Interrupt cause / mask set / mask clear: igb keeps them at the e1000
+// offsets, igc moved them to 0x1500 (Linux e1000_regs.h vs igc_regs.h).
+constexpr uint32_t kIgbIcr = 0x00C0, kIgbIms = 0x00D0, kIgbImc = 0x00D8;
+constexpr uint32_t kIgcIcr = 0x1500, kIgcIms = 0x1508, kIgcImc = 0x150C;
+constexpr uint32_t kImc     = 0x1528;  // extended interrupt mask clear (EIMC)
 constexpr uint32_t kRctl    = 0x0100;
 constexpr uint32_t kTctl    = 0x0400;
 constexpr uint32_t kEeer    = 0x0E30;  // EEE control
@@ -48,6 +52,14 @@ constexpr uint32_t kStatusLinkUp = 1u << 1;
 constexpr uint32_t kStatusSpeed2500 = 1u << 22;  // igc
 constexpr uint32_t kCtrlExtDrvLoad = 1u << 28;  // tells the firmware a driver owns the port
 constexpr uint32_t kQueueEnable = 1u << 25;
+
+// Interrupt causes the kernel is woken for: link change, a received frame
+// (and the receive ring running low or overflowing), a transmit done.
+constexpr uint32_t kIntTxdw  = 1u << 0;
+constexpr uint32_t kIntLsc   = 1u << 2;
+constexpr uint32_t kIntRxdmt = 1u << 4;
+constexpr uint32_t kIntRxo   = 1u << 6;
+constexpr uint32_t kIntRxt   = 1u << 7;
 
 constexpr uint32_t kRctlEn    = 1u << 1;
 constexpr uint32_t kRctlBam   = 1u << 15;
@@ -115,11 +127,13 @@ public:
         // Reset with interrupts masked (we poll). The MAC address and PHY
         // settings reload from the NVM during reset.
         write(kImc, 0xFFFFFFFF);
+        write(igc() ? kIgcImc : kIgbImc, 0xFFFFFFFF);
         const uint32_t rst = family_ == Family::Igc ? kCtrlDevRst : kCtrlRst;
         write(kCtrl, read(kCtrl) | rst);
         ops_->delay_us(20000);
         for (int i = 0; i < 1000 && (read(kCtrl) & rst); ++i) ops_->delay_us(100);
         write(kImc, 0xFFFFFFFF);
+        write(igc() ? kIgcImc : kIgbImc, 0xFFFFFFFF);
         write(kCtrlExt, read(kCtrlExt) | kCtrlExtDrvLoad);
 
         if (family_ == Family::Igc) {
@@ -187,6 +201,19 @@ public:
         rx_next_ = (rx_next_ + 1) % kRxCount;
         return n;
     }
+
+    // One MSI-X/MSI vector for every cause (GPIE left in its single-vector
+    // mode); the kernel already pointed it at the network thread.
+    void enable_irq() {
+        (void)read(igc() ? kIgcIcr : kIgbIcr);
+        write(igc() ? kIgcIms : kIgbIms, kIntTxdw | kIntLsc | kIntRxdmt | kIntRxo | kIntRxt);
+    }
+
+    // Reading ICR clears it, so the card interrupts again for the next frame.
+    // Call before draining the receive ring.
+    uint32_t ack_irq() const { return read(igc() ? kIgcIcr : kIgbIcr); }
+
+    bool igc() const { return family_ == Family::Igc; }
 
     bool link_up() const { return read(kStatus) & kStatusLinkUp; }
 
@@ -342,6 +369,15 @@ extern "C" int32_t aero_igc_send(int32_t nic, const void* frame, uint32_t len) {
 extern "C" int32_t aero_igc_recv(int32_t nic, void* frame, uint32_t max) {
     if (nic < 0 || nic >= g_count || frame == nullptr) return -1;
     return g_nics[nic].recv(frame, max);
+}
+
+extern "C" void aero_igc_enable_irq(int32_t nic) {
+    if (nic >= 0 && nic < g_count) g_nics[nic].enable_irq();
+}
+
+extern "C" uint32_t aero_igc_ack_irq(int32_t nic) {
+    if (nic < 0 || nic >= g_count) return 0;
+    return g_nics[nic].ack_irq();
 }
 
 extern "C" int32_t aero_igc_link(int32_t nic, uint32_t* speed_mbps) {

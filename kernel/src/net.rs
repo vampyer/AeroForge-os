@@ -1,6 +1,9 @@
 //! Networking: finds Intel Ethernet controllers, brings them up through the
 //! C++ e1000 driver and runs a smoltcp TCP/IP stack on the first one from a
 //! kernel thread. DHCP configures the address; `ping` sends ICMP echoes.
+//! On igb/igc cards the thread sleeps until the card's MSI-X interrupt says
+//! a frame arrived (or smoltcp's next timer is due) instead of polling every
+//! tick.
 
 use alloc::string::String;
 use alloc::vec;
@@ -74,6 +77,7 @@ pub struct Nic {
     pub location: String,
     pub pci_id: (u16, u16),
     pub info: NetInfo,
+    pub pci: pci::Device,
 }
 
 /// What DHCP gave the interface.
@@ -98,6 +102,20 @@ struct PingJob {
 }
 
 static PING: IrqMutex<Option<PingJob>> = IrqMutex::new(None);
+
+/// Wakes the network thread: the card's interrupt, or a new ping job.
+static WAKE: sched::Event = sched::Event::new();
+pub static IRQS: AtomicU64 = AtomicU64::new(0);
+
+fn on_irq() {
+    IRQS.fetch_add(1, Ordering::Relaxed);
+    WAKE.signal();
+}
+
+/// The longest the network thread sleeps when nothing happens: smoltcp's
+/// timers (DHCP renewals, TCP retransmits) and pings are checked at least
+/// this often.
+const MAX_SLEEP_TICKS: u64 = 10;
 
 /// Brings up every supported Intel NIC. Returns how many came up.
 pub fn probe() -> usize {
@@ -128,7 +146,7 @@ pub fn probe() -> usize {
         }
         let mut nics = NICS.lock();
         let name = alloc::format!("eth{}", nics.len());
-        nics.push(Nic { port: Port { driver, id }, driver_name, name, location: at, pci_id: (dev.vendor, dev.device), info });
+        nics.push(Nic { port: Port { driver, id }, driver_name, name, location: at, pci_id: (dev.vendor, dev.device), info, pci: *dev });
         found += 1;
     }
     found
@@ -206,7 +224,21 @@ const PING_IDENT: u16 = 0xAE40;
 
 /// Kernel thread: runs the TCP/IP stack on the first NIC, about every 10 ms.
 pub fn net_thread(_: u64) {
-    let Some((nic, mac)) = NICS.lock().first().map(|n| (n.port, n.info.mac)) else { return };
+    let Some((nic, mac, pci, name)) = NICS.lock().first().map(|n| (n.port, n.info.mac, n.pci, n.name.clone())) else { return };
+    // Interrupts aimed at this CPU, where this thread runs. igb/igc only:
+    // the e1000 family stays polled.
+    let irq = if nic.driver == Driver::Igc {
+        crate::msi::attach(&pci, &alloc::format!("{} ({:02x}:{:02x}.{})", name, pci.bus, pci.dev, pci.func), on_irq, crate::percpu::this().index)
+    } else {
+        None
+    };
+    match irq {
+        Some(kind) => {
+            unsafe { dhi::aero_igc_enable_irq(nic.id) };
+            console::print_colored(console::DIM, format_args!("       {}: {} interrupts on, receiving at once when frames arrive\n", name, kind));
+        }
+        None => console::print_colored(console::DIM, format_args!("       {}: polled every tick\n", name)),
+    }
     let mut device = Device { nic, rx: [0; 2048] };
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(config, &mut device, now());
@@ -223,6 +255,10 @@ pub fn net_thread(_: u64) {
     let mut pinger = Pinger::default();
     let mut pinged_gateway = false;
     loop {
+        if irq.is_some() {
+            // Clear the causes first: a frame arriving after this interrupts again.
+            unsafe { dhi::aero_igc_ack_irq(nic.id) };
+        }
         iface.poll(now(), &mut device, &mut sockets);
 
         if let Some(event) = sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
@@ -262,7 +298,15 @@ pub fn net_thread(_: u64) {
         }
 
         pinger.step(&mut sockets, icmp, &ChecksumCapabilities::default());
-        sched::sleep_ticks(1);
+        if irq.is_some() {
+            // Send what the pinger just queued now, not after the sleep.
+            iface.poll(now(), &mut device, &mut sockets);
+            // Sleep until a frame arrives or smoltcp has a timer due.
+            let ticks = iface.poll_delay(now(), &sockets).map_or(MAX_SLEEP_TICKS, |d| d.total_millis() * apic::TIMER_HZ / 1000);
+            WAKE.wait(ticks.clamp(1, MAX_SLEEP_TICKS));
+        } else {
+            sched::sleep_ticks(1);
+        }
     }
 }
 
@@ -277,6 +321,7 @@ struct Pinger {
     sent: u16,
     received: u16,
     sent_at: u64,
+    sent_us: u64,
     active: bool,
 }
 
@@ -297,8 +342,8 @@ impl Pinger {
             let Ok(packet) = Icmpv4Packet::new_checked(payload) else { continue };
             if let Ok(Icmpv4Repr::EchoReply { ident: PING_IDENT, seq_no, .. }) = Icmpv4Repr::parse(&packet, caps) {
                 self.received += 1;
-                let ms = (t - self.sent_at) * 1000 / apic::TIMER_HZ;
-                crate::kok!("ping {}: reply from {}, seq {}, time {} ms", target, from, seq_no, ms);
+                let us = apic::micros().saturating_sub(self.sent_us);
+                crate::kok!("ping {}: reply from {}, seq {}, time {}.{:03} ms", target, from, seq_no, us / 1000, us % 1000);
             }
         }
 
@@ -311,6 +356,7 @@ impl Pinger {
                 self.seq = self.seq.wrapping_add(1);
                 self.sent += 1;
                 self.sent_at = t;
+                self.sent_us = apic::micros();
             }
         } else if self.sent >= count && (self.received >= self.sent || t >= self.sent_at + timeout) {
             let lost = self.sent - self.received.min(self.sent);
@@ -341,6 +387,7 @@ pub fn ping(target: Ipv4Addr, count: u16) -> Result<(), &'static str> {
         }
         *job = Some(PingJob { target, count, done: false });
     }
+    WAKE.signal();
     while PING.lock().as_ref().is_some_and(|j| !j.done) {
         sched::sleep_ticks(5);
     }
