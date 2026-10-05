@@ -1,15 +1,18 @@
-//! The (very) early file namespace. Every FAT32 volume found at boot is
-//! mounted read-only: the first one at "/", each further one at
-//! "/<device name>" (for example "/sata0p1"). Real mount tables, more
-//! filesystems and user-space filesystem servers come with Phase 2.
+//! The (very) early file namespace. Every FAT32 volume is mounted
+//! read-only: the first one found at boot at "/", each further one at
+//! "/<device name>" (for example "/sata0p1"). Volumes on USB disks plugged
+//! in later are mounted the same way and go away when the disk is
+//! unplugged. Real mount tables, more filesystems and user-space filesystem
+//! servers come with Phase 2.
 
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Once;
 
-use crate::block::DEVICES;
+use crate::block::{BlockDevice, DEVICES};
 use crate::fat::{DirEntry, FatVolume};
+use crate::sync::IrqMutex;
 
 pub struct Mount {
     /// "/" for the root volume, "/<device>" for the others.
@@ -17,41 +20,64 @@ pub struct Mount {
     pub vol: FatVolume,
 }
 
-static MOUNTS: Once<Vec<Mount>> = Once::new();
+/// Root first. Lookups clone the Arc and drop the lock before touching the disk.
+static MOUNTS: IrqMutex<Vec<Arc<Mount>>> = IrqMutex::new(Vec::new());
 
-/// Mounts every FAT32 volume. Returns the mounts made, root first.
-pub fn mount_all() -> &'static [Mount] {
-    MOUNTS.call_once(|| {
-        let devices: Vec<_> = DEVICES.lock().iter().cloned().collect();
-        let mut mounts = Vec::new();
-        for dev in devices {
-            if let Ok(vol) = FatVolume::mount(dev) {
-                let path = if mounts.is_empty() { String::from("/") } else { format!("/{}", vol.dev.name()) };
-                mounts.push(Mount { path, vol });
-            }
-        }
-        mounts
-    })
+/// Mounts every FAT32 volume found at boot. Returns the mounts made, root first.
+pub fn mount_all() -> Vec<Arc<Mount>> {
+    let devices: Vec<_> = DEVICES.lock().iter().cloned().collect();
+    for dev in devices {
+        mount(dev);
+    }
+    MOUNTS.lock().clone()
 }
 
-fn mounts() -> Result<&'static [Mount], &'static str> {
-    match MOUNTS.get() {
-        Some(m) if !m.is_empty() => Ok(m),
-        _ => Err("no filesystem mounted"),
+/// Mounts `dev` if it holds a FAT32 volume and is not mounted yet.
+pub fn mount(dev: Arc<dyn BlockDevice>) -> Option<Arc<Mount>> {
+    if mount_point_of(dev.name()).is_some() {
+        return None;
     }
+    let vol = FatVolume::mount(dev).ok()?;
+    let mut mounts = MOUNTS.lock();
+    let path = if mounts.is_empty() { String::from("/") } else { format!("/{}", vol.dev.name()) };
+    let m = Arc::new(Mount { path, vol });
+    mounts.push(m.clone());
+    Some(m)
+}
+
+/// Unmounts the volumes on disk `disk` (the disk itself and its partitions).
+/// Returns the mount points removed.
+pub fn unmount_disk(disk: &str) -> Vec<String> {
+    let mut gone = Vec::new();
+    MOUNTS.lock().retain(|m| {
+        let keep = !crate::block::on_disk(m.vol.dev.name(), disk);
+        if !keep {
+            gone.push(m.path.clone());
+        }
+        keep
+    });
+    gone
+}
+
+fn mounts() -> Result<Vec<Arc<Mount>>, &'static str> {
+    let m = MOUNTS.lock().clone();
+    if m.is_empty() { Err("no filesystem mounted") } else { Ok(m) }
 }
 
 /// Picks the volume a path lives on and returns the path inside that volume.
-fn resolve(path: &str) -> Result<(&'static Mount, &str), &'static str> {
+fn resolve(path: &str) -> Result<(Arc<Mount>, &str), &'static str> {
     let mounts = mounts()?;
     let trimmed = path.trim_start_matches('/');
     let (first, rest) = trimmed.split_once('/').unwrap_or((trimmed, ""));
-    for m in &mounts[1..] {
+    for m in mounts.iter().filter(|m| m.path != "/") {
         if m.path[1..].eq_ignore_ascii_case(first) {
-            return Ok((m, rest));
+            return Ok((m.clone(), rest));
         }
     }
-    Ok((&mounts[0], path))
+    match mounts.iter().find(|m| m.path == "/") {
+        Some(root) => Ok((root.clone(), path)),
+        None => Err("no filesystem mounted at /"),
+    }
 }
 
 fn is_root(path: &str) -> bool {
@@ -63,7 +89,7 @@ pub fn list(path: &str) -> Result<Vec<DirEntry>, &'static str> {
     let mut entries = m.vol.list(inner)?;
     // Mount points show up as directories in "/".
     if is_root(path) {
-        for other in &mounts()?[1..] {
+        for other in mounts()?.iter().filter(|m| m.path != "/") {
             entries.push(DirEntry::mount_point(&other.path[1..]));
         }
     }
@@ -76,6 +102,6 @@ pub fn read(path: &str, limit: usize) -> Result<Vec<u8>, &'static str> {
 }
 
 /// Where a block device is mounted, if anywhere.
-pub fn mount_point_of(dev: &str) -> Option<&'static str> {
-    MOUNTS.get()?.iter().find(|m| m.vol.dev.name() == dev).map(|m| m.path.as_str())
+pub fn mount_point_of(dev: &str) -> Option<String> {
+    MOUNTS.lock().iter().find(|m| m.vol.dev.name() == dev).map(|m| m.path.clone())
 }

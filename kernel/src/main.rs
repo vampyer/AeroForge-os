@@ -239,7 +239,7 @@ extern "C" fn kmain() -> ! {
         kok!("C++ HD Audio driver attached through DHI v{}: {} controller(s)", dhi::ABI_VERSION, cards);
     }
     let mounts = vfs::mount_all();
-    for m in mounts {
+    for m in &mounts {
         kok!("FAT32 volume \"{}\" on {} mounted at {} (read-only)", m.vol.label, m.vol.dev.name(), m.path);
     }
     if mounts.is_empty() {

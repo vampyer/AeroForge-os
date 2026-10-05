@@ -45,6 +45,12 @@ pub struct DriverDisk {
 unsafe impl Send for DriverDisk {}
 unsafe impl Sync for DriverDisk {}
 
+impl Drop for DriverDisk {
+    fn drop(&mut self) {
+        (dhi::OPS.dma_free)(&*self.bounce.lock());
+    }
+}
+
 impl BlockDevice for DriverDisk {
     fn name(&self) -> &str {
         &self.name
@@ -149,23 +155,101 @@ pub fn probe_ahci() -> usize {
     found
 }
 
+/// A USB disk the kernel registered, to tell when it is unplugged.
+struct UsbDisk {
+    name: String,
+    ctrl: i32,
+    id: i32,
+    block_count: u64,
+    serial: String,
+}
+
+static USB_DISKS: IrqMutex<Vec<UsbDisk>> = IrqMutex::new(Vec::new());
+
+/// The USB disks the controller has now: (disk id, info).
+fn usb_disks_of(ctrl: i32) -> Vec<(i32, BlockInfo)> {
+    let mut disks = Vec::new();
+    for index in 0.. {
+        let mut info = BlockInfo::zeroed();
+        let id = unsafe { dhi::aero_xhci_disk(ctrl, index, &mut info) };
+        if id < 0 {
+            break;
+        }
+        disks.push((id, info));
+    }
+    disks
+}
+
+fn add_usb(ctrl: i32, id: i32, info: &BlockInfo) -> Option<String> {
+    let name = {
+        let disks = USB_DISKS.lock();
+        let n = (0..).find(|n| !disks.iter().any(|d| d.name == format!("usb{}", n))).unwrap_or(0);
+        format!("usb{}", n)
+    };
+    if !add_disk(name.clone(), Backend::Usb(id), info) {
+        return None;
+    }
+    USB_DISKS.lock().push(UsbDisk { name: name.clone(), ctrl, id, block_count: info.block_count,
+        serial: String::from(dhi::c_field(&info.serial)) });
+    Some(name)
+}
+
 /// Registers the USB sticks and drives the xHCI driver found (call after usb::probe).
 pub fn probe_usb() -> usize {
     let mut found = 0;
     let ids: Vec<i32> = crate::usb::CONTROLLERS.lock().iter().map(|c| c.id).collect();
     for ctrl in ids {
-        for index in 0.. {
-            let mut info = BlockInfo::zeroed();
-            let disk = unsafe { dhi::aero_xhci_disk(ctrl, index, &mut info) };
-            if disk < 0 {
-                break;
-            }
-            if add_disk(format!("usb{}", found), Backend::Usb(disk), &info) {
+        for (id, info) in usb_disks_of(ctrl) {
+            if add_usb(ctrl, id, &info).is_some() {
                 found += 1;
             }
         }
     }
     found
+}
+
+/// True if block device `dev` is disk `disk` or one of its partitions.
+pub fn on_disk(dev: &str, disk: &str) -> bool {
+    dev == disk || dev.strip_prefix(disk).is_some_and(|rest| rest.starts_with('p'))
+}
+
+/// Brings the controller's USB disks up to date after something was plugged
+/// in or unplugged: unplugged disks are unmounted and forgotten, new ones
+/// registered and their FAT32 volumes mounted.
+pub fn sync_usb(ctrl: i32) {
+    let now = usb_disks_of(ctrl);
+    let gone: Vec<String> = USB_DISKS.lock().iter()
+        .filter(|d| d.ctrl == ctrl && !now.iter().any(|(id, info)| *id == d.id && info.block_count == d.block_count
+            && dhi::c_field(&info.serial) == d.serial))
+        .map(|d| d.name.clone())
+        .collect();
+    for name in gone {
+        let unmounted = crate::vfs::unmount_disk(&name);
+        DEVICES.lock().retain(|d| !on_disk(d.name(), &name));
+        USB_DISKS.lock().retain(|d| d.name != name);
+        if unmounted.is_empty() {
+            crate::kok!("USB disk {} unplugged", name);
+        } else {
+            crate::kok!("USB disk {} unplugged, {} unmounted", name, unmounted.join(", "));
+        }
+    }
+    for (id, info) in now {
+        if USB_DISKS.lock().iter().any(|d| d.ctrl == ctrl && d.id == id) {
+            continue;
+        }
+        let Some(name) = add_usb(ctrl, id, &info) else { continue };
+        let devices: Vec<_> = DEVICES.lock().iter().filter(|d| on_disk(d.name(), &name)).cloned().collect();
+        for d in &devices {
+            if d.name() == name {
+                crate::kok!("USB disk {} plugged in: {}", name, d.describe());
+            }
+        }
+        for d in devices {
+            if let Some(m) = crate::vfs::mount(d) {
+                crate::kok!("FAT32 volume \"{}\" on {} mounted at {} (read-only)", m.vol.label, m.vol.dev.name(), m.path);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------- partitions
