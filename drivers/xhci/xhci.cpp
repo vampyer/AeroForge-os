@@ -205,7 +205,7 @@ public:
         const uint32_t hcc1 = cap32(kHccParams1);
         ctx_size_ = (hcc1 & (1u << 2)) ? 64 : 32;
 
-        take_ownership(hcc1 >> 16);
+        walk_capabilities(hcc1 >> 16);
         if (!reset()) return -2;
         if (!setup_memory()) return -3;
 
@@ -242,7 +242,10 @@ private:
 
     // Asks the firmware to give up the controller (USB legacy support
     // capability), so it stops emulating PS/2 behind our back.
-    void take_ownership(uint32_t xecp) {
+    // Walks the extended capabilities: takes the controller from the firmware
+    // (USB legacy support) and reads which root ports speak USB 2 or USB 3 and
+    // what each port speed ID means (supported protocol).
+    void walk_capabilities(uint32_t xecp) {
         uint32_t off = xecp * 4;
         for (int guard = 0; off != 0 && guard < 64; ++guard) {
             volatile uint32_t& cap = *reinterpret_cast<volatile uint32_t*>(base_ + off);
@@ -252,11 +255,50 @@ private:
                 wait([&] { return (cap & (1u << 16)) == 0; }, 100000);  // BIOS released
                 // Turn off SMIs the firmware may have left enabled.
                 *reinterpret_cast<volatile uint32_t*>(base_ + off + 4) = 0;
-                return;
+            } else if ((v & 0xFF) == 2) {
+                read_protocol(off);
             }
             const uint32_t next = (v >> 8) & 0xFF;
             off = next ? off + next * 4 : 0;
         }
+    }
+
+    // One supported protocol capability: a range of root ports and, if the
+    // controller defines its own port speed IDs (USB 3.1/3.2 hosts often do),
+    // the bit rate of each one.
+    void read_protocol(uint32_t off) {
+        if (protocol_count_ >= kMaxProtocols) return;
+        const auto dw = [&](uint32_t i) { return *reinterpret_cast<volatile uint32_t*>(base_ + off + i * 4); };
+        Protocol& p = protocols_[protocol_count_];
+        p.major = uint8_t(dw(0) >> 24);
+        const uint32_t ports = dw(2);
+        const uint32_t first = ports & 0xFF, count = (ports >> 8) & 0xFF;
+        const uint32_t psic = ports >> 28;
+        for (uint32_t i = 0; i < psic; ++i) {
+            const uint32_t psi = dw(4 + i);
+            const uint32_t psiv = psi & 0xF, exp = (psi >> 4) & 3, mantissa = psi >> 16;
+            // Bit rate in Mb/s: mantissa * 10^(3 * exponent) bit/s.
+            const uint32_t mbps = exp == 3 ? mantissa * 1000 : exp == 2 ? mantissa : 0;
+            if (psiv != 0 && mbps > p.rate_mbps[psiv]) p.rate_mbps[psiv] = mbps;
+        }
+        for (uint32_t port = first; port < first + count && port < kMaxRootPorts; ++port)
+            port_protocol_[port] = uint8_t(protocol_count_ + 1);
+        ++protocol_count_;
+    }
+
+    // Turns a root port's speed ID into the DHI speed code (1 FS, 2 LS, 3 HS,
+    // 4 SuperSpeed 5 Gb/s, 5 SuperSpeed+ 10 Gb/s, 6 SuperSpeed+ 20 Gb/s).
+    uint8_t speed_code(int port, uint8_t psiv) const {
+        const int idx = port < kMaxRootPorts ? port_protocol_[port] : 0;
+        if (idx == 0) return psiv;  // no protocol info: default speed IDs
+        const Protocol& p = protocols_[idx - 1];
+        const uint32_t mbps = p.rate_mbps[psiv & 0xF];
+        if (p.major < 3) {
+            if (mbps == 0) return psiv;
+            return mbps >= 480 ? 3 : mbps >= 12 ? 1 : 2;
+        }
+        if (mbps == 0) return psiv >= 5 ? 5 : 4;  // default IDs: 4 = Gen 1, 5 = Gen 2
+        return mbps >= 20000 ? 6 : mbps >= 10000 ? 5 : 4;
     }
 
     bool reset() {
@@ -323,7 +365,8 @@ private:
         Where at{};
         at.root_port = uint8_t(port);
         at.port = uint8_t(port);
-        attach(at, uint8_t((sc >> 10) & 0xF));
+        at.psiv = uint8_t((sc >> 10) & 0xF);
+        attach(at, speed_code(port, at.psiv));
     }
 
     // Where a device sits in the USB tree.
@@ -334,6 +377,7 @@ private:
         uint8_t parent_slot = 0; // 0 = root hub
         uint8_t port = 0;        // port on the parent
         uint8_t tt_slot = 0, tt_port = 0;  // transaction translator for LS/FS behind a HS hub
+        uint8_t psiv = 0;        // root port speed ID as the controller reported it (0 = use the speed code)
     };
 
     // Addresses, describes and starts the device at `at`; hubs recurse into their ports.
@@ -357,10 +401,10 @@ private:
         ++count_;
         if (d.hid != HidKind::None && !start_hid(d)) d.hid = HidKind::None;
 
-        static const char* const kSpeed[] = {"?", "full speed", "low speed", "high speed", "SuperSpeed", "SuperSpeed+"};
+        static const char* const kSpeed[] = {"?", "full speed", "low speed", "high speed", "SuperSpeed", "SuperSpeed+ 10 Gb/s", "SuperSpeed+ 20 Gb/s"};
         Line l;
         l.s("xhci: ").s(where.str()).s(", slot ").u(d.slot).s(": ").x4(d.info.vendor).s(":").x4(d.info.product)
-         .s(" \"").s(d.info.name).s("\", ").s(speed < 6 ? kSpeed[speed] : "?");
+         .s(" \"").s(d.info.name).s("\", ").s(speed < 7 ? kSpeed[speed] : "?");
         if (d.hid == HidKind::Keyboard) l.s(", HID boot keyboard");
         if (d.hid == HidKind::Mouse) l.s(", HID boot mouse");
         const bool hub = d.info.dev_class == 9 || d.info.iface_class == 9;
@@ -481,7 +525,7 @@ private:
         volatile uint32_t* control = ctx(d.in_ctx, 0);
         control[1] = 0b11;  // add slot + EP0
         volatile uint32_t* sl = ctx(d.in_ctx, 1);
-        sl[0] = (1u << 27) | (uint32_t(speed) << 20) | (at.route & 0xFFFFF);  // one context entry
+        sl[0] = (1u << 27) | (uint32_t(at.psiv ? at.psiv : speed) << 20) | (at.route & 0xFFFFF);  // one context entry
         sl[1] = uint32_t(at.root_port) << 16;                                  // root hub port
         sl[2] = uint32_t(at.tt_slot) | uint32_t(at.tt_port) << 8;              // TT for LS/FS behind a HS hub
         volatile uint32_t* ep = ctx(d.in_ctx, 2);
@@ -801,6 +845,14 @@ private:
     const dhi_ops* ops_ = nullptr;
     volatile uint8_t *base_ = nullptr, *op_ = nullptr, *db_ = nullptr, *rt_ = nullptr;
     int max_ports_ = 0, slots_ = 0, ctx_size_ = 32;
+    struct Protocol {
+        uint8_t major = 0;
+        uint32_t rate_mbps[16] = {};  // by port speed ID, 0 = default meaning
+    };
+    static constexpr int kMaxProtocols = 8, kMaxRootPorts = 256;
+    Protocol protocols_[kMaxProtocols]{};
+    int protocol_count_ = 0;
+    uint8_t port_protocol_[kMaxRootPorts] = {};  // 1-based index into protocols_, 0 = unknown
     dhi_dma dcbaa_{}, events_{}, erst_{};
     Ring commands_{};
     int ev_index_ = 0;

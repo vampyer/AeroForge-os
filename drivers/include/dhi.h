@@ -116,7 +116,7 @@ typedef struct dhi_input_event {
 /* What the driver learned about one USB device. */
 typedef struct dhi_usb_device {
     uint16_t vendor, product;
-    uint8_t  port, speed, slot, dev_class;   /* speed: 1 FS, 2 LS, 3 HS, 4 SS, 5 SS+ */
+    uint8_t  port, speed, slot, dev_class;   /* speed: 1 FS, 2 LS, 3 HS, 4 SS 5 Gb/s, 5 SS+ 10 Gb/s, 6 SS+ 20 Gb/s */
     uint8_t  iface_class, iface_subclass, iface_protocol;
     uint8_t  parent_slot;                    /* 0 = root hub, else the hub's slot; port is on that hub */
     char     name[32];                       /* product string, ASCII */
