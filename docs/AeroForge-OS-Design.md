@@ -475,7 +475,7 @@ Each phase ends with a demo that proves it. Durations assume a small dedicated t
 - GOP framebuffer driver → virtio-gpu 2D → virtio-gpu 3D (**venus**) via the AeroKPI shim.
 - Port libdrm + Mesa (venus/lavapipe first), SDL3, FreeType/HarfBuzz.
 - Glass compositor v1 (Vulkan, window buffers, input routing, blur).
-- USB HID input, controllers; HDA audio, AudioSvc.
+- USB HID input, controllers; HDA audio (the board's codec, and the HDA controller on the Radeon that carries HDMI/DisplayPort audio), AudioSvc.
 - Bluetooth: HCI over USB, pairing, HID gamepads first (emulators need them), then HFP/HSP mic and A2DP audio. QEMU can pass a real USB Bluetooth dongle through for testing.
 - Wi-Fi: MediaTek mt7921/mt7922 (the development machine's card) by porting Linux's mt76 driver through AeroKPI, with WPA2/WPA3 in user space. These MediaTek cards usually carry the Bluetooth radio too (on USB, Linux btmtk), so Wi-Fi and Bluetooth share firmware loading work.
 - **Port DOSBox-X here** (SDL3 only), the earliest flagship app.
@@ -504,6 +504,7 @@ Each phase ends with a demo that proves it. Durations assume a small dedicated t
 
 ### Phase 7: Bare-metal graphics (≈ 12 to 24 months, can start in parallel from Phase 4)
 - Harden AeroKPI; port amdgpu + RADV first (RDNA2/RDNA3/RDNA4), on the Ryzen + Radeon development machine. Firmware feed in AeroCenter.
+- Native display output on the Radeon through amdgpu's display core (DC): mode setting on HDMI and DisplayPort, multiple monitors, high refresh rates. HDMI audio follows from it: DC enables the audio endpoint and hands the monitor's audio capabilities (ELD) to the HDA driver. Until then, every display (HDMI included) runs at the mode the UEFI firmware set, with no HDMI audio.
 - Then i915/xe → Intel + ANV on real hardware.
 - nouveau/nova + NVK for Turing+ NVIDIA.
 - KMS multi-monitor, VRR, direct scanout.
