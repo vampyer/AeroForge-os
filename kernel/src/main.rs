@@ -264,8 +264,8 @@ extern "C" fn kmain() -> ! {
     sched::init_cpu();
     apic::start_timer(interrupts::VECTOR_TIMER);
     arch::enable_interrupts();
-    let start = sched::ticks();
-    while sched::ticks() < start + 5 {
+    // The first tick must arrive (later an idle CPU's timer stops).
+    while percpu::this().timer_irqs.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         arch::hlt();
     }
     kok!("Scheduler running on cpu0, LAPIC timer at {} Hz", apic::TIMER_HZ);

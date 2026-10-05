@@ -327,6 +327,17 @@ how many moves balancing made. The new `spreadtest` program creates exactly that
 three spread and checks, 40 times over 400 ms, that the threads are evenly placed; with the
 balancing switched off it found them uneven in all 40 looks.
 
+Since 0.32 idle CPUs are tickless. A CPU with nothing to run no longer takes the 10 ms tick: its
+timer is armed only for its earliest sleeping thread, or stopped, and it stays halted until an
+interrupt brings work, which saves power and heat. Because an idle CPU no longer wakes up to look
+for work, whoever queues a thread for it sends it a reschedule IPI, and a busy CPU that has user
+threads waiting nudges an idle one to come and take them (`sched` counts these). Two kernel threads
+that woke every tick for nothing now sleep longer: the mixer waits for a program to write sound
+(it still runs every tick while playing), and the USB thread, woken by interrupts anyway, only
+checks on its own every 100 ms. The new `wakeups` command counts each CPU's timer interrupts over
+a second; in QEMU an idle CPU takes 0 to 2 instead of 100. Still waking every tick: the network
+thread when a card has no interrupts (the older e1000 family) and the Bluetooth thread.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -335,7 +346,7 @@ balancing switched off it found them uneven in all 40 looks.
 | CPU tables | Per-CPU GDT and TSS (`rsp0` updated on every switch), double-fault IST stack, per-CPU data through GS with `swapgs` on ring transitions |
 | Interrupts | 256-vector IDT generated at build time, exceptions from ring 3 kill only the faulting process |
 | Interrupt controllers | Local APIC (per-CPU periodic timer, calibrated against the PIT) and I/O APIC with MADT overrides; the 8259 PIC is masked; MSI-X and MSI for PCIe devices (the USB, NVMe and SATA controllers and igb/igc network cards so far) |
-| Scheduler | Preemptive round robin with one run queue per CPU, four priority levels (low, normal, high for programs; kernel threads above them) with preemption on wakeup, work stealing (idle CPUs take waiting user threads from busy ones) and periodic balancing between busy CPUs, idle thread per CPU, one-shot timer with microsecond sleeps and futex timeouts, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
+| Scheduler | Preemptive round robin with one run queue per CPU, four priority levels (low, normal, high for programs; kernel threads above them) with preemption on wakeup, work stealing (idle CPUs take waiting user threads from busy ones) and periodic balancing between busy CPUs, idle thread per CPU, one-shot timer with microsecond sleeps and futex timeouts, tickless idle, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
 | Processes | ELF64 loader, ring 3, threads (on any CPU), memory mapping with TLB shootdowns, futexes, `exit` that ends every thread, waiting for child exit codes, `syscall`/`sysret` entry (the `int 0x80` gate still works), x87/SSE/AVX/AVX-512 registers saved per thread with XSAVE, exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
@@ -361,7 +372,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 1. Saving the vector registers lazily or with XSAVES to make switches cheaper; reusing freed address ranges.
 2. A real-time class with deadlines and protection against a high-priority thread starving the rest; balancing that keeps cache and NUMA locality in mind (preferring a CPU that shares the thread's L3 cache, which on Ryzen means the same CCX).
 3. Event objects, and handles to threads and processes (killing a program from another one).
-4. An ACPICA port (the current table walker never touches AML), TSC-deadline timer mode, a tickless idle CPU (no 10 ms tick while nothing runs, to save battery), and x2APIC mode.
+4. An ACPICA port (the current table walker never touches AML), TSC-deadline timer mode, deeper CPU sleep states (MWAIT C-states from the ACPI tables), and x2APIC mode.
 5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, e1000 interrupts, and sockets for user programs.
 6. Filesystems move to user-space servers behind IPC, as the design says; NTFS writes and compressed NTFS files.
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and targeted TLB shootdowns (only the CPUs running the program, one page at a time).

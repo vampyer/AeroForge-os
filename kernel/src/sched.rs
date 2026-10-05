@@ -6,6 +6,11 @@
 //!   one-shot and is re-armed for the next tick or the earliest sleeper's
 //!   wake-up time, whichever is sooner, so a 2 ms sleep takes 2 ms rather
 //!   than a whole 10 ms tick.
+//! - Tickless idle: a CPU with nothing to run has no tick. Its timer is armed
+//!   only for its earliest sleeper (or not at all), so it stays halted until
+//!   an interrupt brings work. Whoever queues work for an idle CPU sends it
+//!   a reschedule IPI, and a busy CPU with user threads waiting nudges an
+//!   idle one to come and take them, which replaces the idle tick's steal.
 //! - User threads move between CPUs: a CPU about to go idle takes a waiting
 //!   user thread from the busiest other CPU's ready queue (work stealing),
 //!   and every `BALANCE_TICKS` each CPU also pulls one from any CPU with at
@@ -175,6 +180,11 @@ impl ReadyQueues {
         }
     }
 
+    /// Is a thread waiting here that another CPU could take?
+    fn has_migratable(&self) -> bool {
+        self.levels.iter().any(|q| q.iter().any(|t| t.migratable && !t.on_cpu.load(Ordering::SeqCst)))
+    }
+
     /// A thread another CPU may take: the highest level first, and in it
     /// the most recently queued (it has the least cache to lose).
     fn take_migratable(&mut self) -> Option<Arc<Thread>> {
@@ -226,10 +236,20 @@ impl RunQueue {
     }
 
     /// Sets this CPU's timer for the next tick or the earliest sleeper,
-    /// whichever comes first.
-    fn arm_timer(&self, now: u64) {
-        let next = self.sleepers.iter().map(|t| t.wake_at.load(Ordering::Relaxed)).fold(self.tick_due, u64::min);
-        crate::apic::arm_timer(next.saturating_sub(now));
+    /// whichever comes first. An idle CPU gets no tick: only its sleepers
+    /// can fire the timer, and with none it is stopped.
+    fn arm_timer(&self, now: u64, idle: bool) {
+        let first = if idle { u64::MAX } else { self.tick_due };
+        let next = self.sleepers.iter().map(|t| t.wake_at.load(Ordering::Relaxed)).fold(first, u64::min);
+        if next == u64::MAX {
+            crate::apic::stop_timer();
+        } else {
+            crate::apic::arm_timer(next.saturating_sub(now));
+        }
+    }
+
+    fn current_is_idle(&self) -> bool {
+        self.current.as_ref().is_none_or(|c| c.idle)
     }
 }
 
@@ -241,6 +261,10 @@ static NEXT_CPU: AtomicUsize = AtomicUsize::new(0);
 pub static MIGRATIONS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones periodic balancing moved between busy CPUs.
 pub static BALANCE_PULLS: AtomicU64 = AtomicU64::new(0);
+/// One bit per CPU that is running its idle thread (tickless, halted).
+static IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+/// Reschedule IPIs sent to wake an idle CPU for waiting threads.
+pub static IDLE_NUDGES: AtomicU64 = AtomicU64::new(0);
 
 /// Microseconds per scheduler tick (the time slice).
 pub const TICK_US: u64 = 1_000_000 / crate::apic::TIMER_HZ;
@@ -356,8 +380,21 @@ fn enqueue_new(t: Thread) -> Arc<Thread> {
     let t = Arc::new(t);
     THREADS.lock().insert(t.tid, t.clone());
     let cpu = percpu::get(t.cpu()).expect("thread placed on an offline CPU");
-    cpu.rq.lock().ready.push(t.clone());
+    let preempt = {
+        let mut rq = cpu.rq.lock();
+        rq.ready.push(t.clone());
+        outranks(&t, &rq)
+    };
+    // The CPU may be idle with its tick stopped: tell it.
+    if scheduler_running(cpu) {
+        kick(cpu, preempt, t.migratable);
+    }
     t
+}
+
+/// Has `cpu` started scheduling (so it can take a reschedule IPI)?
+fn scheduler_running(cpu: &percpu::PerCpu) -> bool {
+    cpu.rq.lock().current.is_some()
 }
 
 /// Writes the frame `switch_context` pops for a thread that has never run.
@@ -417,11 +454,11 @@ pub fn schedule() {
     if would_idle {
         steal(cpu);
     }
-    let (save_to, load, prev_on_cpu) = {
+    let mut nudge = false;
+    let switch = {
         let mut rq = cpu.rq.lock();
         let now = crate::apic::micros();
         rq.wake_due(now);
-        rq.arm_timer(now);
 
         let prev = rq.current.take().expect("no current thread");
         if prev.state() == State::Running && !prev.idle {
@@ -434,10 +471,22 @@ pub fn schedule() {
         };
         next.set_state(State::Running);
         next.on_cpu.store(true, Ordering::SeqCst);
+        let bit = 1u64 << (cpu.index % 64);
+        if next.idle {
+            IDLE_CPUS.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            IDLE_CPUS.fetch_and(!bit, Ordering::SeqCst);
+            if rq.tick_due <= now {
+                // Coming out of tickless idle: a full time slice from now.
+                rq.tick_due = now + TICK_US;
+            }
+            nudge = rq.ready.has_migratable();
+        }
+        rq.arm_timer(now, next.idle);
         if Arc::ptr_eq(&prev, &next) {
             rq.current = Some(next);
-            return;
-        }
+            None
+        } else {
         if prev.state() == State::Dead {
             // Keep the dead thread (and its stack, which we are standing on)
             // alive until the next switch; the previous zombie goes now.
@@ -464,9 +513,27 @@ pub fn schedule() {
         let load = unsafe { *next.saved_rsp.get() };
         let prev_on_cpu = prev.on_cpu.as_ptr() as *mut u8;
         rq.current = Some(next);
-        (save_to, load, prev_on_cpu)
+        Some((save_to, load, prev_on_cpu))
+        }
     };
-    unsafe { switch_context(save_to, load, prev_on_cpu) };
+    if nudge {
+        nudge_idle(cpu.index);
+    }
+    if let Some((save_to, load, prev_on_cpu)) = switch {
+        unsafe { switch_context(save_to, load, prev_on_cpu) };
+    }
+}
+
+/// Wakes one idle CPU (other than `me`) so it can take a waiting thread.
+fn nudge_idle(me: usize) {
+    let idle = IDLE_CPUS.load(Ordering::SeqCst) & !(1u64 << (me % 64));
+    if idle == 0 {
+        return;
+    }
+    if let Some(cpu) = percpu::get(idle.trailing_zeros() as usize) {
+        IDLE_NUDGES.fetch_add(1, Ordering::Relaxed);
+        crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
+    }
 }
 
 /// Moves one waiting user thread from the CPU with the longest ready queue
@@ -545,9 +612,11 @@ pub fn on_timer() {
     let cpu = percpu::this();
     let now = crate::apic::micros();
     let mut balance = false;
+    cpu.timer_irqs.fetch_add(1, Ordering::Relaxed);
     let reschedule = {
         let mut rq = cpu.rq.lock();
-        if now >= rq.tick_due {
+        let idle = rq.current_is_idle();
+        if !idle && now >= rq.tick_due {
             // Stay on the 10 ms grid unless we fell more than a tick behind.
             rq.tick_due = if rq.tick_due + TICK_US > now { rq.tick_due + TICK_US } else { now + TICK_US };
             if let Some(cur) = rq.current.as_ref() {
@@ -558,7 +627,7 @@ pub fn on_timer() {
         } else if rq.wake_due(now) {
             true
         } else {
-            rq.arm_timer(now);
+            rq.arm_timer(now, idle);
             false
         }
     };
@@ -633,7 +702,7 @@ pub fn wake_sleeper(t: &Arc<Thread>) {
         }
     };
     if let Some(preempt) = woke {
-        kick(cpu, preempt);
+        kick(cpu, preempt, t.migratable);
     }
 }
 
@@ -643,13 +712,18 @@ fn outranks(t: &Thread, rq: &RunQueue) -> bool {
 }
 
 /// After a wakeup on `cpu`: another CPU gets a reschedule IPI so it notices
-/// at once rather than at its next tick; this CPU sends one to itself when
+/// at once (it may be idle with no tick); this CPU sends one to itself when
 /// the woken thread outranks the running one (it fires as soon as
 /// interrupts are on again, e.g. right after the interrupt handler that
-/// did the waking).
-fn kick(cpu: &percpu::PerCpu, preempt: bool) {
+/// did the waking). A user thread left waiting behind the running one
+/// nudges an idle CPU to come and take it.
+fn kick(cpu: &percpu::PerCpu, preempt: bool, migratable: bool) {
     if cpu.index != percpu::this().index || preempt {
         crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
+    }
+    if !preempt && migratable {
+        // It waits behind the running thread; an idle CPU could take it.
+        nudge_idle(cpu.index);
     }
 }
 
@@ -717,7 +791,7 @@ pub fn wake(t: &Arc<Thread>) {
         }
     };
     if let Some(preempt) = woke {
-        kick(cpu, preempt);
+        kick(cpu, preempt, t.migratable);
     }
 }
 

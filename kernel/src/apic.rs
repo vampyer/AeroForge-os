@@ -109,6 +109,11 @@ pub fn start_timer(vector: u8) {
     arm_timer(1_000_000 / TIMER_HZ);
 }
 
+/// Stops this CPU's timer (a tickless idle CPU with no sleepers).
+pub fn stop_timer() {
+    write(REG_TIMER_INITIAL, 0);
+}
+
 /// Makes this CPU's timer interrupt fire `us` microseconds from now
 /// (replacing any earlier setting). A no-op until `start_timer` has run.
 pub fn arm_timer(us: u64) {
