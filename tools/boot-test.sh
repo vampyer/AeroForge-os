@@ -53,7 +53,7 @@ trap 'kill $QEMU_PID $FAKEBT_PID 2>/dev/null || true' EXIT
 fail() {
     echo "FAIL: $1"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|WARN' | tail -8 | tr '\n' '|') | fakebt: $(grep -a 'FAIL\|voice\|reconnect' "$FAKEBT_LOG" | tail -6 | tr '\n' '|')"
+        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|WARN' | tail -8 | tr -d '\r' | tr '\n' ';') | fakebt: $(grep -a 'FAIL\|voice\|reconnect' "$FAKEBT_LOG" | tail -6 | tr -d '\r' | tr '\n' ';')"
     fi
     shift
     for f in "$@"; do cat "$f"; done
