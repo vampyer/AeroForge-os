@@ -69,7 +69,7 @@ constexpr uint32_t kTrbIdt = 1u << 6;      // immediate data (setup stage)
 constexpr uint32_t kTrbDirIn = 1u << 16;
 constexpr uint32_t kTrbSia = 1u << 31;     // isochronous: start as soon as possible
 
-constexpr uint32_t kCcSuccess = 1, kCcStall = 6, kCcShortPacket = 13;
+constexpr uint32_t kCcSuccess = 1, kCcStall = 6, kCcShortPacket = 13, kCcRingUnderrun = 14, kCcRingOverrun = 15;
 
 constexpr uint32_t trb_type(uint32_t t) { return t << 10; }
 
@@ -165,6 +165,13 @@ public:
     // Where the next TRB goes, with the cycle bit it will carry (for Set TR Dequeue Pointer).
     uint64_t dequeue_for_reset() const { return mem_.phys + uint64_t(enqueue_) * sizeof(Trb) | cycle_; }
     int index_of(uint64_t phys) const { return int((phys - mem_.phys) / sizeof(Trb)); }
+    // The data buffer of a TRB on this ring (from a transfer event's TRB
+    // pointer), or 0 when the pointer is not one of ours.
+    uint64_t buffer_of(uint64_t phys) const {
+        if (phys < mem_.phys || phys >= mem_.phys + (kRingTrbs - 1) * sizeof(Trb) || phys % sizeof(Trb)) return 0;
+        const volatile Trb& t = trbs_[index_of(phys)];
+        return t.d0 | uint64_t(t.d1) << 32;
+    }
     int enqueue_index() const { return enqueue_; }
 
 private:
@@ -228,6 +235,7 @@ struct Device {
     Ring sco_in_ring{}, sco_out_ring{};
     dhi_dma sco_bufs{};                    // kScoTrbs IN packets, then kScoTrbs OUT packets
     uint32_t sco_in_queued = 0, sco_in_done = 0, sco_out_queued = 0, sco_out_done = 0;
+    uint32_t sco_in_busy = 0;              // bit per IN buffer with a transfer queued
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -1050,14 +1058,18 @@ private:
             return false;
         d.sco_alt = alt;
         d.sco_in_queued = d.sco_in_done = 0;
+        d.sco_in_busy = 0;
         d.sco_out_queued = d.sco_out_done = 0;
-        for (int i = 0; i < kScoTrbs; ++i) queue_sco_in(d);
+        for (int i = 0; i < kScoTrbs; ++i) queue_sco_in(d, uint32_t(i));
         return true;
     }
 
-    void queue_sco_in(Device& d) {
+    // Queues buffer `slot` for one isochronous IN packet.
+    void queue_sco_in(Device& d, uint32_t slot) {
         if (!d.sco_alt) return;
-        const uint64_t phys = d.sco_bufs.phys + uint64_t(d.sco_in_queued++ % kScoTrbs) * kScoBuf;
+        ++d.sco_in_queued;
+        d.sco_in_busy |= 1u << slot;
+        const uint64_t phys = d.sco_bufs.phys + uint64_t(slot) * kScoBuf;
         d.sco_in_ring.push(uint32_t(phys), uint32_t(phys >> 32), d.sco_in_mps[d.sco_alt],
                            trb_type(kTrbIsoch) | kTrbIoc | kTrbIsp | kTrbSia);
         ring_doorbell(d.slot, d.sco_in_dci);
@@ -1388,10 +1400,21 @@ private:
             bt_received(*d, 2, kBtTrbs + d->acl_done++ % kBtTrbs, kBtAclBuf, code, d2 & 0xFFFFFF);
             queue_bt_acl(*d);
         } else if (d->bt >= 0 && d->sco_alt && ep == d->sco_in_dci) {
-            sco_received(*d, d->sco_in_done++ % kScoTrbs, code, d2 & 0xFFFFFF);
-            queue_sco_in(*d);
+            // Ring overrun (no TRB queued when a packet came) finishes no
+            // transfer; counting it as one made the driver read the wrong
+            // buffers. So the buffer comes from the TRB the event names, and
+            // that same buffer is queued again once its data is copied out.
+            if (code == kCcRingUnderrun || code == kCcRingOverrun) return;
+            const uint64_t buf = d->sco_in_ring.buffer_of(ptr);
+            if (buf < d->sco_bufs.phys || buf >= d->sco_bufs.phys + kScoTrbs * kScoBuf) return;
+            const uint32_t slot = uint32_t((buf - d->sco_bufs.phys) / kScoBuf);
+            if (!(d->sco_in_busy & (1u << slot))) return;
+            d->sco_in_busy &= ~(1u << slot);
+            ++d->sco_in_done;
+            sco_received(*d, slot, code, d2 & 0xFFFFFF);
+            queue_sco_in(*d, slot);
         } else if (d->bt >= 0 && ep == d->sco_out_dci) {
-            ++d->sco_out_done;
+            if (code != kCcRingUnderrun && code != kCcRingOverrun) ++d->sco_out_done;
         } else if ((d->storage || d->bt >= 0) && (ep == d->in_dci || ep == d->out_dci)) {
             d->bulk_code = code;
             d->bulk_done = true;

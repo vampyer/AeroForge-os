@@ -9,6 +9,7 @@ mod hfp;
 mod hid;
 mod l2cap;
 mod rfcomm;
+mod scoframe;
 mod sdp;
 
 use alloc::collections::VecDeque;
@@ -413,7 +414,8 @@ pub(super) struct Host {
     inquiry_done: bool,
     conns: Vec<l2cap::Conn>,
     pair_deadline: Option<u64>,
-    sco: Vec<u8>,
+    /// Isochronous voice packets as received, before framing.
+    sco: VecDeque<Vec<u8>>,
     sco_in: VecDeque<Vec<u8>>,
     /// The voice link (SCO handle, ACL handle of its device) and whether we
     /// set it up (so we take it down after recording).
@@ -441,7 +443,7 @@ impl Host {
         Host { index, id, name, up: false, evt: Vec::new(), acl: Vec::new(), events: VecDeque::new(),
             acl_in: VecDeque::new(), commands: VecDeque::new(), command_credits: 1, waiting: None, reply: None,
             acl_out: VecDeque::new(), acl_credits: 0, acl_mtu: 0, inquiry_done: false, conns: Vec::new(),
-            pair_deadline: None, sco: Vec::new(), sco_in: VecDeque::new(), voice: None, rec: None }
+            pair_deadline: None, sco: VecDeque::new(), sco_in: VecDeque::new(), voice: None, rec: None }
     }
 
     fn bring_up(&mut self) -> Result<(), String> {
@@ -545,7 +547,7 @@ impl Host {
             match kind {
                 dhi::BT_EVENT => self.evt.extend_from_slice(&buf[..n as usize]),
                 dhi::BT_ACL => self.acl.extend_from_slice(&buf[..n as usize]),
-                dhi::BT_SCO => self.sco.extend_from_slice(&buf[..n as usize]),
+                dhi::BT_SCO => self.sco.push_back(buf[..n as usize].to_vec()),
                 _ => {}
             }
         }
@@ -557,19 +559,13 @@ impl Host {
             let len = 4 + u16::from_le_bytes([self.acl[2], self.acl[3]]) as usize;
             self.acl_in.push_back(self.acl.drain(..len).collect());
         }
-        // A lost isochronous packet breaks the packet boundaries: skip ahead
-        // to the next header that names the voice link.
-        loop {
-            if let Some((handle, _, _)) = self.voice {
-                let skip = self.sco.windows(2).position(|w| u16::from_le_bytes([w[0], w[1]]) & 0x0FFF == handle)
-                    .unwrap_or(self.sco.len().saturating_sub(1));
-                self.sco.drain(..skip);
-            }
-            if self.sco.len() < 3 || self.sco.len() < 3 + self.sco[2] as usize {
-                break;
-            }
-            let len = 3 + self.sco[2] as usize;
-            self.sco_in.push_back(self.sco.drain(..len).collect());
+        // Lost isochronous packets must not shift the samples (see scoframe.rs).
+        let Some((handle, _, _)) = self.voice else {
+            self.sco.clear();
+            return;
+        };
+        while let Some(pkt) = scoframe::next(&mut self.sco, handle) {
+            self.sco_in.push_back(pkt);
         }
     }
 
