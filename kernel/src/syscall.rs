@@ -148,6 +148,7 @@ pub const SYS_FUTEX_WAIT: u64 = 27;
 pub const SYS_FUTEX_WAKE: u64 = 28;
 pub const SYS_PROCESS_WAIT: u64 = 29;
 pub const SYS_THREAD_ID: u64 = 30;
+pub const SYS_THREAD_PRIORITY: u64 = 31;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -254,6 +255,24 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             sched::exit_current();
         }
         SYS_THREAD_ID => Ok(sched::current().tid),
+        SYS_THREAD_PRIORITY => {
+            // Thread id (0 = the caller), new level: 0 low, 1 normal, 2 high.
+            // Only threads of the caller's own process.
+            if a1 > sched::PRIO_HIGH as u64 {
+                return Err(E_INVAL);
+            }
+            let t = if a0 == 0 {
+                sched::current()
+            } else {
+                let found = sched::THREADS.lock().get(&a0).cloned();
+                match found {
+                    Some(t) if t.pid() == proc_.pid => t,
+                    _ => return Err(E_NOTFOUND),
+                }
+            };
+            sched::set_priority(&t, a1 as u8);
+            Ok(0)
+        }
         SYS_THREAD_CREATE => {
             // entry, stack top (16-byte aligned), argument for the entry function.
             if a0 >= USER_END || a1 >= USER_END || a1 % 16 != 0 {

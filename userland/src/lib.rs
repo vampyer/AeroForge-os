@@ -43,6 +43,7 @@ pub mod sys {
     pub const FUTEX_WAKE: u64 = 28;
     pub const PROCESS_WAIT: u64 = 29;
     pub const THREAD_ID: u64 = 30;
+    pub const THREAD_PRIORITY: u64 = 31;
 }
 
 pub mod rights {

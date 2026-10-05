@@ -8,6 +8,12 @@
 //!   saving its context (`on_cpu` is cleared inside `switch_context`).
 //!   Kernel threads stay on the CPU they were created on, since some of them
 //!   (the USB and network threads) aim their device's interrupts at it.
+//! - Four priority levels: low, normal and high for user threads (a game
+//!   asks for high, background work for low), and a level above them for
+//!   kernel threads, which mostly sleep until a device needs them. A CPU
+//!   always runs its highest-priority ready thread; threads of one level
+//!   share the CPU round robin. A thread woken at a higher level than the
+//!   one running preempts it at once.
 //! - Every lock the scheduler touches is an `IrqMutex`, so code holding one
 //!   can never be preempted into a deadlock.
 
@@ -61,6 +67,7 @@ pub struct Thread {
     on_cpu: AtomicBool,
     /// May another CPU take it? User threads only.
     migratable: bool,
+    priority: AtomicU8,
     state: AtomicU8,
     idle: bool,
     kstack: KernelStack,
@@ -103,6 +110,10 @@ impl Thread {
         self.cpu.load(Ordering::SeqCst)
     }
 
+    pub fn priority(&self) -> u8 {
+        self.priority.load(Ordering::Relaxed)
+    }
+
     fn kstack_top(&self) -> u64 {
         self.kstack.top() & !0xF
     }
@@ -112,8 +123,65 @@ impl Thread {
     }
 }
 
+/// Priority levels. Programs may pick the first three.
+pub const PRIO_LOW: u8 = 0;
+pub const PRIO_NORMAL: u8 = 1;
+pub const PRIO_HIGH: u8 = 2;
+pub const PRIO_KERNEL: u8 = 3;
+const LEVELS: usize = 4;
+
+pub fn priority_name(p: u8) -> &'static str {
+    ["low", "normal", "high", "kernel"].get(p as usize).copied().unwrap_or("?")
+}
+
+/// Ready threads, one round-robin queue per priority level.
+pub struct ReadyQueues {
+    levels: [VecDeque<Arc<Thread>>; LEVELS],
+}
+
+impl ReadyQueues {
+    const fn new() -> Self {
+        Self { levels: [const { VecDeque::new() }; LEVELS] }
+    }
+
+    fn push(&mut self, t: Arc<Thread>) {
+        let p = (t.priority() as usize).min(LEVELS - 1);
+        self.levels[p].push_back(t);
+    }
+
+    /// The first thread of the highest non-empty level.
+    fn pop(&mut self) -> Option<Arc<Thread>> {
+        self.levels.iter_mut().rev().find_map(|q| q.pop_front())
+    }
+
+    fn len(&self) -> usize {
+        self.levels.iter().map(|q| q.len()).sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.levels.iter().all(|q| q.is_empty())
+    }
+
+    fn remove(&mut self, t: &Arc<Thread>) {
+        for q in self.levels.iter_mut() {
+            q.retain(|x| !Arc::ptr_eq(x, t));
+        }
+    }
+
+    /// A thread another CPU may take: the highest level first, and in it
+    /// the most recently queued (it has the least cache to lose).
+    fn take_migratable(&mut self) -> Option<Arc<Thread>> {
+        for q in self.levels.iter_mut().rev() {
+            if let Some(i) = q.iter().rposition(|t| t.migratable && !t.on_cpu.load(Ordering::SeqCst)) {
+                return q.remove(i);
+            }
+        }
+        None
+    }
+}
+
 pub struct RunQueue {
-    ready: VecDeque<Arc<Thread>>,
+    ready: ReadyQueues,
     current: Option<Arc<Thread>>,
     idle: Option<Arc<Thread>>,
     sleepers: Vec<Arc<Thread>>,
@@ -123,7 +191,7 @@ pub struct RunQueue {
 
 impl RunQueue {
     pub fn new() -> Self {
-        Self { ready: VecDeque::new(), current: None, idle: None, sleepers: Vec::new(), zombie: None, switches: 0 }
+        Self { ready: ReadyQueues::new(), current: None, idle: None, sleepers: Vec::new(), zombie: None, switches: 0 }
     }
 
     pub fn load(&self) -> usize {
@@ -202,6 +270,7 @@ pub fn init_cpu() {
         cpu: AtomicUsize::new(cpu.index),
         on_cpu: AtomicBool::new(true),
         migratable: false,
+        priority: AtomicU8::new(PRIO_LOW),
         state: AtomicU8::new(State::Running as u8),
         idle: true,
         kstack: KernelStack::empty(),
@@ -228,6 +297,7 @@ fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread
         tid: NEXT_TID.fetch_add(1, Ordering::SeqCst),
         name,
         migratable: process.is_some(),
+        priority: AtomicU8::new(if process.is_some() { PRIO_NORMAL } else { PRIO_KERNEL }),
         process,
         cpu: AtomicUsize::new(cpu),
         on_cpu: AtomicBool::new(false),
@@ -247,7 +317,7 @@ fn enqueue_new(t: Thread) -> Arc<Thread> {
     let t = Arc::new(t);
     THREADS.lock().insert(t.tid, t.clone());
     let cpu = percpu::get(t.cpu()).expect("thread placed on an offline CPU");
-    cpu.rq.lock().ready.push_back(t.clone());
+    cpu.rq.lock().ready.push(t.clone());
     t
 }
 
@@ -316,7 +386,7 @@ pub fn schedule() {
             if rq.sleepers[i].wake_at.load(Ordering::Relaxed) <= now {
                 let t = rq.sleepers.swap_remove(i);
                 t.set_state(State::Ready);
-                rq.ready.push_back(t);
+                rq.ready.push(t);
             } else {
                 i += 1;
             }
@@ -325,9 +395,9 @@ pub fn schedule() {
         let prev = rq.current.take().expect("no current thread");
         if prev.state() == State::Running && !prev.idle {
             prev.set_state(State::Ready);
-            rq.ready.push_back(prev.clone());
+            rq.ready.push(prev.clone());
         }
-        let next = match rq.ready.pop_front() {
+        let next = match rq.ready.pop() {
             Some(t) => t,
             None => rq.idle.clone().unwrap(),
         };
@@ -388,14 +458,12 @@ fn steal(me: &percpu::PerCpu) {
     let Some(victim) = victim else { return };
     let taken = {
         let mut rq = victim.rq.lock();
-        // The most recently queued thread has the least cache to lose.
-        let pos = rq.ready.iter().rposition(|t| t.migratable && !t.on_cpu.load(Ordering::SeqCst));
-        pos.and_then(|i| rq.ready.remove(i))
+        rq.ready.take_migratable()
     };
     if let Some(t) = taken {
         t.cpu.store(me.index, Ordering::SeqCst);
         MIGRATIONS.fetch_add(1, Ordering::Relaxed);
-        me.rq.lock().ready.push_back(t);
+        me.rq.lock().ready.push(t);
     }
 }
 
@@ -451,13 +519,29 @@ pub fn wake_sleeper(t: &Arc<Thread>) {
         if t.state() == State::Sleeping {
             rq.sleepers.retain(|s| !Arc::ptr_eq(s, t));
             t.set_state(State::Ready);
-            rq.ready.push_back(t.clone());
-            true
+            rq.ready.push(t.clone());
+            Some(outranks(t, &rq))
         } else {
-            false
+            None
         }
     };
-    if woke && cpu.index != percpu::this().index {
+    if let Some(preempt) = woke {
+        kick(cpu, preempt);
+    }
+}
+
+/// Should woken thread `t` take the CPU from the one running there now?
+fn outranks(t: &Thread, rq: &RunQueue) -> bool {
+    rq.current.as_ref().is_none_or(|c| c.idle || t.priority() > c.priority())
+}
+
+/// After a wakeup on `cpu`: another CPU gets a reschedule IPI so it notices
+/// at once rather than at its next tick; this CPU sends one to itself when
+/// the woken thread outranks the running one (it fires as soon as
+/// interrupts are on again, e.g. right after the interrupt handler that
+/// did the waking).
+fn kick(cpu: &percpu::PerCpu, preempt: bool) {
+    if cpu.index != percpu::this().index || preempt {
         crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
     }
 }
@@ -519,14 +603,26 @@ pub fn wake(t: &Arc<Thread>) {
         let mut rq = cpu.rq.lock();
         if t.state() == State::Blocked {
             t.set_state(State::Ready);
-            rq.ready.push_back(t.clone());
-            true
+            rq.ready.push(t.clone());
+            Some(outranks(t, &rq))
         } else {
-            false
+            None
         }
     };
-    if woke && cpu.index != percpu::this().index {
-        crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
+    if let Some(preempt) = woke {
+        kick(cpu, preempt);
+    }
+}
+
+/// Sets the priority of thread `t` (one of the PRIO_ constants). A thread
+/// waiting in a ready queue moves to its new level there.
+pub fn set_priority(t: &Arc<Thread>, priority: u8) {
+    let Some(cpu) = percpu::get(t.cpu()) else { return };
+    let mut rq = cpu.rq.lock();
+    t.priority.store(priority, Ordering::Relaxed);
+    if t.state() == State::Ready && rq.ready.levels.iter().any(|q| q.iter().any(|x| Arc::ptr_eq(x, t))) {
+        rq.ready.remove(t);
+        rq.ready.push(t.clone());
     }
 }
 
@@ -587,7 +683,7 @@ pub fn unblock_current() {
     let mut rq = cpu.rq.lock();
     let cur = rq.current.clone().unwrap();
     if cur.state() == State::Ready {
-        rq.ready.retain(|t| !Arc::ptr_eq(t, &cur));
+        rq.ready.remove(&cur);
     }
     cur.set_state(State::Running);
 }
