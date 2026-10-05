@@ -297,7 +297,8 @@ pub fn sync_usb(ctrl: i32) {
         }
         for d in devices {
             if let Some(m) = crate::vfs::mount(d) {
-                crate::kok!("{} volume \"{}\" on {} mounted at {}", m.vol.kind(), m.vol.label(), m.vol.dev().name(), m.path);
+                crate::kok!("{} volume \"{}\" on {} mounted at {}{}", m.vol.kind(), m.vol.label(), m.vol.dev().name(), m.path,
+            if m.vol.read_only() { " (read-only)" } else { "" });
             }
         }
     }

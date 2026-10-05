@@ -31,7 +31,10 @@
 # then the 'savetest' program saves, overwrites and deletes files through the
 # file system calls and the shell saves and deletes files on the SATA and USB
 # disks; after QEMU exits every volume must pass fsck.fat and mtools must read
-# the saved files back.
+# the saved files back. Last, an NTFS drive (a second SATA disk, from
+# tools/ntfs-test.part.xz) must mount read-only and its folders, a
+# 300-entry folder, fragmented and sparse files read back exactly, while
+# compressed files and writes are refused.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -46,6 +49,7 @@ make iso >/dev/null
 ./tools/make-sata-disk.sh >/dev/null 2>&1
 ./tools/make-usb-disk.sh >/dev/null 2>&1
 ./tools/make-usb-disk.sh build/usb2.img HOTSTICK tools/usb2-files exfat >/dev/null 2>&1
+./tools/make-ntfs-disk.sh >/dev/null
 cc -O2 -Wall -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser -lm
 FAKEBT_LOG=build/fakebt.log
 build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin 2>"$FAKEBT_LOG" &
@@ -65,6 +69,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,file=build/test-vars.fd \
     -drive file=build/disk.img,if=none,id=nvm,format=raw -device nvme,serial=AERO0001,drive=nvm \
     -drive file=build/sata.img,if=none,id=sata,format=raw -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1 \
+    -drive file=build/ntfs.img,if=none,id=ntfs,format=raw -device ide-hd,drive=ntfs,bus=ide.3,serial=AERONTFS \
     -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
     -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
     -drive file=build/usb.img,if=none,id=stick,format=raw -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
@@ -101,6 +106,14 @@ done
 EXFAT_CMDS+=('write /usb1p1/AeroForge-OS-Design.md replaced by AeroForge' 'rm /usb1p1/hot.txt' 'mkdir /usb1p1/Music' 'ls /usb1p1/games/saves')
 EXFAT_WAIT+=('bytes to /usb1p1/AeroForge-OS-Design.md' 'deleted /usb1p1/hot.txt\|  /usb1p1/hot.txt: ' 'created directory /usb1p1/Music\|  /usb1p1/Music: ' '  Level 8 checkpoint.sav\|  /usb1p1/games/saves: ')
 EXFAT_STEP=0
+# The same for the NTFS drive (checksums are the files' FNV-1a, as made by tools/make-ntfs-image.sh).
+NTFS_CMDS=('ls /sata1p1' 'ls /sata1p1/Photos' 'cat /sata1p1/users/player/saved games/level 9.sav'
+    'wc /sata1p1/Program Files/AeroForge/manual.md' 'wc /sata1p1/fragmented.bin' 'wc /sata1p1/interleaved.bin'
+    'wc /sata1p1/sparse.bin' 'cat /sata1p1/Packed/squeezed.txt' 'write /sata1p1/new.txt hello')
+NTFS_WAIT=('  Café ☕.txt\|  /sata1p1: ' '  IMG_0300.JPG\|  /sata1p1/Photos: ' 'checkpoint=castle-9\|  /sata1p1/users/player/saved games/level 9.sav: '
+    '  /sata1p1/Program Files/AeroForge/manual.md' '  /sata1p1/fragmented.bin' '  /sata1p1/interleaved.bin'
+    '  /sata1p1/sparse.bin' '  /sata1p1/Packed/squeezed.txt: ' '  /sata1p1/new.txt: ')
+NTFS_STEP=0
 monitor() { python3 tools/qemu-monitor.py build/qemu-monitor.sock "$@" >/dev/null; }
 STAGE=0
 
@@ -177,13 +190,23 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; type_keys $'write /usb0p1/usbnote.txt Saved from AeroForge on USB\n'; STAGE=27
     elif [ $STAGE = 27 ] && grep -q "bytes to /usb0p1/usbnote.txt\|  /usb0p1/usbnote.txt: " "$LOG"; then
         sleep 1; type_keys $'rm /usb0p1/usb.txt\n'; STAGE=28
+    elif [ $STAGE = 28 ] && grep -q "deleted /usb0p1/usb.txt\|  /usb0p1/usb.txt: " "$LOG"; then
+        # Reading the NTFS drive.
+        sleep 1; type_keys "${NTFS_CMDS[0]}"$'\n'; STAGE=ntfs
+    elif [ $STAGE = ntfs ] && grep -q "${NTFS_WAIT[$NTFS_STEP]}" "$LOG"; then
+        NTFS_STEP=$((NTFS_STEP + 1))
+        if [ $NTFS_STEP -lt ${#NTFS_CMDS[@]} ]; then
+            sleep 1; type_keys "${NTFS_CMDS[$NTFS_STEP]}"$'\n'
+        else
+            STAGE=done
+        fi
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 28 ] && grep -q "deleted /usb0p1/usb.txt\|  /usb0p1/usb.txt: " "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = done ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -268,8 +291,17 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "wrote 28 bytes to /usb0p1/usbnote.txt" "$LOG" || { fail "the shell could not save a file on the USB stick"; }
         grep -q "deleted /usb0p1/usb.txt" "$LOG" || { fail "the shell could not delete a file on the USB stick"; }
         python3 tools/check-fat-files.py build || { fail "the saved files are not right on the disk images"; }
+        grep -q "NTFS volume \"WINDATA\" on sata1p1 mounted at /sata1p1 (read-only)" "$LOG" || { fail "the NTFS drive was not mounted"; }
+        grep -q "  Café ☕.txt" "$LOG" && ! grep -q "  \$MFT" "$LOG" || { fail "the NTFS root folder was not listed right"; }
+        [ "$(grep -c "  IMG_0[0-9]*.JPG" "$LOG")" = 300 ] || { fail "the 300-photo NTFS folder (an index B-tree) was not listed in full"; }
+        grep -q "48976 bytes, 561 lines, fnv1a fd53da30847dce45  /sata1p1/Program Files/AeroForge/manual.md" "$LOG" || { fail "a file in an NTFS sub-folder did not read back right"; }
+        grep -q "393216 bytes, 1536 lines, fnv1a 22f6a3b59ab0158d  /sata1p1/fragmented.bin" "$LOG" \
+            && grep -q "393216 bytes, 1536 lines, fnv1a db413e2ace59158d  /sata1p1/interleaved.bin" "$LOG" || { fail "fragmented NTFS files did not read back right"; }
+        grep -q "3145747 bytes, 1 lines, fnv1a 25326fd0f3313539  /sata1p1/sparse.bin" "$LOG" || { fail "a sparse NTFS file did not read back right"; }
+        grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
+        grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
