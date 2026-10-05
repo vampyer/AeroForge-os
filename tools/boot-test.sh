@@ -6,7 +6,10 @@
 # Intel igb card gets an address over DHCP and pings the gateway (a second,
 # e1000e card must come up with a link), and a simulated MediaTek Bluetooth
 # adapter (tools/fakebt) gets its firmware, comes up and finds the simulated
-# gamepads in a scan. Intended for CI (design doc, Phase 0).
+# gamepads in a scan; then the test types 'bt pair' and 'gamepad' at the
+# shell: the classic gamepad must pair, report its input, reconnect on its own
+# after it "turns off and on" and report again. Intended for CI (design doc,
+# Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,7 +28,7 @@ build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hd
 FAKEBT_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG"
+rm -f "$LOG" build/qemu-monitor.sock
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -37,17 +40,29 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive file=build/usb.img,if=none,id=stick,format=raw -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
     -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
     -nic user,model=igb -nic user,model=e1000e \
-    -cdrom build/aeroforge.iso -serial file:"$LOG" -display none &
+    -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
+    -monitor unix:build/qemu-monitor.sock,server,nowait &
 QEMU_PID=$!
 trap 'kill $QEMU_PID $FAKEBT_PID 2>/dev/null || true' EXIT
 
+type_keys() { python3 tools/qemu-type.py build/qemu-monitor.sock "$1"; }
+STAGE=0
+
 for _ in $(seq "$TIMEOUT"); do
+    # The Bluetooth gamepad test types at the shell as the log advances.
+    if [ $STAGE = 0 ] && grep -q "hci0: scan found" "$LOG" 2>/dev/null; then
+        sleep 2; type_keys $'bt pair 11:22:33:44:55:66\n'; STAGE=1
+    elif [ $STAGE = 1 ] && grep -q "paired and connected\|bt pair:" "$LOG"; then
+        sleep 1; type_keys $'gamepad\n'; STAGE=2
+    elif [ $STAGE = 2 ] && [ "$(grep -c 'gamepad 11:22:33:44:55:66 .* connected (' "$LOG")" -ge 2 ]; then
+        sleep 1; type_keys $'gamepad\n'; STAGE=3
+    fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         echo "FAIL: kernel panic"; sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG"; exit 1
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && grep -q "hci0: scan found\|WARN.*hci0" "$LOG"; then
+        && { [ $STAGE = 3 ] && grep -q "buttons: 2 12" "$LOG" || grep -q "WARN.*hci0\|bt pair:" "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { echo "FAIL: not all CPUs came online"; exit 1; }
@@ -71,8 +86,12 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "hci0: Bluetooth 5.2 adapter 0e8d:0608 up, address F0:0D:AE:F0:12:01, made by MediaTek" "$LOG" || { echo "FAIL: Bluetooth adapter not up"; cat "$FAKEBT_LOG"; exit 1; }
         grep -q "11:22:33:44:55:66  classic .* gamepad .*\"Wireless Gamepad\"" "$LOG" || { echo "FAIL: classic Bluetooth gamepad not found by the scan"; exit 1; }
         grep -q "C0:FF:EE:00:12:34  LE random .* gamepad .*\"BLE Pad\"" "$LOG" || { echo "FAIL: LE gamepad not found by the scan"; exit 1; }
+        grep -q "\"Wireless Gamepad\" paired and connected (4 axes, hat, 12 buttons)" "$LOG" || { echo "FAIL: Bluetooth gamepad did not pair"; cat "$FAKEBT_LOG"; exit 1; }
+        grep -q "buttons: 1 3 10, hat right, axes: X +127 Y +0 Z +0 Rz -127" "$LOG" || { echo "FAIL: gamepad input not decoded"; cat "$FAKEBT_LOG"; exit 1; }
+        grep -q "reconnect OK" "$FAKEBT_LOG" || { echo "FAIL: gamepad could not reconnect with the stored key"; cat "$FAKEBT_LOG"; exit 1; }
+        grep -q "buttons: 2 12, hat down, axes: X -127 Y +0 Z +0 Rz +0" "$LOG" || { echo "FAIL: gamepad input after the reconnect not decoded"; cat "$FAKEBT_LOG"; exit 1; }
         grep -q "read /system/session.cfg" "$LOG" || { echo "FAIL: aerosmss did not read its config from disk"; exit 1; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware and found the gamepads in a scan, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
