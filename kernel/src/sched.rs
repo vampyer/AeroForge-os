@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::interrupts::InterruptFrame;
 use crate::process::Process;
 use crate::sync::IrqMutex;
+use crate::fpu::FpuArea;
 use crate::kstack::KernelStack;
 use crate::{arch, gdt, memory, percpu};
 
@@ -58,6 +59,8 @@ pub struct Thread {
     pml4: u64,
     wake_at: AtomicU64,
     pub runtime_ticks: AtomicU64,
+    /// Saved floating point and vector registers; user threads only.
+    fpu: Option<FpuArea>,
 }
 
 // saved_rsp is only touched by the owning CPU inside `schedule`.
@@ -178,6 +181,7 @@ pub fn init_cpu() {
         pml4: memory::kernel_pml4(),
         wake_at: AtomicU64::new(0),
         runtime_ticks: AtomicU64::new(0),
+        fpu: None,
     });
     let mut rq = cpu.rq.lock();
     rq.idle = Some(idle.clone());
@@ -190,6 +194,7 @@ fn pick_cpu() -> usize {
 
 fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread {
     let pml4 = process.as_ref().map_or(memory::kernel_pml4(), |p| p.pml4);
+    let fpu = process.as_ref().map(|_| FpuArea::new().expect("out of memory for a register save area"));
     Thread {
         tid: NEXT_TID.fetch_add(1, Ordering::SeqCst),
         name,
@@ -202,6 +207,7 @@ fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread
         pml4,
         wake_at: AtomicU64::new(0),
         runtime_ticks: AtomicU64::new(0),
+        fpu,
     }
 }
 
@@ -295,6 +301,17 @@ pub fn schedule() {
             rq.zombie = Some(prev.clone());
         }
         rq.switches += 1;
+
+        // The kernel never uses the floating point registers, so they still
+        // hold the outgoing user thread's values here.
+        if prev.state() != State::Dead {
+            if let Some(f) = prev.fpu.as_ref() {
+                f.save();
+            }
+        }
+        if let Some(f) = next.fpu.as_ref() {
+            f.restore();
+        }
 
         percpu::set_kernel_stack(next.kstack_top());
         if arch::read_cr3() & !0xFFF != next.pml4 {

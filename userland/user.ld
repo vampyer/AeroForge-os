@@ -17,7 +17,7 @@ SECTIONS
     . = ALIGN(4096);
     .rodata : { *(.rodata .rodata.*) } :rodata
     . = ALIGN(4096);
-    .data : { *(.data .data.*) } :data
+    .data : { *(.data .data.*) *(.got .got.*) } :data
     .bss : { *(.bss .bss.*) *(COMMON) } :data
-    /DISCARD/ : { *(.eh_frame*) *(.note .note.*) *(.comment) }
+    /DISCARD/ : { *(.eh_frame*) *(.gcc_except_table*) *(.note .note.*) *(.comment) }
 }
