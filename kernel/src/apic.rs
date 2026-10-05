@@ -1,6 +1,11 @@
 //! Local APIC (per-CPU timer, end-of-interrupt) and I/O APIC (routing device
 //! IRQs). Replaces the 8259 PIC and 8254 PIT from the first milestone; the
 //! PIT is now only used once, to calibrate the LAPIC timer.
+//!
+//! The LAPIC timer runs in one-shot mode: the scheduler arms it for
+//! whichever comes first, the next 10 ms time-slice tick or the earliest
+//! sleeping thread's wake-up time, so sleeps are as precise as the timer
+//! (well under a microsecond) instead of rounding to whole ticks.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -22,8 +27,11 @@ const REG_TIMER_DIVIDE: u64 = 0x3E0;
 
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
-static TICKS_PER_PERIOD: AtomicU32 = AtomicU32::new(0);
+/// LAPIC timer counts (divider 16) in 10 ms.
+static COUNTS_PER_10MS: AtomicU32 = AtomicU32::new(0);
 static TSC_PER_US: AtomicU64 = AtomicU64::new(1000);
+/// TSC value at calibration, so `micros` counts from (about) boot.
+static TSC_BOOT: AtomicU64 = AtomicU64::new(0);
 
 fn read(reg: u64) -> u32 {
     unsafe { ((LAPIC_BASE.load(Ordering::Relaxed) + reg) as *const u32).read_volatile() }
@@ -56,7 +64,7 @@ pub fn init_bsp() -> u32 {
 
     enable_local();
     let per_10ms = calibrate();
-    TICKS_PER_PERIOD.store(per_10ms * (100 / TIMER_HZ as u32), Ordering::SeqCst);
+    COUNTS_PER_10MS.store(per_10ms, Ordering::SeqCst);
     per_10ms * 100 * 16 / 1_000_000 // LAPIC timer input clock in MHz (divider 16)
 }
 
@@ -84,18 +92,29 @@ fn calibrate() -> u32 {
         let tsc0 = arch::rdtsc();
         while inb(0x61) & 0x20 == 0 {}
         let elapsed = u32::MAX - read(REG_TIMER_CURRENT);
-        TSC_PER_US.store(((arch::rdtsc() - tsc0) / 10_000).max(1), Ordering::SeqCst);
+        let tsc1 = arch::rdtsc();
+        TSC_PER_US.store(((tsc1 - tsc0) / 10_000).max(1), Ordering::SeqCst);
+        TSC_BOOT.store(tsc1, Ordering::SeqCst);
         write(REG_TIMER_INITIAL, 0);
         elapsed
     }
 }
 
-/// Enables this CPU's LAPIC and starts its periodic timer on `vector`.
+/// Enables this CPU's LAPIC and starts its timer (one-shot) on `vector`;
+/// the first interrupt comes one tick from now.
 pub fn start_timer(vector: u8) {
     enable_local();
     write(REG_TIMER_DIVIDE, 0x3);
-    write(REG_LVT_TIMER, vector as u32 | (1 << 17)); // periodic
-    write(REG_TIMER_INITIAL, TICKS_PER_PERIOD.load(Ordering::SeqCst));
+    write(REG_LVT_TIMER, vector as u32); // one-shot
+    arm_timer(1_000_000 / TIMER_HZ);
+}
+
+/// Makes this CPU's timer interrupt fire `us` microseconds from now
+/// (replacing any earlier setting). A no-op until `start_timer` has run.
+pub fn arm_timer(us: u64) {
+    let per_10ms = COUNTS_PER_10MS.load(Ordering::Relaxed) as u64;
+    let count = (us.saturating_mul(per_10ms) / 10_000).clamp(1, u32::MAX as u64);
+    write(REG_TIMER_INITIAL, count as u32);
 }
 
 // ----------------------------------------------------------------- I/O APIC
@@ -154,12 +173,13 @@ pub fn route_isa_irq(irq: u8, vector: u8, lapic_id: u32) {
     ioapic_write(0x10 + 2 * pin, low);
 }
 
-/// Busy-waits using the TSC (calibrated against the PIT at boot).
-/// Microseconds since boot, from the TSC: finer than the 10 ms timer tick.
+/// Microseconds since boot, from the TSC (calibrated against the PIT).
+/// This is the clock the scheduler's sleeps and `ticks` run on.
 pub fn micros() -> u64 {
-    arch::rdtsc() / TSC_PER_US.load(Ordering::Relaxed)
+    arch::rdtsc().saturating_sub(TSC_BOOT.load(Ordering::Relaxed)) / TSC_PER_US.load(Ordering::Relaxed)
 }
 
+/// Busy-waits using the TSC.
 pub fn delay_us(us: u64) {
     let end = arch::rdtsc() + us * TSC_PER_US.load(Ordering::Relaxed);
     while arch::rdtsc() < end {

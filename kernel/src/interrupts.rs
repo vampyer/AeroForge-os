@@ -161,7 +161,7 @@ extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
         0..=31 => exception(frame),
         VECTOR_TIMER => {
             apic::eoi();
-            sched::on_tick();
+            sched::on_timer();
         }
         VECTOR_KEYBOARD => {
             let mut ev = dhi::KeyEvent::default();

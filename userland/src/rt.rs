@@ -36,6 +36,13 @@ pub mod futex {
         unsafe { syscall(sys::FUTEX_WAIT, word as *const AtomicU32 as u64, expected as u64, 0, 0) };
     }
 
+    /// Like `wait`, but gives up after `timeout_us` microseconds. Returns
+    /// false if it timed out.
+    pub fn wait_timeout(word: &AtomicU32, expected: u32, timeout_us: u64) -> bool {
+        let r = unsafe { syscall(sys::FUTEX_WAIT, word as *const AtomicU32 as u64, expected as u64, timeout_us.max(1), 0) };
+        r != crate::E_TIMEDOUT
+    }
+
     /// Wakes up to `count` threads sleeping on `word`; returns how many woke.
     pub fn wake(word: &AtomicU32, count: u32) -> u64 {
         unsafe { syscall(sys::FUTEX_WAKE, word as *const AtomicU32 as u64, count as u64, 0, 0) as u64 }
