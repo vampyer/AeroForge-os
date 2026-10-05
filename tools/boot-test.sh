@@ -48,7 +48,10 @@
 # 'nettest' uses UDP and TCP sockets against tools/echo-server.py on this
 # host (10.0.2.2 to the guest): a UDP echo, a receive timeout, 64 KiB echoed
 # over TCP with the end of data, and a refused connection; 'ifconfig' must
-# then show its sockets closed and gone.
+# then show its sockets closed and gone. It also reads the network info,
+# looks names up through the test DNS server in echo-server.py, and runs a
+# TCP server that a client on this host reaches through QEMU's port
+# forwarding (host 5580 to guest 7070).
 # 'spreadtest' leaves its busy threads at one, three, one and three per CPU:
 # periodic balancing must even them out although no CPU goes idle.
 # 'wakeups' counts timer interrupts per CPU over a second: cpu0, which only
@@ -84,7 +87,9 @@ build/fakepad build/xpad.sock --xinput 2>"$FAKEPAD_LOG" &
 XPAD_PID=$!
 build/fakepad build/hidpad.sock --hid 2>>"$FAKEPAD_LOG" &
 HIDPAD_PID=$!
-python3 tools/echo-server.py >build/echo-server.log 2>&1 &
+: >build/echo-server.log
+# Appending: the host client below writes to the same log.
+python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
@@ -102,12 +107,12 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
     -chardev socket,id=xpad,path=build/xpad.sock -device usb-redir,chardev=xpad,bus=xhci.0,port=4 \
     -chardev socket,id=hidpad,path=build/hidpad.sock -device usb-redir,chardev=hidpad,bus=xhci.0,port=1.3 \
-    -nic user,model=igb -nic user,model=e1000e \
+    -nic user,model=igb,hostfwd=tcp:127.0.0.1:5580-:7070 -nic user,model=e1000e \
     -device ich9-intel-hda,id=hda -device hda-output,bus=hda.0,audiodev=snd -audiodev wav,id=snd,path=build/sound.wav \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
     -monitor unix:build/qemu-monitor.sock,server,nowait &
 QEMU_PID=$!
-trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
 fail() {
@@ -246,7 +251,11 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = timer ] && grep -q "\[timertest\] .*\(: OK\|FAILED\)" "$LOG"; then
         # Balancing between busy CPUs.
         sleep 1; type_keys $'run nettest\n'; STAGE=net
-    elif [ $STAGE = net ] && grep -q "\[nettest\] .*\(: OK\|FAILED\)" "$LOG"; then
+    elif [ $STAGE = net ] && [ -z "${CLIENT_PID:-}" ] && grep -q "\[nettest\] listening on port" "$LOG"; then
+        # The other direction: a client on this host connects to nettest's server.
+        python3 tools/echo-server.py client 5580 >>build/echo-server.log 2>&1 &
+        CLIENT_PID=$!
+    elif [ $STAGE = net ] && grep -q "\[nettest\] \(network info, DNS lookups and a TCP server: OK\|FAILED\)" "$LOG"; then
         # Its sockets must be closed and removed once it has exited.
         sleep 3; type_keys $'ifconfig\n'; STAGE=netsockets
     elif [ $STAGE = netsockets ] && grep -q "program socket(s) open" "$LOG"; then
@@ -320,6 +329,9 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "sleeps were not precise to well under a tick, frame pacing slipped, or futex timeouts failed"; }
         grep -q "\[nettest\] UDP echo, receive timeout, 64 KiB TCP echo and a refused connection: OK" "$LOG" \
             || { fail "UDP or TCP sockets did not work against the host's echo server" build/echo-server.log; }
+        grep -q "\[nettest\] network info, DNS lookups and a TCP server: OK" "$LOG" \
+            || { fail "network info, DNS lookups or the TCP server did not work" build/echo-server.log; }
+        grep -q "host client: got .*: OK" build/echo-server.log || { fail "the host's client did not get nettest's server's answer" build/echo-server.log; }
         grep -q "^  0 program socket(s) open" "$LOG" || { fail "nettest's sockets were not closed after it exited"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }

@@ -50,6 +50,9 @@ pub mod sys {
     pub const SOCKET_CONNECT: u64 = 35;
     pub const SOCKET_SEND: u64 = 36;
     pub const SOCKET_RECV: u64 = 37;
+    pub const SOCKET_LISTEN: u64 = 38;
+    pub const SOCKET_ACCEPT: u64 = 39;
+    pub const NET_INFO: u64 = 40;
 }
 
 pub mod rights {
@@ -308,6 +311,16 @@ pub mod net {
         }
     }
 
+    /// Prints an IPv4 address as a.b.c.d.
+    pub struct Ip(pub [u8; 4]);
+
+    impl core::fmt::Display for Ip {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let [a, b, c, d] = self.0;
+            write!(f, "{}.{}.{}.{}", a, b, c, d)
+        }
+    }
+
     impl core::fmt::Display for Endpoint {
         fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
             let [a, b, c, d] = self.addr;
@@ -316,6 +329,157 @@ pub mod net {
     }
 
     pub struct Socket(Handle);
+
+    /// The network as DHCP set it up.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Info {
+        pub addr: [u8; 4],
+        pub prefix_len: u8,
+        /// All zero when there is none.
+        pub gateway: [u8; 4],
+        pub dns: [u8; 4],
+    }
+
+    /// `E_NOTFOUND` until DHCP has given an address.
+    pub fn info() -> Result<Info, i64> {
+        let mut w = [0u32; 4];
+        check(unsafe { syscall(sys::NET_INFO, w.as_mut_ptr() as u64, 0, 0, 0) })?;
+        Ok(Info { addr: w[0].to_be_bytes(), prefix_len: w[1] as u8, gateway: w[2].to_be_bytes(), dns: w[3].to_be_bytes() })
+    }
+
+    /// Looks up `name`'s IPv4 address with the DNS server DHCP gave,
+    /// waiting up to `timeout_us` in all. `E_NOTFOUND` if the name does
+    /// not exist (or there is no network), `E_TIMEDOUT` if no answer came.
+    pub fn resolve(name: &str, timeout_us: u64) -> Result<[u8; 4], i64> {
+        let dns = info()?.dns;
+        if dns == [0; 4] {
+            return Err(E_NOTFOUND);
+        }
+        resolve_with(Endpoint::new(dns, 53), name, timeout_us)
+    }
+
+    /// `resolve` through the DNS server at `server`. A dotted IPv4 address
+    /// is returned as is.
+    pub fn resolve_with(server: Endpoint, name: &str, timeout_us: u64) -> Result<[u8; 4], i64> {
+        if let Some(a) = parse_ipv4(name) {
+            return Ok(a);
+        }
+        let mut query = [0u8; 512];
+        let id = (clock_us() as u16) ^ 0xAE40;
+        let len = dns::query(&mut query, id, name).ok_or(E_INVAL)?;
+        let sock = Socket::udp()?;
+        sock.connect(server, 0)?;
+        let deadline = clock_us().saturating_add(timeout_us);
+        let mut reply = [0u8; 512];
+        // Ask again every second: DNS runs over UDP and a packet can be lost.
+        loop {
+            sock.send(&query[..len])?;
+            let resend = clock_us().saturating_add(1_000_000).min(deadline);
+            loop {
+                let now = clock_us();
+                if now >= resend {
+                    break;
+                }
+                match sock.recv(&mut reply, resend - now) {
+                    Ok(n) => match dns::answer(&reply[..n], id) {
+                        Some(r) => return r,
+                        None => continue, // not ours, or garbled
+                    },
+                    Err(E_TIMEDOUT) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            if clock_us() >= deadline {
+                return Err(E_TIMEDOUT);
+            }
+        }
+    }
+
+    pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+        let mut out = [0u8; 4];
+        let mut parts = s.split('.');
+        for b in out.iter_mut() {
+            let p = parts.next()?;
+            if p.is_empty() || p.len() > 3 || !p.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            *b = p.parse().ok()?;
+        }
+        parts.next().is_none().then_some(out)
+    }
+
+    /// The DNS wire format, just enough for A lookups (RFC 1035).
+    pub mod dns {
+        use super::super::{E_NOTFOUND};
+
+        const TYPE_A: u16 = 1;
+        const CLASS_IN: u16 = 1;
+
+        /// Writes a recursive query for `name`'s A record; returns its length.
+        pub fn query(buf: &mut [u8; 512], id: u16, name: &str) -> Option<usize> {
+            let name = name.strip_suffix('.').unwrap_or(name);
+            if name.is_empty() || name.len() > 253 {
+                return None;
+            }
+            buf[..12].copy_from_slice(&[(id >> 8) as u8, id as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+            let mut n = 12;
+            for label in name.split('.') {
+                if label.is_empty() || label.len() > 63 {
+                    return None;
+                }
+                buf[n] = label.len() as u8;
+                buf[n + 1..n + 1 + label.len()].copy_from_slice(label.as_bytes());
+                n += 1 + label.len();
+            }
+            buf[n] = 0;
+            buf[n + 1..n + 5].copy_from_slice(&[0, TYPE_A as u8, 0, CLASS_IN as u8]);
+            Some(n + 5)
+        }
+
+        /// Skips a (possibly compressed) name at `i`; returns the index after it.
+        fn skip_name(m: &[u8], mut i: usize) -> Option<usize> {
+            loop {
+                let len = *m.get(i)? as usize;
+                match len {
+                    0 => return Some(i + 1),
+                    l if l & 0xC0 == 0xC0 => return Some(i + 2),
+                    l => i += 1 + l,
+                }
+            }
+        }
+
+        fn u16_at(m: &[u8], i: usize) -> Option<u16> {
+            Some(u16::from_be_bytes([*m.get(i)?, *m.get(i + 1)?]))
+        }
+
+        /// The first A record in a reply to query `id`: None if this is not
+        /// a reply to it, `E_NOTFOUND` if the name does not exist or has no
+        /// IPv4 address.
+        pub fn answer(m: &[u8], id: u16) -> Option<Result<[u8; 4], i64>> {
+            if m.len() < 12 || u16_at(m, 0)? != id || m[2] & 0x80 == 0 {
+                return None;
+            }
+            let rcode = m[3] & 0x0F;
+            if rcode != 0 {
+                return Some(Err(E_NOTFOUND));
+            }
+            let (qd, an) = (u16_at(m, 4)?, u16_at(m, 6)?);
+            let mut i = 12;
+            for _ in 0..qd {
+                i = skip_name(m, i)? + 4;
+            }
+            for _ in 0..an {
+                i = skip_name(m, i)?;
+                let (ty, class, rdlen) = (u16_at(m, i)?, u16_at(m, i + 2)?, u16_at(m, i + 8)? as usize);
+                let data = m.get(i + 10..i + 10 + rdlen)?;
+                if ty == TYPE_A && class == CLASS_IN && rdlen == 4 {
+                    return Some(Ok([data[0], data[1], data[2], data[3]]));
+                }
+                i += 10 + rdlen; // CNAMEs and the like: the A record follows
+            }
+            Some(Err(E_NOTFOUND))
+        }
+    }
 
     fn open(kind: u64) -> Result<Socket, i64> {
         check(unsafe { syscall(sys::SOCKET_OPEN, kind, 0, 0, 0) }).map(|h| Socket(Handle(h)))
@@ -345,6 +509,17 @@ pub mod net {
         pub fn send(&self, data: &[u8]) -> Result<usize, i64> {
             check(unsafe { syscall(sys::SOCKET_SEND, self.0 .0, data.as_ptr() as u64, data.len() as u64, 0) })
                 .map(|n| n as usize)
+        }
+
+        /// TCP: waits for connections on `port` (take them with `accept`).
+        pub fn listen(&self, port: u16) -> Result<(), i64> {
+            check(unsafe { syscall(sys::SOCKET_LISTEN, self.0 .0, port as u64, 0, 0) }).map(|_| ())
+        }
+
+        /// TCP after `listen`: waits up to `timeout_us` (0 = no limit) for a
+        /// connection.
+        pub fn accept(&self, timeout_us: u64) -> Result<Socket, i64> {
+            check(unsafe { syscall(sys::SOCKET_ACCEPT, self.0 .0, timeout_us, 0, 0) }).map(|h| Socket(Handle(h)))
         }
 
         /// TCP: sends everything.

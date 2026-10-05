@@ -155,6 +155,9 @@ pub const SYS_SOCKET_OPEN: u64 = 34;
 pub const SYS_SOCKET_CONNECT: u64 = 35;
 pub const SYS_SOCKET_SEND: u64 = 36;
 pub const SYS_SOCKET_RECV: u64 = 37;
+pub const SYS_SOCKET_LISTEN: u64 = 38;
+pub const SYS_SOCKET_ACCEPT: u64 = 39;
+pub const SYS_NET_INFO: u64 = 40;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -524,6 +527,42 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             let data = sock.recv(len as usize, a3).map_err(sock_error)?;
             to_user(a1, &data)?;
             Ok(data.len() as u64)
+        }
+        SYS_SOCKET_LISTEN => {
+            // Handle of an unconnected TCP socket, port.
+            let sock = socket_handle(&proc_, a0, rights::RECV)?;
+            let port = u16::try_from(a1).map_err(|_| E_INVAL)?;
+            sock.listen(port).map(|_| 0).map_err(sock_error)
+        }
+        SYS_SOCKET_ACCEPT => {
+            // Listening handle, timeout in µs (0 = none). Returns the new
+            // connection's handle.
+            let sock = socket_handle(&proc_, a0, rights::RECV)?;
+            let pid = proc_.pid;
+            drop(proc_);
+            let conn = sock.accept(a1).map_err(sock_error)?;
+            // Not held while waiting, like the other blocking calls.
+            let proc_ = sched::current().process.clone().filter(|p| p.pid == pid).ok_or(E_INVAL)?;
+            let h = proc_.handles.lock().insert(Handle { object: Object::Socket(conn), rights: rights::ALL });
+            Ok(h)
+        }
+        SYS_NET_INFO => {
+            // Writes four u32s at a0: address, prefix length, gateway, DNS
+            // server (addresses as a << 24 | b << 16 | c << 8 | d, 0 for none).
+            let lease = net::info().ok_or(E_NOTFOUND)?;
+            let ip = |a: Option<core::net::Ipv4Addr>| a.map_or(0, u32::from);
+            let words = [
+                u32::from(lease.address.address()),
+                lease.address.prefix_len() as u32,
+                ip(lease.router),
+                ip(lease.dns),
+            ];
+            let mut bytes = [0u8; 16];
+            for (i, w) in words.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            to_user(a0, &bytes)?;
+            Ok(0)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
         SYS_AUDIO_WRITE => {
