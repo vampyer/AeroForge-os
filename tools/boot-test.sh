@@ -40,7 +40,7 @@
 # Then 'threadtest' runs four threads under one futex lock, uses the heap,
 # waits for a child program's exit code and exits with three threads still
 # running, which 'ps' must no longer show. Last, 'irq' must show that the
-# USB and NVMe controllers have been raising MSI-X interrupts.
+# USB, NVMe and SATA (AHCI) controllers have been raising interrupts.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -273,6 +273,8 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "vector 0x[0-9a-f]*  MSI-X -> cpu[0-9]* *[1-9][0-9]* interrupts  xhci0" "$LOG" || { fail "the USB controller raised no interrupts"; }
         grep -q "nvme0: MSI-X completion interrupts on" "$LOG" || { fail "NVMe completion interrupts (MSI-X) not set up"; }
         grep -q "vector 0x[0-9a-f]*  MSI-X -> cpu0 *[1-9][0-9]* interrupts  nvme0" "$LOG" || { fail "the NVMe controller raised no interrupts"; }
+        grep -q "ahci0: MSI completion interrupts on" "$LOG" || { fail "SATA (AHCI) completion interrupts (MSI) not set up"; }
+        grep -q "vector 0x[0-9a-f]*  MSI   -> cpu0 *[1-9][0-9]* interrupts  ahci0" "$LOG" || { fail "the SATA (AHCI) controller raised no interrupts"; }
         grep -q "\[melody\] played 4 notes" "$LOG" || { fail "the melody program could not play"; }
         [ "$(echo "$TONE" | grep -cE "^tone 0\.(29|30|31) s, (52[0-9]|66[0-9]|78[0-9]|10[45][0-9]) Hz")" = 4 ] \
             || { fail "the melody program's four notes were not heard on the sound card ($TONE)"; }
@@ -331,7 +333,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, the USB and NVMe controllers raised MSI-X interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, the USB, NVMe and SATA controllers raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

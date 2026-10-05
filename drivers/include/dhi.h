@@ -111,9 +111,12 @@ int32_t aero_nvme_flush(int32_t ctrl);
  * identifies every SATA disk on it. Fills up to `max` entries of `out` and
  * returns how many disks were found (negative on controller error). Disk ids
  * for aero_ahci_read are 0..n-1 across all controllers, in discovery order,
- * starting at the value returned through `first_id`. */
-int32_t aero_ahci_init(const dhi_ops *ops, uint64_t abar_phys, dhi_block_info *out,
-                       int32_t max, int32_t *first_id);
+ * starting at the value returned through `first_id`. `irq_first` is
+ * DHI_NO_IRQ (poll), or the first of `max` interrupt sources the kernel has
+ * pointed the controller's MSI at, all signalled together: disk i of this
+ * controller sleeps on source irq_first + i. */
+int32_t aero_ahci_init(const dhi_ops *ops, uint64_t abar_phys, uint32_t irq_first,
+                       dhi_block_info *out, int32_t max, int32_t *first_id);
 
 /* Reads `count` sectors starting at `lba` into the DMA buffer at `buf_phys`.
  * count * block_size must not exceed max_transfer. 0 = ok. */

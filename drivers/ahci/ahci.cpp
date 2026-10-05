@@ -1,8 +1,11 @@
 // AeroForge AHCI (SATA) driver (C++20, freestanding), behind the Driver Host
 // Interface.
 //
-// Polling mode, one command slot per port: reads, writes and cache flushes.
-// NCQ and interrupts come later.
+// One command slot per port: reads, writes and cache flushes. When the kernel
+// hands init interrupt sources (its MSI already pointed at them), a thread
+// waiting for a command polls briefly, then sleeps until the controller's
+// interrupt. The controller has one interrupt for all ports, so each port
+// clears its own status bits after a command. NCQ comes later.
 
 #include "dhi.h"
 
@@ -11,8 +14,10 @@ namespace {
 // HBA registers (AHCI 1.3.1, section 3.1).
 constexpr uint32_t kHbaCap = 0x00;
 constexpr uint32_t kHbaGhc = 0x04;
+constexpr uint32_t kHbaIs  = 0x08;
 constexpr uint32_t kHbaPi  = 0x0C;
 constexpr uint32_t kGhcAhciEnable = 1u << 31;
+constexpr uint32_t kGhcIrqEnable = 1u << 1;
 
 // Port registers (section 3.3), relative to 0x100 + port * 0x80.
 constexpr uint32_t kPxClb  = 0x00;
@@ -20,6 +25,7 @@ constexpr uint32_t kPxClbu = 0x04;
 constexpr uint32_t kPxFb   = 0x08;
 constexpr uint32_t kPxFbu  = 0x0C;
 constexpr uint32_t kPxIs   = 0x10;
+constexpr uint32_t kPxIe   = 0x14;
 constexpr uint32_t kPxCmd  = 0x18;
 constexpr uint32_t kPxTfd  = 0x20;
 constexpr uint32_t kPxSig  = 0x24;
@@ -32,6 +38,10 @@ constexpr uint32_t kCmdFre   = 1u << 4;
 constexpr uint32_t kCmdFr    = 1u << 14;
 constexpr uint32_t kCmdCr    = 1u << 15;
 constexpr uint32_t kIsTaskFileError = 1u << 30;
+// Interrupts for a finished command (D2H register FIS, PIO setup FIS, set
+// device bits FIS) and for errors (task file, host bus, interface).
+constexpr uint32_t kIeCompletion = (1u << 0) | (1u << 1) | (1u << 3);
+constexpr uint32_t kIeErrors = (1u << 30) | (1u << 29) | (1u << 28) | (1u << 27);
 constexpr uint32_t kTfdErr = 1u << 0;
 constexpr uint32_t kTfdBusy = 1u << 7;
 constexpr uint32_t kTfdDrq = 1u << 3;
@@ -46,6 +56,7 @@ constexpr uint8_t kAtaFlushCacheExt = 0xEA;
 constexpr uint16_t kHeaderWrite = 1u << 6;
 
 constexpr uint32_t kMaxTransfer = 8192;
+constexpr uint32_t kSpinUs = 20;  // poll this long before sleeping for the interrupt
 constexpr int kMaxDisks = 8;
 
 struct CommandHeader {
@@ -73,9 +84,14 @@ static_assert(sizeof(CommandTable) == 144);
 
 class Disk {
 public:
-    bool init(const dhi_ops* ops, volatile uint8_t* port, dhi_block_info* info) {
+    bool init(const dhi_ops* ops, volatile uint8_t* abar, uint32_t index, uint32_t irq_source,
+              dhi_block_info* info) {
         ops_ = ops;
-        port_ = port;
+        abar_ = abar;
+        index_ = index;
+        port_ = abar + 0x100 + index * 0x80;
+        irq_ = irq_source != DHI_NO_IRQ;
+        irq_source_ = irq_source;
         stop();
         if (ops_->dma_alloc(1024, &cmd_list_) != 0 || ops_->dma_alloc(256, &fis_) != 0 ||
             ops_->dma_alloc(sizeof(CommandTable), &table_) != 0) {
@@ -86,6 +102,7 @@ public:
         write64(kPxFb, kPxFbu, fis_.phys);
         write(kPxSerr, 0xFFFFFFFF);
         write(kPxIs, 0xFFFFFFFF);
+        write(kPxIe, irq_ ? (kIeCompletion | kIeErrors) : 0);
         auto* header = static_cast<CommandHeader*>(cmd_list_.virt);
         header->ctba = table_.phys;
         start();
@@ -156,22 +173,42 @@ private:
         t->prdt[0].reserved = 0;
         t->prdt[0].dbc = bytes - 1;
 
-        write(kPxIs, 0xFFFFFFFF);
+        clear_irq();
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         write(kPxCi, 1);
-        for (uint32_t us = 0; us < 5'000'000; us += 2) {
+        bool error = false;
+        for (uint32_t us = 0; us < 5'000'000;) {
             if ((read32(kPxCi) & 1) == 0) break;
             if (read32(kPxIs) & kIsTaskFileError) {
                 ops_->log("ahci: task file error");
-                return false;
+                error = true;
+                break;
             }
-            ops_->delay_us(2);
+            if (irq_ && us >= kSpinUs) {
+                // Sleep until the controller interrupts (for this port or
+                // another one); each wait counts as its longest, 10 ms.
+                ops_->irq_wait(irq_source_);
+                us += 10000;
+            } else {
+                ops_->delay_us(2);
+                us += 2;
+            }
         }
-        if (read32(kPxCi) & 1) {
+        const bool busy = (read32(kPxCi) & 1) != 0;
+        clear_irq();
+        if (error) return false;
+        if (busy) {
             ops_->log("ahci: command timed out");
             return false;
         }
         return (read32(kPxTfd) & kTfdErr) == 0;
+    }
+
+    // Port status bits first, then this port's bit in the controller's
+    // summary, so the controller can interrupt again for the next command.
+    void clear_irq() {
+        write(kPxIs, 0xFFFFFFFF);
+        *reinterpret_cast<volatile uint32_t*>(abar_ + kHbaIs) = 1u << index_;
     }
 
     void stop() {
@@ -206,7 +243,11 @@ private:
     }
 
     const dhi_ops* ops_ = nullptr;
+    volatile uint8_t* abar_ = nullptr;
     volatile uint8_t* port_ = nullptr;
+    uint32_t index_ = 0;
+    bool irq_ = false;
+    uint32_t irq_source_ = 0;
     dhi_dma cmd_list_{}, fis_{}, table_{};
     uint64_t sectors_ = 0;
 };
@@ -216,8 +257,8 @@ constinit int32_t g_count = 0;
 
 }  // namespace
 
-extern "C" int32_t aero_ahci_init(const dhi_ops* ops, uint64_t abar_phys, dhi_block_info* out,
-                                  int32_t max, int32_t* first_id) {
+extern "C" int32_t aero_ahci_init(const dhi_ops* ops, uint64_t abar_phys, uint32_t irq_first,
+                                  dhi_block_info* out, int32_t max, int32_t* first_id) {
     if (ops == nullptr || out == nullptr || first_id == nullptr || ops->abi_version != DHI_ABI_VERSION) return -1;
     auto* abar = static_cast<volatile uint8_t*>(ops->map_mmio(abar_phys, 0x1100));
     if (abar == nullptr) return -1;
@@ -237,12 +278,16 @@ extern "C" int32_t aero_ahci_init(const dhi_ops* ops, uint64_t abar_phys, dhi_bl
         if ((ssts & 0xF) != 3 || ((ssts >> 8) & 0xF) != 1) continue;  // no device, or not active
         if (*reinterpret_cast<volatile uint32_t*>(port + kPxSig) != kSigSataDisk) continue;  // e.g. ATAPI CD-ROM
         out[found] = dhi_block_info{};
-        if (g_disks[g_count].init(ops, port, &out[found])) {
+        const uint32_t irq = irq_first == DHI_NO_IRQ ? DHI_NO_IRQ : irq_first + uint32_t(found);
+        if (g_disks[g_count].init(ops, abar, p, irq, &out[found])) {
             ++g_count;
             ++found;
         }
     }
-    ops->log(found > 0 ? "ahci: controller ready (polling, 1 command slot per port)"
+    // Port interrupts are enabled per port in Disk::init; this lets them out.
+    if (irq_first != DHI_NO_IRQ) reg(kHbaGhc) = reg(kHbaGhc) | kGhcIrqEnable;
+    ops->log(found > 0 ? (irq_first != DHI_NO_IRQ ? "ahci: controller ready, 1 command slot per port"
+                                                  : "ahci: controller ready (polling, 1 command slot per port)")
                        : "ahci: controller ready, no SATA disks attached");
     return found;
 }

@@ -260,6 +260,14 @@ queue, because controllers (QEMU's included) only deliver on vectors that were e
 queue was created. During early boot, before the scheduler runs, the driver still polls. The
 boot test checks that the NVMe controller is on MSI-X and has raised interrupts.
 
+Since 0.26 SATA disks do the same. The AHCI controller has a single MSI for all its ports, so
+the kernel reserves a group of interrupt sources for it, one per disk, and the controller's
+interrupt signals the whole group: each disk's thread sleeps on its own source, and one woken by
+another port's completion just checks its command again. The driver enables the completion and
+error interrupts on each port and clears the port's status and its bit in the controller's
+summary after every command, so the next one can interrupt again. `aero_ahci_init` takes the
+first source. The boot test checks that the AHCI controller is on MSI and has raised interrupts.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -267,7 +275,7 @@ boot test checks that the NVMe controller is on MSI-X and has raised interrupts.
 | Memory | Binary **buddy** page allocator (4 KiB to 4 MiB blocks, coalescing), **slab** heap (16 B to 2 KiB size classes, larger requests straight from the buddy), per-process address spaces sharing the kernel half |
 | CPU tables | Per-CPU GDT and TSS (`rsp0` updated on every switch), double-fault IST stack, per-CPU data through GS with `swapgs` on ring transitions |
 | Interrupts | 256-vector IDT generated at build time, exceptions from ring 3 kill only the faulting process |
-| Interrupt controllers | Local APIC (per-CPU periodic timer, calibrated against the PIT) and I/O APIC with MADT overrides; the 8259 PIC is masked; MSI-X and MSI for PCIe devices (the USB and NVMe controllers so far) |
+| Interrupt controllers | Local APIC (per-CPU periodic timer, calibrated against the PIT) and I/O APIC with MADT overrides; the 8259 PIC is masked; MSI-X and MSI for PCIe devices (the USB, NVMe and SATA controllers so far) |
 | Scheduler | Preemptive round robin with one run queue per CPU, idle thread per CPU, sleep, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
 | Processes | ELF64 loader, ring 3, threads (on any CPU), memory mapping with TLB shootdowns, futexes, `exit` that ends every thread, waiting for child exit codes, `syscall`/`sysret` entry (the `int 0x80` gate still works), x87/SSE/AVX/AVX-512 registers saved per thread with XSAVE, exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
@@ -278,7 +286,7 @@ boot test checks that the NVMe controller is on MSI-X and has raised interrupts.
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files), `fputest` (floating point and vector registers), `threadtest` (threads, heap, locks) (Rust, `no_std` with `alloc`, hardware floating point) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `irq`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, an NTFS drive's folders and fragmented and sparse files, five programs keeping their floating point and vector registers apart, threads sharing a lock and a heap and ending with their program, MSI-X interrupts from the USB and NVMe controllers, the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, an NTFS drive's folders and fragmented and sparse files, five programs keeping their floating point and vector registers apart, threads sharing a lock and a heap and ending with their program, interrupts from the USB, NVMe and SATA controllers, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -295,7 +303,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
 3. Event objects, and handles to threads and processes (killing a program from another one).
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI interrupts and NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, network interrupts, and sockets for user programs.
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, network interrupts, and sockets for user programs.
 6. Filesystems move to user-space servers behind IPC, as the design says; NTFS writes and compressed NTFS files.
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and targeted TLB shootdowns (only the CPUs running the program, one page at a time).
 
