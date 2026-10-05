@@ -134,6 +134,34 @@ int32_t aero_xhci_poll(int32_t ctrl, dhi_input_event *out, int32_t max);
 /* Describes device `index` (0..devices-1) of a controller. 0 = ok. */
 int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device *out);
 
+/* ---- Intel Ethernet driver, e1000/e1000e family (drivers/e1000) ---- */
+
+typedef struct dhi_net_info {
+    uint8_t  mac[6];
+    uint8_t  link_up;     /* 1 = cable connected and negotiated */
+    uint8_t  _pad;
+    uint32_t speed_mbps;  /* 10, 100 or 1000 */
+} dhi_net_info;
+
+/* 1 if this driver handles Intel (vendor 0x8086) device `device_id`. */
+int32_t aero_e1000_supports(uint16_t device_id);
+
+/* Resets the NIC whose registers (BAR0) are at `mmio_phys`, sets up one
+ * receive and one transmit ring and waits briefly for the link. Returns a
+ * NIC id >= 0, or a negative error. */
+int32_t aero_e1000_init(const dhi_ops *ops, uint64_t mmio_phys, dhi_net_info *info);
+
+/* Queues one Ethernet frame (without CRC, at most 2048 bytes). 0 = queued,
+ * negative if the transmit ring is full or the frame is invalid. */
+int32_t aero_e1000_send(int32_t nic, const void *frame, uint32_t len);
+
+/* Copies the next received frame into `frame`. Returns its length, 0 if
+ * nothing is waiting, or -1 for a dropped (bad or oversized) frame. */
+int32_t aero_e1000_recv(int32_t nic, void *frame, uint32_t max);
+
+/* Returns 1 if the link is up and reports the current speed. */
+int32_t aero_e1000_link(int32_t nic, uint32_t *speed_mbps);
+
 #ifdef __cplusplus
 }
 #endif
