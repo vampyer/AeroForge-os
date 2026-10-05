@@ -88,7 +88,7 @@ fn find_pads(ctrl: i32, location: &str) {
         crate::kok!("{}gamepad \"{}\" on {} ({})", kind, name, place, layout.summary());
         bt::GAMEPADS.lock().push(bt::Gamepad { adapter: usize::MAX, address: [0; 6], name, connected: true,
             layout: layout.summary(), axes: layout.axis_mask(), reports: 0, pad: hid::Pad::default(),
-            usb: Some(place.clone()) });
+            usb: Some(place.clone()), xinput: d.iface_class == 0xFF });
         PADS.lock().push(Pad { ctrl, index, location: place, layout });
     }
 }

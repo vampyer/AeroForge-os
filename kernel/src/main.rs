@@ -15,6 +15,7 @@ mod dhi;
 mod elf;
 mod fat;
 mod fb;
+mod gamepad;
 mod gdt;
 mod kstack;
 mod interrupts;
