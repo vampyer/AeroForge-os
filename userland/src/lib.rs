@@ -23,6 +23,8 @@ pub mod sys {
     pub const HANDLE_CLOSE: u64 = 13;
     pub const HANDLE_DUP: u64 = 14;
     pub const FILE_READ: u64 = 15;
+    pub const AUDIO_WRITE: u64 = 16;
+    pub const AUDIO_QUEUED: u64 = 17;
 }
 
 pub mod rights {
@@ -83,6 +85,46 @@ pub fn read_file(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
         syscall(sys::FILE_READ, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
     })
     .map(|n| n as usize)
+}
+
+/// Sound: 48 kHz, 16-bit, stereo. Each program gets its own stream; the
+/// kernel mixes them into the selected output.
+pub mod audio {
+    use super::*;
+
+    pub const RATE: u32 = 48_000;
+
+    /// Queues interleaved left/right samples; returns how many frames (pairs)
+    /// were taken. Never blocks: when it returns fewer, wait a little and
+    /// write the rest. Err if there is no sound output.
+    pub fn write(interleaved: &[i16]) -> Result<usize, i64> {
+        check(unsafe { syscall(sys::AUDIO_WRITE, interleaved.as_ptr() as u64, (interleaved.len() / 2) as u64, 0, 0) })
+            .map(|n| n as usize)
+    }
+
+    /// Writes all of `interleaved`, waiting while the queue is full.
+    pub fn write_all(mut interleaved: &[i16]) -> Result<(), i64> {
+        while interleaved.len() >= 2 {
+            let n = write(interleaved)?;
+            interleaved = &interleaved[2 * n..];
+            if !interleaved.is_empty() {
+                sleep_ms(10);
+            }
+        }
+        Ok(())
+    }
+
+    /// Frames still waiting to be heard.
+    pub fn queued() -> Result<usize, i64> {
+        check(unsafe { syscall(sys::AUDIO_QUEUED, 0, 0, 0, 0) }).map(|n| n as usize)
+    }
+
+    /// Waits until everything written has been played.
+    pub fn drain() {
+        while queued().is_ok_and(|n| n > 0) {
+            sleep_ms(10);
+        }
+    }
 }
 
 /// A handle to a kernel object, closed when dropped.

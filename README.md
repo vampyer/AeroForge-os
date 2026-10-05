@@ -96,9 +96,17 @@ stream with a cyclic buffer. `sound` lists controllers, codecs and outputs (jack
 whether something is plugged in), `sound use <card>.<output>` picks one (by default a jack
 with something plugged in), and `sound test [hz] [seconds]` plays a tone. HDMI/DisplayPort
 outputs of a Radeon card are found but stay silent until the display driver (Phase 7) turns on
-the audio of the connected screen. Programs cannot play sound yet (an audio service comes
-next), and there is no recording from the board's inputs yet. The boot test plays a tone on
-QEMU's emulated HDA card and measures it in the WAV file QEMU records.
+the audio of the connected screen. There is no recording from the board's inputs yet. The
+boot test plays a tone on QEMU's emulated HDA card and measures it in the WAV file QEMU records.
+
+Since 0.12 programs can play sound. Two system calls, `audio_write` (48 kHz 16-bit stereo
+frames, up to 0.1 s per call) and `audio_queued`, give every process its own stream of up to a
+quarter of a second; libaero wraps them as `audio::write_all` and `audio::drain`. A kernel
+`mixer` thread sums all streams (with clipping), keeps about 100 ms queued on the card, starts
+the output when something plays and stops it after half a second of silence, and follows
+`sound use`. The `sound test` tone goes through the same mixer, so it plays alongside programs.
+`run melody` plays a C major arpeggio, and the boot test checks its four notes in QEMU's WAV
+output.
 
 | Area | Status |
 |---|---|
@@ -116,14 +124,15 @@ QEMU's emulated HDA card and measures it in the WAV file QEMU records.
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
-| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
+| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone on the emulated HD Audio card (measured in QEMU's WAV output), the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
 `exit`, `write`, `yield`, `getpid`, `sleep_ms`, `cpu_id`, `uptime_ms`, `spawn`, `port_create`,
-`port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`, `file_read`.
+`port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`, `file_read`,
+`audio_write`, `audio_queued`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1
@@ -159,7 +168,7 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
                           L2CAP (l2cap.rs), SDP client and server (sdp.rs), HID
                           gamepads (hid.rs), RFCOMM (rfcomm.rs), hands-free audio
                           gateway (hfp.rs)
-  src/sound.rs            sound cards (HD Audio): outputs, test tones
+  src/sound.rs            sound cards (HD Audio): outputs, mixer, test tones
   src/modules.rs          boot modules: user programs and firmware
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
@@ -169,6 +178,7 @@ userland/                 user programs and libaero (Rust, no_std)
   src/lib.rs              system call wrappers, println!, handles
   src/bin/aerosmss.rs     session manager, first process
   src/bin/{echod,client,crasher}.rs   IPC demo service and clients, fault demo
+  src/bin/melody.rs       plays four notes through the audio system calls
 drivers/include/dhi.h     the DHI contract (C ABI)
 drivers/ps2kbd/           PS/2 keyboard driver (C++)
 drivers/nvme/             NVMe driver (C++)

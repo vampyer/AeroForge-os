@@ -1,15 +1,18 @@
 //! Sound: finds the High Definition Audio controllers (the motherboard's
 //! audio chip, and the audio function of graphics cards for HDMI and
 //! DisplayPort), lists their outputs through the C++ HDA driver, and plays
-//! 48 kHz 16-bit stereo on the chosen one. For now the shell is the only
-//! user (`sound test`); an audio service for programs comes later.
+//! 48 kHz 16-bit stereo on the chosen one. Programs (through system calls)
+//! and the shell's test tone each queue sound in their own stream; a mixer
+//! thread adds the streams together and feeds the sound card.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dhi::{self, HdaInfo, HdaOutput};
 use crate::sync::IrqMutex;
-use crate::{console, pci, sched};
+use crate::{apic, console, pci, sched};
 
 pub const RATE: u32 = 48_000;
 
@@ -30,8 +33,6 @@ impl Card {
 pub static CARDS: IrqMutex<Vec<Card>> = IrqMutex::new(Vec::new());
 /// The output sound goes to: (card, output index).
 static SELECTED: IrqMutex<Option<(usize, usize)>> = IrqMutex::new(None);
-/// Held while something plays, so two players do not share the stream.
-static PLAYING: IrqMutex<bool> = IrqMutex::new(false);
 
 /// Brings up every HDA controller. Returns how many came up.
 pub fn probe() -> usize {
@@ -171,78 +172,156 @@ fn sin(x: f64) -> f64 {
 /// quarter of full scale, with short fades so it does not click. Waits until
 /// it has been played.
 pub fn tone(hz: u32, ms: u32) -> Result<String, String> {
+    let name = output_label().ok_or_else(|| String::from("no audio output"))?;
     let frames = (RATE as u64 * ms as u64 / 1000) as usize;
     let fade = (RATE / 200) as usize; // 5 ms
     let step = 2.0 * core::f64::consts::PI * hz as f64 / RATE as f64;
-    let mut phase = 0.0f64;
+    let mut buf = Vec::with_capacity(2 * 1024);
     let mut done = 0usize;
-    play(|buf| {
-        let mut n = 0;
-        for f in buf.chunks_exact_mut(2) {
-            if done == frames {
-                break;
-            }
-            let ramp = (done.min(frames - 1 - done) as f64 / fade as f64).min(1.0);
-            let v = (8000.0 * ramp * sin(phase)) as i16;
-            phase += step;
-            f[0] = v;
-            f[1] = v;
-            done += 1;
-            n += 1;
+    while done < frames {
+        buf.clear();
+        for k in done..(done + 1024).min(frames) {
+            let ramp = (k.min(frames - 1 - k) as f64 / fade as f64).min(1.0);
+            let v = (8000.0 * ramp * sin(step * k as f64)) as i16;
+            buf.extend_from_slice(&[v, v]);
         }
-        n
-    })
-}
-
-/// Runs a player: `fill` writes interleaved stereo frames into the slice it
-/// gets and returns how many it wrote (0 = finished).
-pub fn play(mut fill: impl FnMut(&mut [i16]) -> usize) -> Result<String, String> {
-    let Some((c, o)) = selected() else { return Err(String::from("no audio output")) };
-    let (id, name) = {
-        let cards = CARDS.lock();
-        let card = &cards[c];
-        (card.id, alloc::format!("{} {}", card.name, output_name(&card.outputs()[o])))
-    };
-    {
-        let mut playing = PLAYING.lock();
-        if *playing {
-            return Err(String::from("something is already playing"));
-        }
-        *playing = true;
-    }
-    let result = unsafe { dhi::aero_hda_start(id, o as i32) };
-    if result != 0 {
-        *PLAYING.lock() = false;
-        return Err(alloc::format!("could not start the output ({})", result));
-    }
-    let mut buf = [0i16; 2 * 1024];
-    let mut len = 0usize; // frames in buf not yet accepted
-    let mut total = 0u64;
-    loop {
-        if len == 0 {
-            len = fill(&mut buf);
-            if len == 0 {
-                break;
+        let mut at = 0;
+        while at < buf.len() {
+            let n = write(KERNEL, &buf[at..])?;
+            at += 2 * n;
+            if at < buf.len() {
+                sched::sleep_ticks(1);
             }
         }
-        let n = unsafe { dhi::aero_hda_write(id, buf.as_ptr(), len as u32) };
-        if n < 0 {
-            break;
-        }
-        let n = n as usize;
-        total += n as u64;
-        buf.copy_within(2 * n..2 * len, 0);
-        len -= n;
-        if len > 0 {
-            sched::sleep_ticks(1);
-        }
+        done += buf.len() / 2;
     }
-    // Let the rest play out, then a little silence before stopping.
-    while unsafe { dhi::aero_hda_pending(id) } > 0 {
+    while queued(KERNEL) > 0 {
         sched::sleep_ticks(1);
     }
-    sched::sleep_ticks(5);
-    unsafe { dhi::aero_hda_stop(id) };
-    *PLAYING.lock() = false;
-    Ok(alloc::format!("{} frames on {}", total, name))
+    Ok(alloc::format!("{} frames on {}", frames, name))
+}
+
+fn output_label() -> Option<String> {
+    let (c, o) = selected()?;
+    let cards = CARDS.lock();
+    let card = cards.get(c)?;
+    Some(alloc::format!("{} {}", card.name, output_name(card.outputs().get(o)?)))
+}
+
+// ------------------------------------------------------------- the mixer
+
+/// The owner id of sound the kernel itself plays (the shell's test tone).
+pub const KERNEL: u64 = 0;
+/// Each player may queue a quarter of a second.
+const STREAM_FRAMES: usize = (RATE / 4) as usize;
+/// The mixer keeps about 100 ms in the sound card's buffer.
+const CARD_TARGET: i32 = (RATE / 10) as i32;
+/// The output stops after half a second of silence.
+const IDLE_TICKS: u32 = 50;
+
+/// One player's queued frames (left, right).
+struct Stream {
+    owner: u64,
+    frames: VecDeque<(i16, i16)>,
+    last_write: u64,
+}
+
+static STREAMS: IrqMutex<Vec<Stream>> = IrqMutex::new(Vec::new());
+static CARD_PENDING: AtomicU32 = AtomicU32::new(0);
+
+/// Queues interleaved 48 kHz stereo frames for `owner` (a process id, or
+/// KERNEL); returns how many frames fit. Never blocks.
+pub fn write(owner: u64, interleaved: &[i16]) -> Result<usize, String> {
+    if selected().is_none() {
+        return Err(String::from("no audio output"));
+    }
+    let mut streams = STREAMS.lock();
+    let i = match streams.iter().position(|s| s.owner == owner) {
+        Some(i) => i,
+        None => {
+            streams.push(Stream { owner, frames: VecDeque::new(), last_write: 0 });
+            streams.len() - 1
+        }
+    };
+    let s = &mut streams[i];
+    let n = (STREAM_FRAMES - s.frames.len()).min(interleaved.len() / 2);
+    s.frames.extend(interleaved[..2 * n].chunks_exact(2).map(|f| (f[0], f[1])));
+    s.last_write = sched::ticks();
+    Ok(n)
+}
+
+/// Frames `owner` has queued that have not been played yet (including
+/// what the mixer already handed to the sound card).
+pub fn queued(owner: u64) -> usize {
+    let mine = STREAMS.lock().iter().find(|s| s.owner == owner).map_or(0, |s| s.frames.len());
+    mine + CARD_PENDING.load(Ordering::Relaxed) as usize
+}
+
+/// Kernel thread: mixes every player's queued sound into the selected
+/// output, starting the output when there is something to play and
+/// stopping it after a little silence.
+pub fn mixer_thread(_: u64) {
+    let mut running: Option<(i32, usize, usize)> = None; // (driver id, card, output)
+    let mut idle = 0u32;
+    let mut mix = Vec::with_capacity(2 * CARD_TARGET as usize);
+    loop {
+        let have = STREAMS.lock().iter().any(|s| !s.frames.is_empty());
+        let want = selected();
+        if let Some((id, c, o)) = running {
+            if want != Some((c, o)) {
+                unsafe { dhi::aero_hda_stop(id) };
+                running = None;
+            }
+        }
+        if running.is_none() && have {
+            if let Some((c, o)) = want {
+                let id = CARDS.lock().get(c).map(|card| card.id);
+                if let Some(id) = id {
+                    let rc = unsafe { dhi::aero_hda_start(id, o as i32) };
+                    if rc == 0 {
+                        running = Some((id, c, o));
+                        idle = 0;
+                    } else {
+                        console::print_colored(console::YELLOW, format_args!("[WARN] sound: could not start the output ({})\n", rc));
+                        STREAMS.lock().clear();
+                    }
+                }
+            }
+        }
+        if let Some((id, _, _)) = running {
+            let pending = unsafe { dhi::aero_hda_pending(id) }.max(0);
+            let room = (CARD_TARGET - pending).max(0) as usize;
+            mix.clear();
+            {
+                let mut streams = STREAMS.lock();
+                let n = streams.iter().map(|s| s.frames.len()).max().unwrap_or(0).min(room);
+                mix.resize(2 * n, 0i32);
+                for s in streams.iter_mut() {
+                    for k in 0..n.min(s.frames.len()) {
+                        let (l, r) = s.frames.pop_front().unwrap_or((0, 0));
+                        mix[2 * k] += l as i32;
+                        mix[2 * k + 1] += r as i32;
+                    }
+                }
+            }
+            if !mix.is_empty() {
+                let out: Vec<i16> = mix.iter().map(|&v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16).collect();
+                unsafe { dhi::aero_hda_write(id, out.as_ptr(), (out.len() / 2) as u32) };
+                idle = 0;
+            } else if pending == 0 {
+                idle += 1;
+                if idle > IDLE_TICKS {
+                    unsafe { dhi::aero_hda_stop(id) };
+                    running = None;
+                }
+            }
+            CARD_PENDING.store(unsafe { dhi::aero_hda_pending(id) }.max(0) as u32, Ordering::Relaxed);
+        } else {
+            CARD_PENDING.store(0, Ordering::Relaxed);
+        }
+        // Forget players that have gone quiet.
+        let now = sched::ticks();
+        STREAMS.lock().retain(|s| !s.frames.is_empty() || now - s.last_write < 2 * apic::TIMER_HZ);
+        sched::sleep_ticks(1);
+    }
 }
