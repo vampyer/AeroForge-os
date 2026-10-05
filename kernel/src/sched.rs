@@ -2,9 +2,12 @@
 //!
 //! - Each CPU has its own ready queue, sleep list and idle thread; the LAPIC
 //!   timer preempts the running thread every tick (round robin).
-//! - A thread is pinned to the CPU it was created on. That keeps the
-//!   switch path simple (a thread's saved context is only ever resumed by the
-//!   CPU that saved it); load balancing by migration comes later.
+//! - User threads move between CPUs: a CPU about to go idle takes a waiting
+//!   user thread from the busiest other CPU's ready queue (work stealing).
+//!   A thread is only taken once the CPU that last ran it has finished
+//!   saving its context (`on_cpu` is cleared inside `switch_context`).
+//!   Kernel threads stay on the CPU they were created on, since some of them
+//!   (the USB and network threads) aim their device's interrupts at it.
 //! - Every lock the scheduler touches is an `IrqMutex`, so code holding one
 //!   can never be preempted into a deadlock.
 
@@ -51,7 +54,13 @@ pub struct Thread {
     pub tid: u64,
     pub name: String,
     pub process: Option<Arc<Process>>,
-    pub cpu: usize,
+    /// The CPU whose run queue owns the thread; changes when it migrates.
+    cpu: AtomicUsize,
+    /// Set while a CPU runs the thread, until `switch_context` has saved
+    /// its registers; another CPU must not resume it before that.
+    on_cpu: AtomicBool,
+    /// May another CPU take it? User threads only.
+    migratable: bool,
     state: AtomicU8,
     idle: bool,
     kstack: KernelStack,
@@ -90,6 +99,10 @@ impl Thread {
         self.state.store(s as u8, Ordering::SeqCst);
     }
 
+    pub fn cpu(&self) -> usize {
+        self.cpu.load(Ordering::SeqCst)
+    }
+
     fn kstack_top(&self) -> u64 {
         self.kstack.top() & !0xF
     }
@@ -123,6 +136,8 @@ pub static THREADS: IrqMutex<BTreeMap<u64, Arc<Thread>>> = IrqMutex::new(BTreeMa
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CPU: AtomicUsize = AtomicUsize::new(0);
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Threads moved to another CPU by work stealing.
+pub static MIGRATIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
@@ -131,7 +146,9 @@ pub fn ticks() -> u64 {
 global_asm!(
     r#"
 .section .text
-// switch_context(save_rsp_to: *mut u64, load_rsp: u64)
+// switch_context(save_rsp_to: *mut u64, load_rsp: u64, prev_on_cpu: *mut u8)
+// Clearing prev_on_cpu after the save tells other CPUs the outgoing thread
+// may now be resumed elsewhere (x86 keeps the two stores in order).
 .global switch_context
 switch_context:
     push rbp
@@ -141,6 +158,7 @@ switch_context:
     push r14
     push r15
     mov [rdi], rsp
+    mov byte ptr [rdx], 0
     mov rsp, rsi
     pop r15
     pop r14
@@ -160,7 +178,7 @@ kthread_trampoline:
 );
 
 extern "C" {
-    fn switch_context(save_rsp_to: *mut u64, load_rsp: u64);
+    fn switch_context(save_rsp_to: *mut u64, load_rsp: u64, prev_on_cpu: *mut u8);
     fn kthread_trampoline();
     fn isr_exit();
 }
@@ -181,7 +199,9 @@ pub fn init_cpu() {
         tid: NEXT_TID.fetch_add(1, Ordering::SeqCst),
         name: alloc::format!("idle/{}", cpu.index),
         process: None,
-        cpu: cpu.index,
+        cpu: AtomicUsize::new(cpu.index),
+        on_cpu: AtomicBool::new(true),
+        migratable: false,
         state: AtomicU8::new(State::Running as u8),
         idle: true,
         kstack: KernelStack::empty(),
@@ -207,8 +227,10 @@ fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread
     Thread {
         tid: NEXT_TID.fetch_add(1, Ordering::SeqCst),
         name,
+        migratable: process.is_some(),
         process,
-        cpu,
+        cpu: AtomicUsize::new(cpu),
+        on_cpu: AtomicBool::new(false),
         state: AtomicU8::new(State::Ready as u8),
         idle: false,
         kstack: KernelStack::new(KSTACK_SIZE as u64).expect("out of memory for a kernel stack"),
@@ -224,7 +246,7 @@ fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread
 fn enqueue_new(t: Thread) -> Arc<Thread> {
     let t = Arc::new(t);
     THREADS.lock().insert(t.tid, t.clone());
-    let cpu = percpu::get(t.cpu).expect("thread placed on an offline CPU");
+    let cpu = percpu::get(t.cpu()).expect("thread placed on an offline CPU");
     cpu.rq.lock().ready.push_back(t.clone());
     t
 }
@@ -279,7 +301,14 @@ pub fn current() -> Arc<Thread> {
 pub fn schedule() {
     debug_assert!(!arch::interrupts_enabled());
     let cpu = percpu::this();
-    let (save_to, load) = {
+    let would_idle = {
+        let rq = cpu.rq.lock();
+        rq.ready.is_empty() && rq.current.as_ref().is_none_or(|c| c.idle || c.state() != State::Running)
+    };
+    if would_idle {
+        steal(cpu);
+    }
+    let (save_to, load, prev_on_cpu) = {
         let mut rq = cpu.rq.lock();
         let now = ticks();
         let mut i = 0;
@@ -303,6 +332,7 @@ pub fn schedule() {
             None => rq.idle.clone().unwrap(),
         };
         next.set_state(State::Running);
+        next.on_cpu.store(true, Ordering::SeqCst);
         if Arc::ptr_eq(&prev, &next) {
             rq.current = Some(next);
             return;
@@ -331,10 +361,42 @@ pub fn schedule() {
         }
         let save_to = prev.saved_rsp.get();
         let load = unsafe { *next.saved_rsp.get() };
+        let prev_on_cpu = prev.on_cpu.as_ptr() as *mut u8;
         rq.current = Some(next);
-        (save_to, load)
+        (save_to, load, prev_on_cpu)
     };
-    unsafe { switch_context(save_to, load) };
+    unsafe { switch_context(save_to, load, prev_on_cpu) };
+}
+
+/// Moves one waiting user thread from the CPU with the longest ready queue
+/// to `me`, which has nothing to run. Only one run queue lock is held at a
+/// time, so two CPUs stealing from each other cannot deadlock.
+fn steal(me: &percpu::PerCpu) {
+    let mut victim = None;
+    let mut longest = 0;
+    for i in 0..percpu::count() {
+        if i == me.index {
+            continue;
+        }
+        let Some(c) = percpu::get(i) else { continue };
+        let n = c.rq.lock().ready.len();
+        if n > longest {
+            longest = n;
+            victim = Some(c);
+        }
+    }
+    let Some(victim) = victim else { return };
+    let taken = {
+        let mut rq = victim.rq.lock();
+        // The most recently queued thread has the least cache to lose.
+        let pos = rq.ready.iter().rposition(|t| t.migratable && !t.on_cpu.load(Ordering::SeqCst));
+        pos.and_then(|i| rq.ready.remove(i))
+    };
+    if let Some(t) = taken {
+        t.cpu.store(me.index, Ordering::SeqCst);
+        MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+        me.rq.lock().ready.push_back(t);
+    }
 }
 
 /// Called from the timer interrupt on every CPU.
@@ -383,7 +445,7 @@ fn sleep_ticks_unless(n: u64, flag: &AtomicBool) {
 
 /// Ends a thread's sleep early (it runs as soon as its CPU gets to it).
 pub fn wake_sleeper(t: &Arc<Thread>) {
-    let Some(cpu) = percpu::get(t.cpu) else { return };
+    let Some(cpu) = percpu::get(t.cpu()) else { return };
     let woke = {
         let mut rq = cpu.rq.lock();
         if t.state() == State::Sleeping {
@@ -452,7 +514,7 @@ pub fn mark_current_blocked() -> Arc<Thread> {
 /// another one, a reschedule IPI makes it pick the thread up now rather than
 /// at its next timer tick.
 pub fn wake(t: &Arc<Thread>) {
-    let cpu = percpu::get(t.cpu).unwrap();
+    let cpu = percpu::get(t.cpu()).unwrap();
     let woke = {
         let mut rq = cpu.rq.lock();
         if t.state() == State::Blocked {
@@ -539,8 +601,8 @@ pub fn kill_threads_of(pid: u64) {
     for t in victims {
         t.wake_at.store(0, Ordering::Relaxed);
         wake(&t);
-        if t.cpu != percpu::this().index {
-            if let Some(cpu) = percpu::get(t.cpu) {
+        if t.cpu() != percpu::this().index {
+            if let Some(cpu) = percpu::get(t.cpu()) {
                 crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
             }
         }
