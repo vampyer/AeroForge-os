@@ -107,7 +107,7 @@ impl Shell {
                 for t in threads.values() {
                     let handles = t.process.as_ref().map_or(0, |p| p.handles.lock().count());
                     kprintln!("  {:>4} {:>4} {:>4}  {:<9} {:>7}  {}{}",
-                        t.tid, t.pid(), t.cpu, t.state().name(), t.runtime_ticks.load(Ordering::Relaxed), t.name,
+                        t.tid, t.pid(), t.cpu(), t.state().name(), t.runtime_ticks.load(Ordering::Relaxed), t.name,
                         if t.process.is_some() { alloc::format!("  ({} handles)", handles) } else { String::new() });
                 }
                 kprintln!("  {} process(es)", process::PROCESSES.lock().len());
@@ -120,6 +120,7 @@ impl Shell {
                             i, s.ready, s.switches, ticks, s.current);
                     }
                 }
+                kprintln!("  {} thread migrations between CPUs", sched::MIGRATIONS.load(Ordering::Relaxed));
             }
             "run" => match process::spawn(arg, 0) {
                 Ok(pid) => kprintln!("  started {} as pid {}", arg, pid),
