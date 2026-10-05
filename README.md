@@ -23,7 +23,9 @@ FAT32 volume is mounted at `/<device>`, for example `/sata0p1`.
 Since 0.5 USB works through the C++ **xHCI** driver: it resets the controller, enumerates
 every device on the root ports (USB 2 and USB 3 SuperSpeed), reads its descriptors and drives
 HID boot-protocol keyboards and mice. USB keys go to the shell like PS/2 keys; `lsusb` lists
-the devices and `mouse` shows the pointer position.
+the devices and `mouse` shows the pointer position. Devices behind USB hubs are found too, through
+nested hubs (tested with QEMU's USB 1.1 hub; the USB 2 and USB 3 hub paths are written but
+need real hardware to test).
 
 | Area | Status |
 |---|---|
@@ -37,12 +39,12 @@ the devices and `mouse` shows the pointer position.
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
-| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration, HID boot keyboard and mouse, polled from a kernel thread) |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, polled from a kernel thread) |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and checks every CPU, both mounts, the USB keyboard and mouse, the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and checks every CPU, both mounts, the USB keyboard and mouse behind a hub, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -56,7 +58,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; AHCI interrupts, NCQ and writes; xHCI hubs, USB mass storage, MSI-X interrupts and hotplug.
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; AHCI interrupts, NCQ and writes; USB mass storage, xHCI MSI-X interrupts and hotplug.
 6. Filesystems move to user-space servers behind IPC, as the design says; FAT32 writes, exFAT and NTFS (read-only on real drives at first).
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and TLB shootdowns so permission changes reach every CPU at once.
 
@@ -125,6 +127,6 @@ the QEMU window through WSLg. OVMF paths can be overridden with
 
 The ISO also boots on real UEFI PCs from a USB stick (write it with Rufus in DD mode or
 `dd`), with CSM/legacy boot off and Secure Boot off. USB keyboards work through the xHCI
-driver when plugged straight into a port on the PC; keyboards behind a USB hub (including
-hubs built into monitors) need hub support, which comes next. Booting and the IPC demo
+driver, also behind USB hubs (including hubs built into monitors). Devices plugged in after
+boot are not picked up yet. Booting and the IPC demo
 don't need a keyboard.
