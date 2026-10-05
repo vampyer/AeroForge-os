@@ -242,6 +242,55 @@ int32_t aero_btmtk_chip(const dhi_ops *ops, int32_t bt, dhi_btmtk_chip *out);
 int32_t aero_btmtk_setup(const dhi_ops *ops, int32_t bt, const void *firmware, uint32_t size,
                          dhi_btmtk_result *out);
 
+/* ---- Intel High Definition Audio driver (drivers/hda) ---- */
+
+#define DHI_HDA_MAX_OUTPUTS 8
+#define DHI_HDA_LINE_OUT   0u
+#define DHI_HDA_SPEAKER    1u
+#define DHI_HDA_HEADPHONES 2u
+#define DHI_HDA_SPDIF      3u
+#define DHI_HDA_HDMI       4u  /* HDMI or DisplayPort (graphics card audio) */
+
+/* One output jack (pin) with a path from a DAC. */
+typedef struct dhi_hda_output {
+    uint8_t codec;
+    uint8_t pin;
+    uint8_t dac;
+    uint8_t kind;      /* DHI_HDA_* */
+    uint8_t location;  /* configuration default bits 24-29 */
+    uint8_t color;     /* configuration default bits 12-15 */
+    uint8_t fixed;     /* built in (a laptop speaker) */
+    uint8_t plugged;   /* 1 = something plugged in, 0 = nothing, 2 = cannot tell */
+} dhi_hda_output;
+
+typedef struct dhi_hda_info {
+    uint32_t codec_ids[4];   /* vendor << 16 | device */
+    uint8_t  codec_count;
+    uint8_t  in_streams;
+    uint8_t  out_streams;
+    uint8_t  output_count;
+    dhi_hda_output outputs[DHI_HDA_MAX_OUTPUTS];
+} dhi_hda_info;
+
+/* Resets the controller whose registers are at `bar0_phys` (bus mastering
+ * already enabled), finds its codecs and their outputs. Returns a
+ * controller id >= 0, or a negative error. */
+int32_t aero_hda_init(const dhi_ops *ops, uint64_t bar0_phys, dhi_hda_info *out);
+
+/* Routes output `output` (an index into dhi_hda_info.outputs) to a 48 kHz
+ * 16-bit stereo stream and starts it, silent until written. 0 = ok. */
+int32_t aero_hda_start(int32_t ctrl, int32_t output);
+
+/* Queues interleaved left/right frames; returns how many fit (the buffer
+ * holds about a third of a second). Played sound is cleared behind the
+ * play position, so the stream goes silent when nothing more is written. */
+int32_t aero_hda_write(int32_t ctrl, const int16_t *frames, uint32_t count);
+
+/* Frames written but not played yet. */
+int32_t aero_hda_pending(int32_t ctrl);
+
+void aero_hda_stop(int32_t ctrl);
+
 #ifdef __cplusplus
 }
 #endif

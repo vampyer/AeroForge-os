@@ -87,6 +87,19 @@ itself. There is no sound output or audio API for programs yet: that comes with 
 The simulated headset pairs, holds a 440 Hz tone up to its microphone, switches off and on and
 reconnects, and the boot test records it before and after.
 
+Since 0.11 there is sound. A C++ Intel High Definition Audio driver (`drivers/hda`) resets each
+HDA controller (the motherboard's audio chip, and the audio function of graphics cards), talks
+to its codecs over the CORB/RIRB command rings, walks each codec's widget graph to find the
+output jacks and a path from a DAC to each (through mixers and selectors, unmuting amplifiers
+at 0 dB, turning on external amplifiers), and plays 48 kHz 16-bit stereo through one output
+stream with a cyclic buffer. `sound` lists controllers, codecs and outputs (jack, colour, and
+whether something is plugged in), `sound use <card>.<output>` picks one (by default a jack
+with something plugged in), and `sound test [hz] [seconds]` plays a tone. HDMI/DisplayPort
+outputs of a Radeon card are found but stay silent until the display driver (Phase 7) turns on
+the audio of the connected screen. Programs cannot play sound yet (an audio service comes
+next), and there is no recording from the board's inputs yet. The boot test plays a tone on
+QEMU's emulated HDA card and measures it in the WAV file QEMU records.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -99,13 +112,13 @@ reconnects, and the boot test records it before and after.
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
-| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) and an **HD Audio** driver (CORB/RIRB, codec widget graph, output routing, one 48 kHz stereo output stream) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
-| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, the security audit and self-test, the config read and the whole IPC demo |
+| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone on the emulated HD Audio card (measured in QEMU's WAV output), the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -146,6 +159,7 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
                           L2CAP (l2cap.rs), SDP client and server (sdp.rs), HID
                           gamepads (hid.rs), RFCOMM (rfcomm.rs), hands-free audio
                           gateway (hfp.rs)
+  src/sound.rs            sound cards (HD Audio): outputs, test tones
   src/modules.rs          boot modules: user programs and firmware
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
@@ -163,6 +177,7 @@ drivers/xhci/             xHCI (USB 3) driver (C++)
 drivers/e1000/            Intel Ethernet driver, e1000/e1000e (C++)
 drivers/igc/              Intel Ethernet driver, igb/igc: I210/I211, I225/I226 (C++)
 drivers/btmtk/            MediaTek Bluetooth firmware loader, MT7921/MT7922 (C++)
+drivers/hda/              Intel High Definition Audio driver (C++)
 tools/boot-test.sh        headless QEMU boot test
 tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/disk-files/
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
@@ -170,6 +185,7 @@ tools/make-usb-disk.sh    builds the USB stick image (MBR + FAT32) from tools/us
 tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
 tools/fakebt/             simulated USB Bluetooth adapter, gamepad and headset for QEMU (usbredir, C)
 tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)
+tools/wav-tone.py         measures the test tone in QEMU's recorded sound output (boot test)
 ```
 
 ## Building and running

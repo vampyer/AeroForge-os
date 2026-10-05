@@ -31,6 +31,7 @@ mod sched;
 mod security;
 mod serial;
 mod shell;
+mod sound;
 mod smp;
 mod sync;
 mod syscall;
@@ -222,6 +223,19 @@ extern "C" fn kmain() -> ! {
     }
     if nics > 0 {
         kok!("C++ Intel Ethernet drivers (e1000/e1000e, igb/igc) attached through DHI v{}: {} port(s)", dhi::ABI_VERSION, nics);
+    }
+    let cards = sound::probe();
+    for c in sound::CARDS.lock().iter() {
+        let codecs: alloc::vec::Vec<alloc::string::String> = c.info.codec_ids[..c.info.codec_count as usize].iter()
+            .map(|&id| sound::codec_name(id)).collect();
+        let outputs: alloc::vec::Vec<alloc::string::String> = c.outputs().iter().map(sound::output_name).collect();
+        console::print_colored(console::DIM, format_args!("       {}: {} {:04x}:{:04x} at {}, codecs: {}, outputs: {}\n",
+            c.name, sound::card_name(c.pci_id.0), c.pci_id.0, c.pci_id.1, c.location,
+            if codecs.is_empty() { alloc::string::String::from("none") } else { codecs.join(", ") },
+            if outputs.is_empty() { alloc::string::String::from("none") } else { outputs.join(", ") }));
+    }
+    if cards > 0 {
+        kok!("C++ HD Audio driver attached through DHI v{}: {} controller(s)", dhi::ABI_VERSION, cards);
     }
     let mounts = vfs::mount_all();
     for m in mounts {
