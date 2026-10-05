@@ -1,8 +1,10 @@
 // AeroForge NVMe driver (C++20, freestanding), behind the Driver Host Interface.
 //
-// Polling mode for now: one admin queue pair and one I/O queue pair per
-// controller, completions found by watching the phase bit. Interrupts
-// (MSI-X) and one queue pair per CPU come later.
+// One admin queue pair and one I/O queue pair per controller; completions
+// are found by watching the phase bit. When the kernel hands init an
+// interrupt source (MSI-X/MSI already pointed at it), a thread waiting for an
+// I/O command sleeps until the completion interrupt instead of spinning. One queue pair per CPU
+// comes later.
 
 #include "dhi.h"
 
@@ -24,6 +26,7 @@ constexpr uint8_t kOpWrite      = 0x01;
 constexpr uint8_t kOpRead       = 0x02;
 
 constexpr uint32_t kQueueDepth = 64;
+constexpr uint32_t kSpinUs = 20;  // poll this long before sleeping for the interrupt
 constexpr uint32_t kPageSize = 4096;
 constexpr int kMaxControllers = 4;
 
@@ -59,8 +62,10 @@ struct Queue {
 
 class Controller {
 public:
-    int32_t init(const dhi_ops* ops, uint64_t bar0, dhi_block_info* info) {
+    int32_t init(const dhi_ops* ops, uint64_t bar0, uint32_t irq_source, dhi_block_info* info) {
         ops_ = ops;
+        irq_ = irq_source != DHI_NO_IRQ;
+        irq_source_ = irq_source;
         regs_ = static_cast<volatile uint8_t*>(ops->map_mmio(bar0, 0x4000));
         if (regs_ == nullptr) return -1;
 
@@ -92,7 +97,7 @@ public:
         max_transfer_ = 2 * kPageSize;
         if (mdts_ != 0 && (kPageSize << mdts_) < max_transfer_) max_transfer_ = kPageSize << mdts_;
         info->max_transfer = max_transfer_;
-        ops_->log("nvme: controller ready, admin + 1 I/O queue pair (polling)");
+        ops_->log("nvme: controller ready, admin + 1 I/O queue pair");
         return 0;
     }
 
@@ -163,7 +168,7 @@ private:
         c.cdw0 = kOpCreateIoCq;
         c.prp1 = io_.cq.phys;
         c.cdw10 = ((kQueueDepth - 1) << 16) | io_.id;
-        c.cdw11 = 1;  // physically contiguous, interrupts off
+        c.cdw11 = irq_ ? (1u | (1u << 1)) : 1u;  // physically contiguous; interrupts on vector 0 if we have one
         if (submit(admin_, c, nullptr) != 0) return fail("create I/O completion queue failed");
         c = Command{};
         c.cdw0 = kOpCreateIoSq;
@@ -191,7 +196,8 @@ private:
         write32(doorbell(q.id, false), q.sq_tail);
 
         auto* cq = static_cast<volatile Completion*>(q.cq.virt);
-        for (uint32_t waited_us = 0;; ++waited_us) {
+        const uint32_t limit_us = 1000u * (timeout_ms_ ? timeout_ms_ : 1000);
+        for (uint32_t waited_us = 0;;) {
             const uint16_t status = cq[q.cq_head].status;
             if ((status & 1) == q.phase) {
                 if (result) *result = cq[q.cq_head].result;
@@ -200,8 +206,16 @@ private:
                 write32(doorbell(q.id, true), q.cq_head);
                 return (status >> 1) == 0 ? 0 : -(int32_t)(status >> 1);
             }
-            if (waited_us > 1000u * (timeout_ms_ ? timeout_ms_ : 1000)) return -100;
-            ops_->delay_us(1);
+            if (waited_us > limit_us) return -100;
+            if (irq_ && q.id != 0 && waited_us >= kSpinUs) {
+                // Fast drives finish within the spin; after it, sleep until the
+                // completion interrupt (each wait counts as its longest, 10 ms).
+                ops_->irq_wait(irq_source_);
+                waited_us += 10000;
+            } else {
+                ops_->delay_us(1);
+                ++waited_us;
+            }
         }
     }
 
@@ -255,6 +269,8 @@ private:
     uint32_t block_size_ = 512;
     uint32_t max_transfer_ = 0;
     Queue admin_{}, io_{};
+    bool irq_ = false;
+    uint32_t irq_source_ = 0;
 };
 
 constinit Controller g_controllers[kMaxControllers]{};
@@ -262,11 +278,11 @@ constinit int g_count = 0;
 
 }  // namespace
 
-extern "C" int32_t aero_nvme_init(const dhi_ops* ops, uint64_t bar0_phys, dhi_block_info* out) {
+extern "C" int32_t aero_nvme_init(const dhi_ops* ops, uint64_t bar0_phys, uint32_t irq_source, dhi_block_info* out) {
     if (ops == nullptr || out == nullptr || ops->abi_version != DHI_ABI_VERSION) return -1;
     if (g_count == kMaxControllers) return -2;
     *out = dhi_block_info{};
-    const int32_t rc = g_controllers[g_count].init(ops, bar0_phys, out);
+    const int32_t rc = g_controllers[g_count].init(ops, bar0_phys, irq_source, out);
     if (rc != 0) return rc;
     return g_count++;
 }

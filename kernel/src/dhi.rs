@@ -1,10 +1,11 @@
 //! Rust side of the Driver Host Interface. Must match drivers/include/dhi.h.
 
 use core::ffi::{c_char, CStr};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{apic, arch, memory};
+use crate::{apic, arch, memory, sched};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 #[repr(C)]
 pub struct DmaBuf {
@@ -24,6 +25,7 @@ pub struct DhiOps {
     pub dma_free: extern "C" fn(*const DmaBuf),
     pub map_mmio: extern "C" fn(u64, u64) -> *mut u8,
     pub delay_us: extern "C" fn(u32),
+    pub irq_wait: extern "C" fn(u32),
 }
 
 #[repr(C)]
@@ -159,7 +161,7 @@ pub struct HdaInfo {
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
-    pub fn aero_nvme_init(ops: *const DhiOps, bar0_phys: u64, out: *mut BlockInfo) -> i32;
+    pub fn aero_nvme_init(ops: *const DhiOps, bar0_phys: u64, irq_source: u32, out: *mut BlockInfo) -> i32;
     pub fn aero_nvme_read(ctrl: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_nvme_write(ctrl: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_nvme_flush(ctrl: i32) -> i32;
@@ -244,6 +246,35 @@ extern "C" fn dhi_delay_us(us: u32) {
     apic::delay_us(us as u64);
 }
 
+/// Interrupt sources drivers wait on through `irq_wait`; each one belongs to
+/// a device whose MSI-X/MSI handler signals it.
+pub const IRQ_SOURCES: usize = 8;
+static IRQ_EVENTS: [sched::Event; IRQ_SOURCES] = [const { sched::Event::new() }; IRQ_SOURCES];
+static IRQ_NEXT: AtomicUsize = AtomicUsize::new(0);
+const IRQ_HANDLERS: [fn(); IRQ_SOURCES] = [
+    || IRQ_EVENTS[0].signal(), || IRQ_EVENTS[1].signal(), || IRQ_EVENTS[2].signal(), || IRQ_EVENTS[3].signal(),
+    || IRQ_EVENTS[4].signal(), || IRQ_EVENTS[5].signal(), || IRQ_EVENTS[6].signal(), || IRQ_EVENTS[7].signal(),
+];
+
+/// `irq_source` value for a driver that polls.
+pub const NO_IRQ: u32 = u32::MAX;
+
+/// Reserves an interrupt source: its number for the driver and the handler
+/// to give `msi::attach`.
+pub fn irq_source() -> Option<(u32, fn())> {
+    let n = IRQ_NEXT.fetch_add(1, Ordering::SeqCst);
+    (n < IRQ_SOURCES).then(|| (n as u32, IRQ_HANDLERS[n]))
+}
+
+extern "C" fn dhi_irq_wait(source: u32) {
+    match IRQ_EVENTS.get(source as usize) {
+        Some(e) if sched::can_block() => {
+            e.wait(1);
+        }
+        _ => apic::delay_us(1),
+    }
+}
+
 /// Lives for the whole kernel lifetime, as the DHI contract requires.
 pub static OPS: DhiOps = DhiOps {
     abi_version: ABI_VERSION,
@@ -255,4 +286,5 @@ pub static OPS: DhiOps = DhiOps {
     dma_free: dhi_dma_free,
     map_mmio: dhi_map_mmio,
     delay_us: dhi_delay_us,
+    irq_wait: dhi_irq_wait,
 };

@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define DHI_ABI_VERSION 2u
+#define DHI_ABI_VERSION 3u
 
 /* A physically contiguous, kernel-owned buffer a device can DMA into. */
 typedef struct dhi_dma {
@@ -40,6 +40,11 @@ typedef struct dhi_ops {
     void    (*dma_free)(const dhi_dma *buf);
     volatile void *(*map_mmio)(uint64_t phys, uint64_t size); /* uncached */
     void    (*delay_us)(uint32_t us);
+    /* ABI 3: waits for interrupt `source` (handed to the driver by the kernel)
+     * to fire, for at most about 10 ms; returns at once if it already fired
+     * since the last wait. Where the caller cannot sleep (early boot) it just
+     * pauses briefly. Drivers re-check their hardware after it returns. */
+    void    (*irq_wait)(uint32_t source);
 } dhi_ops;
 
 /* Key event produced by input drivers. */
@@ -76,9 +81,17 @@ typedef struct dhi_block_info {
     uint8_t  _pad;
 } dhi_block_info;
 
+/* No interrupt source: the driver polls. */
+#define DHI_NO_IRQ 0xFFFFFFFFu
+
 /* Brings up the controller at `bar0_phys` (bus mastering already enabled)
- * and its first namespace. Returns a controller id >= 0, or a negative error. */
-int32_t aero_nvme_init(const dhi_ops *ops, uint64_t bar0_phys, dhi_block_info *out);
+ * and its first namespace. Returns a controller id >= 0, or a negative error.
+ * `irq_source` is DHI_NO_IRQ, or the interrupt source (see dhi_ops.irq_wait)
+ * the kernel has already pointed the controller's MSI-X/MSI vector 0 at; it
+ * must be set up before this call, because the I/O completion queue is
+ * created with interrupts on and controllers may only honour vectors that
+ * were enabled when a queue was created. */
+int32_t aero_nvme_init(const dhi_ops *ops, uint64_t bar0_phys, uint32_t irq_source, dhi_block_info *out);
 
 /* Reads `count` blocks starting at `lba` into the DMA buffer at `buf_phys`.
  * count * block_size must not exceed max_transfer. 0 = ok. */

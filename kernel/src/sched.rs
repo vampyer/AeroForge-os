@@ -429,6 +429,16 @@ impl Event {
     }
 }
 
+/// Can the calling code sleep? Not before the scheduler runs on this CPU,
+/// and not on an idle thread (the boot code is one).
+pub fn can_block() -> bool {
+    if percpu::count() == 0 {
+        return false;
+    }
+    let rq = percpu::this().rq.lock();
+    rq.current.as_ref().is_some_and(|t| !t.idle)
+}
+
 /// Marks the current thread blocked. The caller must have put it on some wait
 /// list (holding that list's lock) and must call `schedule` next, with
 /// interrupts still disabled.
