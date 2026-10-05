@@ -202,6 +202,8 @@ extern "C" {
     pub fn aero_igc_send(nic: i32, frame: *const u8, len: u32) -> i32;
     pub fn aero_igc_recv(nic: i32, frame: *mut u8, max: u32) -> i32;
     pub fn aero_igc_link(nic: i32, speed_mbps: *mut u32) -> i32;
+    pub fn aero_igc_enable_irq(nic: i32);
+    pub fn aero_igc_ack_irq(nic: i32) -> u32;
 }
 
 extern "C" fn dhi_log(msg: *const c_char) {

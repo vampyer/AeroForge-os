@@ -280,6 +280,13 @@ int32_t aero_igc_send(int32_t nic, const void *frame, uint32_t len);
 int32_t aero_igc_recv(int32_t nic, void *frame, uint32_t max);
 int32_t aero_igc_link(int32_t nic, uint32_t *speed_mbps);
 
+/* Interrupts: the kernel points the card's MSI-X/MSI vector 0 at its network
+ * thread, then calls aero_igc_enable_irq. The thread calls aero_igc_ack_irq
+ * (returns and clears the causes) each time before it drains the receive
+ * ring, so a frame arriving later interrupts again. */
+void aero_igc_enable_irq(int32_t nic);
+uint32_t aero_igc_ack_irq(int32_t nic);
+
 /* ---- MediaTek Bluetooth set-up (drivers/btmtk) ----
  * MT7921 and MT7922 adapters boot with a ROM only: the firmware patch has to
  * be downloaded before ordinary HCI commands work. */
