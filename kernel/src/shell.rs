@@ -71,6 +71,7 @@ impl Shell {
                 kprintln!("  run <prog>  start a user program ({})", program_list());
                 kprintln!("  ports       published IPC ports");
                 kprintln!("  lspci       PCIe devices");
+                kprintln!("  display     the screen: size, how it is driven, who has it");
                 kprintln!("  lsusb       USB controllers and devices");
                 kprintln!("  mouse       USB mouse pointer position and buttons");
                 kprintln!("  ifconfig    network cards, link and address");
@@ -128,6 +129,16 @@ impl Shell {
                     sched::IDLE_NUDGES.load(Ordering::Relaxed)
                 );
             }
+            "display" => match crate::display::info() {
+                Some(d) => {
+                    kprintln!("  {}x{} through the {}", d.width, d.height, d.kind);
+                    match d.owner {
+                        Some(pid) => kprintln!("  pid {} has the whole screen", pid),
+                        None => kprintln!("  showing the console"),
+                    }
+                }
+                None => kprintln!("  no display (serial console only)"),
+            },
             "wakeups" => {
                 // This shell sleeps meanwhile, so its CPU can go idle too.
                 let count = || -> alloc::vec::Vec<u64> {

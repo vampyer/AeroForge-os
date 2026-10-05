@@ -255,6 +255,7 @@ pub fn on_exit(p: &Arc<Process>) {
     }
     PROCESSES.lock().remove(&p.pid);
     futex::forget_process(p.pid);
+    crate::display::release(p.pid);
     p.exit.code.store(code, Ordering::SeqCst);
     p.exit.exited.store(true, Ordering::SeqCst);
     crate::wait::notify();

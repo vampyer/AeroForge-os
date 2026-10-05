@@ -59,6 +59,9 @@ pub mod sys {
     pub const WAIT_ANY: u64 = 44;
     pub const PROCESS_HANDLE: u64 = 45;
     pub const PROCESS_KILL: u64 = 46;
+    pub const DISPLAY_ACQUIRE: u64 = 47;
+    pub const DISPLAY_PRESENT: u64 = 48;
+    pub const DISPLAY_RELEASE: u64 = 49;
 }
 
 pub mod rights {
@@ -200,6 +203,48 @@ pub mod audio {
     pub fn drain() {
         while queued().is_ok_and(|n| n > 0) {
             sleep_ms(10);
+        }
+    }
+}
+
+/// The whole screen for one program at a time. Draw 0x00RRGGBB pixels into
+/// your own image and present the parts that changed; the console comes
+/// back when the program releases the screen or exits.
+pub mod display {
+    use super::*;
+
+    /// The screen, while this program owns it.
+    pub struct Screen {
+        pub width: usize,
+        pub height: usize,
+    }
+
+    /// Takes the screen. Err if another program has it or there is none.
+    pub fn acquire() -> Result<Screen, i64> {
+        check(unsafe { syscall(sys::DISPLAY_ACQUIRE, 0, 0, 0, 0) })
+            .map(|v| Screen { width: (v >> 32) as usize, height: (v & 0xFFFF_FFFF) as usize })
+    }
+
+    impl Screen {
+        /// Shows rectangle (x, y, w, h) of `image`, whose rows are `stride`
+        /// pixels long and which covers the screen from the top-left.
+        pub fn present(&self, image: &[u32], stride: usize, x: usize, y: usize, w: usize, h: usize) -> Result<(), i64> {
+            if stride == 0 || image.len() < stride * (y + h).min(self.height) {
+                return Err(E_INVAL);
+            }
+            let rect = x as u64 | (y as u64) << 16 | (w as u64) << 32 | (h as u64) << 48;
+            check(unsafe { syscall(sys::DISPLAY_PRESENT, image.as_ptr() as u64, stride as u64, rect, 0) }).map(|_| ())
+        }
+
+        /// Shows the whole of `image` (rows of `width` pixels).
+        pub fn present_all(&self, image: &[u32]) -> Result<(), i64> {
+            self.present(image, self.width, 0, 0, self.width, self.height)
+        }
+    }
+
+    impl Drop for Screen {
+        fn drop(&mut self) {
+            unsafe { syscall(sys::DISPLAY_RELEASE, 0, 0, 0, 0) };
         }
     }
 }

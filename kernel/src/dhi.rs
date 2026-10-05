@@ -158,6 +158,18 @@ pub struct HdaInfo {
     pub outputs: [HdaOutput; 8],
 }
 
+/// Register regions of a virtio 1.x PCI device (physical addresses).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct VirtioPci {
+    pub common: u64,
+    pub notify: u64,
+    pub isr: u64,
+    pub device: u64,
+    pub notify_mult: u32,
+    pub _pad: u32,
+}
+
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
@@ -204,6 +216,11 @@ extern "C" {
     pub fn aero_igc_link(nic: i32, speed_mbps: *mut u32) -> i32;
     pub fn aero_igc_enable_irq(nic: i32);
     pub fn aero_igc_ack_irq(nic: i32) -> u32;
+    pub fn aero_vgpu_init(ops: *const DhiOps, pci: *const VirtioPci, width: *mut u32, height: *mut u32) -> i32;
+    pub fn aero_vgpu_create(id: u32, width: u32, height: u32, pages: *const u64, count: u32) -> i32;
+    pub fn aero_vgpu_destroy(id: u32) -> i32;
+    pub fn aero_vgpu_scanout(id: u32, width: u32, height: u32) -> i32;
+    pub fn aero_vgpu_flush(id: u32, x: u32, y: u32, w: u32, h: u32, stride: u32) -> i32;
 }
 
 extern "C" fn dhi_log(msg: *const c_char) {

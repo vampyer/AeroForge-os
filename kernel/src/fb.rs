@@ -9,6 +9,9 @@ pub struct Fb {
     pub width: usize,
     pub height: usize,
     stride: usize, // in pixels
+    /// Bounding box of what was drawn since the last `take_damage`:
+    /// (x0, y0, x1, y1), exclusive ends.
+    damage: Option<(usize, usize, usize, usize)>,
 }
 
 unsafe impl Send for Fb {}
@@ -30,13 +33,40 @@ impl Fb {
     /// # Safety
     /// `base` must point at a mapped 32 bpp framebuffer of the given geometry.
     pub unsafe fn new(base: *mut u8, width: usize, height: usize, pitch: usize) -> Self {
-        Self { base: base as *mut u32, width, height, stride: pitch / 4 }
+        Self { base: base as *mut u32, width, height, stride: pitch / 4, damage: None }
+    }
+
+    pub fn base(&self) -> *mut u32 {
+        self.base
+    }
+
+    /// Row length in pixels.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Records that a rectangle changed, for whoever shows this image.
+    pub fn mark(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        let (x1, y1) = ((x + w).min(self.width), (y + h).min(self.height));
+        if x >= x1 || y >= y1 {
+            return;
+        }
+        self.damage = Some(match self.damage {
+            None => (x, y, x1, y1),
+            Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x1), d.max(y1)),
+        });
+    }
+
+    /// The changed rectangle (x, y, w, h) since the last call, if any.
+    pub fn take_damage(&mut self) -> Option<(usize, usize, usize, usize)> {
+        self.damage.take().map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0))
     }
 
     #[inline]
     pub fn put(&mut self, x: usize, y: usize, c: u32) {
         if x < self.width && y < self.height {
             unsafe { self.base.add(y * self.stride + x).write_volatile(c) }
+            self.mark(x, y, 1, 1);
         }
     }
 
@@ -114,6 +144,7 @@ impl Fb {
                 core::ptr::copy(src, dst, w);
             }
         }
+        self.mark(x, y, w, h - dy);
     }
 }
 

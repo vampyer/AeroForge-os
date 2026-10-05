@@ -72,6 +72,52 @@ impl Device {
         None
     }
 
+    /// Config-space offsets of every capability `id` (vendor-specific
+    /// capabilities, 0x09, can appear several times).
+    pub fn capabilities(&self, id: u8) -> alloc::vec::Vec<u64> {
+        let mut found = alloc::vec::Vec::new();
+        if self.read16(0x06) & (1 << 4) == 0 {
+            return found;
+        }
+        let mut off = (self.read32(0x34) & 0xFC) as u64;
+        for _ in 0..48 {
+            if off < 0x40 {
+                break;
+            }
+            let header = self.read16(off);
+            if header as u8 == id {
+                found.push(off);
+            }
+            off = ((header >> 8) & 0xFC) as u64;
+        }
+        found
+    }
+
+    /// The register regions of a virtio 1.x ("modern") device.
+    pub fn virtio_regions(&self) -> Option<crate::dhi::VirtioPci> {
+        let mut r = crate::dhi::VirtioPci::default();
+        let mut seen = 0u8;
+        for cap in self.capabilities(0x09) {
+            let kind = (self.read32(cap) >> 24) as u8;
+            if !(1..=4).contains(&kind) {
+                continue; // PCI config access, shared memory, ...
+            }
+            let bar = self.read32(cap + 4) as u8 as u64;
+            let addr = self.bar(bar)? + self.read32(cap + 8) as u64;
+            match kind {
+                1 => r.common = addr,
+                2 => {
+                    r.notify = addr;
+                    r.notify_mult = self.read32(cap + 16);
+                }
+                3 => r.isr = addr,
+                _ => r.device = addr,
+            }
+            seen |= 1 << kind;
+        }
+        (seen & 0b110 == 0b110).then_some(r)
+    }
+
     /// Lets the device decode memory accesses and master DMA; masks legacy INTx.
     pub fn enable_mmio_and_dma(&self) {
         let cmd = self.read32(0x04);
@@ -89,6 +135,7 @@ impl Device {
             (0x0C, 0x05, _) => "SMBus controller",
             (0x02, 0x00, _) => "Ethernet controller",
             (0x03, 0x00, _) => "VGA display controller",
+            (0x03, 0x80, _) if self.vendor == 0x1AF4 => "Display controller (virtio-gpu)",
             (0x03, _, _) => "Display controller",
             (0x04, 0x03, _) => "Audio device (HDA)",
             (0x06, 0x00, _) => "Host bridge",
