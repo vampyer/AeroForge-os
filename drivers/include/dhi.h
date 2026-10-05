@@ -140,7 +140,7 @@ typedef struct dhi_net_info {
     uint8_t  mac[6];
     uint8_t  link_up;     /* 1 = cable connected and negotiated */
     uint8_t  _pad;
-    uint32_t speed_mbps;  /* 10, 100 or 1000 */
+    uint32_t speed_mbps;  /* 10, 100, 1000 or 2500 */
 } dhi_net_info;
 
 /* 1 if this driver handles Intel (vendor 0x8086) device `device_id`. */
@@ -161,6 +161,16 @@ int32_t aero_e1000_recv(int32_t nic, void *frame, uint32_t max);
 
 /* Returns 1 if the link is up and reports the current speed. */
 int32_t aero_e1000_link(int32_t nic, uint32_t *speed_mbps);
+
+/* ---- Intel Ethernet driver, igb/igc family (drivers/igc) ----
+ * igb: 82576, I350, I210, I211. igc: I225, I226 (2.5 Gb/s).
+ * Same calls as the e1000 driver; init also takes the PCI device id, which
+ * picks the family. */
+int32_t aero_igc_supports(uint16_t device_id);
+int32_t aero_igc_init(const dhi_ops *ops, uint64_t mmio_phys, uint16_t device_id, dhi_net_info *info);
+int32_t aero_igc_send(int32_t nic, const void *frame, uint32_t len);
+int32_t aero_igc_recv(int32_t nic, void *frame, uint32_t max);
+int32_t aero_igc_link(int32_t nic, uint32_t *speed_mbps);
 
 #ifdef __cplusplus
 }

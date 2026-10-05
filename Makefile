@@ -66,7 +66,7 @@ NVME_ARGS = -drive file=$(BUILD)/disk.img,if=none,id=nvm,format=raw \
             -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1 \
             -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
             -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
-            -nic user,model=e1000e
+            -nic user,model=igb
 
 run: iso $(BUILD)/vars.fd $(BUILD)/disk.img $(BUILD)/sata.img
 	$(QEMU) $(QEMU_FLAGS) $(OVMF_ARGS) $(NVME_ARGS) -cdrom $(ISO) -serial stdio

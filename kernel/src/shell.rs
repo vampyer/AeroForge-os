@@ -159,12 +159,12 @@ impl Shell {
                     kprintln!("  no network cards");
                 }
                 for n in nics.iter() {
-                    let link = match net::link(n.id) {
+                    let link = match n.port.link() {
                         Some(speed) => alloc::format!("up, {} Mb/s", speed),
                         None => String::from("down"),
                     };
-                    kprintln!("  {}  Intel {:04x}:{:04x} at {}, MAC {}, link {}",
-                        n.name, n.pci_id.0, n.pci_id.1, n.location, net::mac_string(&n.info.mac), link);
+                    kprintln!("  {}  Intel {:04x}:{:04x} ({} driver) at {}, MAC {}, link {}",
+                        n.name, n.pci_id.0, n.pci_id.1, n.driver_name, n.location, net::mac_string(&n.info.mac), link);
                 }
                 drop(nics);
                 if let Some(l) = *net::LEASE.lock() {
