@@ -276,3 +276,69 @@ pub unsafe fn force_console() {
         }
     }
 }
+
+/// A name for well-known graphics chips (PCI vendor:device).
+fn gpu_name(vendor: u16, device: u16) -> &'static str {
+    match (vendor, device) {
+        (0x1002, 0x15DD) => "AMD Radeon Vega (Raven Ridge)",
+        (0x1002, 0x15D8) => "AMD Radeon Vega (Picasso)",
+        (0x1002, 0x1636) => "AMD Radeon Vega (Renoir)",
+        (0x1002, 0x1638) => "AMD Radeon Vega (Cezanne)",
+        (0x1002, 0x164C) => "AMD Radeon Vega (Lucienne)",
+        (0x1002, 0x15E7) => "AMD Radeon Vega (Barcelo)",
+        (0x1002, 0x1681) => "AMD Radeon 680M (Rembrandt)",
+        (0x1002, 0x164E) => "AMD Radeon (Raphael)",
+        (0x1002, 0x15BF) => "AMD Radeon 780M (Phoenix)",
+        (0x1002, _) => "AMD Radeon",
+        (0x8086, _) => "Intel graphics",
+        (0x10DE, _) => "NVIDIA graphics",
+        (0x1234, 0x1111) => "QEMU standard VGA",
+        (0x1AF4, 0x1050) => "virtio-gpu",
+        _ => "graphics device",
+    }
+}
+
+/// Prints every graphics device on PCI with what identifies it, its
+/// memory windows (BARs) and which one holds the screen the firmware set up.
+/// This is what the Radeon driver work starts from on real hardware.
+pub fn report_gpus() {
+    let gop = arch::without_interrupts(|| {
+        DISPLAY.lock().as_ref().and_then(|d| match d.front {
+            Front::Gop { base, stride } => Some((crate::memory::virt_to_phys_direct(base as u64), d.width, d.height, stride)),
+            Front::Virtio { .. } => None,
+        })
+    });
+    for d in pci::devices().iter().filter(|d| d.class == 0x03) {
+        let rev = d.read32(0x08) & 0xFF;
+        let sub = d.read32(0x2C);
+        crate::kok!("GPU {:02x}:{:02x}.{}: {} [{:04x}:{:04x}] rev {:02x}, subsystem {:04x}:{:04x}",
+            d.bus, d.dev, d.func, gpu_name(d.vendor, d.device), d.vendor, d.device, rev, sub & 0xFFFF, sub >> 16);
+        // Memory BARs (the address only: sizing a BAR means briefly
+        // switching off the window the screen is shown from).
+        let mut bars = alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < 6 {
+            let lo = d.read32(0x10 + i * 4);
+            let wide = lo & 1 == 0 && (lo >> 1) & 3 == 2;
+            if lo & 1 == 0 {
+                if let Some(addr) = d.bar(i) {
+                    bars.push((i, addr, wide, lo & 8 != 0));
+                }
+            }
+            i += if wide { 2 } else { 1 };
+        }
+        // The screen is in the BAR with the highest start at or below it.
+        let screen_bar = gop.and_then(|(fb, ..)| bars.iter().filter(|b| b.1 <= fb).max_by_key(|b| b.1).map(|b| b.0));
+        for (i, addr, wide, pref) in &bars {
+            crate::console::print_colored(crate::console::DIM, format_args!(
+                "       BAR{} at {:#x}{}{}{}\n", i, addr,
+                if *wide { ", 64-bit" } else { "" },
+                if *pref { ", prefetchable" } else { "" },
+                if screen_bar == Some(*i) { "  <- screen" } else { "" }));
+        }
+    }
+    if let Some((fb, w, h, stride)) = gop {
+        crate::console::print_colored(crate::console::DIM, format_args!(
+            "       firmware screen: {}x{}, {} bytes per row, at {:#x}\n", w, h, stride * 4, fb));
+    }
+}

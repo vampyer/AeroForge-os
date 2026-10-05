@@ -173,25 +173,7 @@ impl Shell {
                         d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass, d.prog_if, d.kind());
                 }
             }
-            "lsusb" => {
-                let ctrls = usb::CONTROLLERS.lock();
-                if ctrls.is_empty() {
-                    kprintln!("  no USB controllers");
-                }
-                for c in ctrls.iter() {
-                    kprintln!("  xHCI controller {} at {}: {} device(s)", c.id, c.location, c.devices.len());
-                    for d in &c.devices {
-                        let at = if d.parent_slot == 0 {
-                            alloc::format!("port {}", d.port)
-                        } else {
-                            alloc::format!("hub {} port {}", d.parent_slot, d.port)
-                        };
-                        kprintln!("    {:<15} slot {:<2} {:04x}:{:04x}  {:<9} {:<13} {}",
-                            at, d.slot, d.vendor, d.product, usb::speed_name(d.speed), usb::class_name(d),
-                            dhi::c_field(&d.name));
-                    }
-                }
-            }
+            "lsusb" => print_usb(),
             "mouse" => {
                 use core::sync::atomic::Ordering::Relaxed;
                 let b = usb::MOUSE_BUTTONS.load(Relaxed);
@@ -508,4 +490,26 @@ fn program_list() -> String {
         s.push_str(&m.name);
     }
     s
+}
+
+/// Every USB controller and device (the `lsusb` command; also printed at
+/// the end of boot, for a photo on hardware where typing does not work).
+pub fn print_usb() {
+    let ctrls = usb::CONTROLLERS.lock();
+    if ctrls.is_empty() {
+        kprintln!("  no USB controllers");
+    }
+    for c in ctrls.iter() {
+        kprintln!("  xHCI controller {} at {}: {} device(s)", c.id, c.location, c.devices.len());
+        for d in &c.devices {
+            let at = if d.parent_slot == 0 {
+                alloc::format!("port {}", d.port)
+            } else {
+                alloc::format!("hub {} port {}", d.parent_slot, d.port)
+            };
+            kprintln!("    {:<15} slot {:<2} {:04x}:{:04x}  {:<9} {:<13} {}",
+                at, d.slot, d.vendor, d.product, usb::speed_name(d.speed), usb::class_name(d),
+                dhi::c_field(&d.name));
+        }
+    }
 }
