@@ -22,8 +22,10 @@
 # then the 'padtest' program must read all four gamepads through the
 # gamepad system call, in the Xbox layout; last, both USB pads unplug
 # themselves and plug back in (hot-plug on a root port and behind the hub),
-# and 'padtest' must read them again; a second USB stick plugged into the
-# hub must be mounted and readable, and unmounted when it is pulled out;
+# and 'padtest' must read them again; a second USB stick, formatted exFAT,
+# plugged into the hub must be mounted and readable, take saved files (enough
+# that a folder grows), an overwrite, a delete and a new folder, and be
+# unmounted when it is pulled out (fsck.exfat checks it afterwards);
 # last, 'diskwrite' must write, flush and read back a test pattern on the
 # NVMe, SATA and USB disks, and the disk images must hold it after QEMU exits;
 # then the 'savetest' program saves, overwrites and deletes files through the
@@ -43,7 +45,7 @@ make iso >/dev/null
 ./tools/make-disk.sh >/dev/null
 ./tools/make-sata-disk.sh >/dev/null 2>&1
 ./tools/make-usb-disk.sh >/dev/null 2>&1
-./tools/make-usb-disk.sh build/usb2.img HOTSTICK tools/usb2-files >/dev/null 2>&1
+./tools/make-usb-disk.sh build/usb2.img HOTSTICK tools/usb2-files exfat >/dev/null 2>&1
 cc -O2 -Wall -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser -lm
 FAKEBT_LOG=build/fakebt.log
 build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin 2>"$FAKEBT_LOG" &
@@ -88,6 +90,17 @@ fail() {
 }
 
 type_keys() { python3 tools/qemu-type.py build/qemu-monitor.sock "$1"; }
+# Shell commands for the exFAT stick, each with the output that ends it
+# (the success line, or the error line, which starts with the path).
+EXFAT_CMDS=('wc /usb1p1/AeroForge-OS-Design.md')
+EXFAT_WAIT=('fd53da30847dce45  /usb1p1/AeroForge-OS-Design.md\|  /usb1p1/AeroForge-OS-Design.md: ')
+for n in 4 5 6 7 8; do
+    EXFAT_CMDS+=("write \"/usb1p1/Games/Saves/Level $n checkpoint.sav\" checkpoint=lava-$n")
+    EXFAT_WAIT+=("bytes to /usb1p1/Games/Saves/Level $n checkpoint.sav\|  /usb1p1/Games/Saves/Level $n checkpoint.sav: ")
+done
+EXFAT_CMDS+=('write /usb1p1/AeroForge-OS-Design.md replaced by AeroForge' 'rm /usb1p1/hot.txt' 'mkdir /usb1p1/Music' 'ls /usb1p1/games/saves')
+EXFAT_WAIT+=('bytes to /usb1p1/AeroForge-OS-Design.md' 'deleted /usb1p1/hot.txt\|  /usb1p1/hot.txt: ' 'created directory /usb1p1/Music\|  /usb1p1/Music: ' '  Level 8 checkpoint.sav\|  /usb1p1/games/saves: ')
+EXFAT_STEP=0
 monitor() { python3 tools/qemu-monitor.py build/qemu-monitor.sock "$@" >/dev/null; }
 STAGE=0
 
@@ -132,8 +145,16 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = 16 ] && grep -q "mounted at /usb1p1" "$LOG"; then
         sleep 1; type_keys $'cat /usb1p1/hot.txt\n'; STAGE=17
     elif [ $STAGE = 17 ] && grep -q "This stick was plugged in while AeroForge was running" "$LOG"; then
-        # ...read, and pulled out again.
-        sleep 1; monitor "device_del stick2"; STAGE=18
+        # ...read and written (it is exFAT)...
+        sleep 1; type_keys "${EXFAT_CMDS[0]}"$'\n'; STAGE=exfat
+    elif [ $STAGE = exfat ] && grep -q "${EXFAT_WAIT[$EXFAT_STEP]}" "$LOG"; then
+        EXFAT_STEP=$((EXFAT_STEP + 1))
+        if [ $EXFAT_STEP -lt ${#EXFAT_CMDS[@]} ]; then
+            sleep 1; type_keys "${EXFAT_CMDS[$EXFAT_STEP]}"$'\n'
+        else
+            # ...and pulled out again.
+            sleep 1; monitor "device_del stick2"; STAGE=18
+        fi
     elif [ $STAGE = 18 ] && grep -q "USB disk usb1 unplugged" "$LOG"; then
         sleep 1; type_keys $'ls /usb1p1\n'; STAGE=19
     elif [ $STAGE = 19 ] && grep -q "  /usb1p1: " "$LOG"; then
@@ -222,7 +243,14 @@ for _ in $(seq "$TIMEOUT"); do
         [ "$(grep -c "\[padtest\] .*\"Controller\" (USB, Xbox layout): A Y LB Start" "$LOG")" -ge 2 ] && [ "$(grep -c "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS" "$LOG")" -ge 2 ] \
             && [ "$(grep -c "\[padtest\] 4 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
         grep -q "USB disk usb1 plugged in: .*USB \"QEMU QEMU HARDDISK\" serial AEROUSB2" "$LOG" || { fail "the USB stick plugged in later was not registered"; }
-        grep -q "FAT32 volume \"HOTSTICK\" on usb1p1 mounted at /usb1p1" "$LOG" || { fail "the USB stick plugged in later was not mounted"; }
+        grep -q "exFAT volume \"HOTSTICK\" on usb1p1 mounted at /usb1p1" "$LOG" || { fail "the exFAT USB stick plugged in later was not mounted"; }
+        grep -q "48976 bytes, 561 lines, fnv1a fd53da30847dce45  /usb1p1/AeroForge-OS-Design.md" "$LOG" || { fail "a many-cluster file on the exFAT stick did not read back right"; }
+        for n in 4 5 6 7 8; do
+            grep -q "wrote 18 bytes to /usb1p1/Games/Saves/Level $n checkpoint.sav" "$LOG" || { fail "saving level $n on the exFAT stick failed"; }
+        done
+        grep -q "wrote 22 bytes to /usb1p1/AeroForge-OS-Design.md" "$LOG" || { fail "overwriting a file on the exFAT stick failed"; }
+        grep -q "deleted /usb1p1/hot.txt" "$LOG" || { fail "deleting a file on the exFAT stick failed"; }
+        grep -q "created directory /usb1p1/Music" "$LOG" || { fail "creating a folder on the exFAT stick failed"; }
         grep -q "USB disk usb1 unplugged, /usb1p1 unmounted" "$LOG" || { fail "the unplugged USB stick was not unmounted"; }
         grep -q "  /usb1p1: " "$LOG" || { fail "the unplugged USB stick's files were still reachable"; }
         for d in nvme0 sata0 usb0; do
@@ -241,7 +269,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "deleted /usb0p1/usb.txt" "$LOG" || { fail "the shell could not delete a file on the USB stick"; }
         python3 tools/check-fat-files.py build || { fail "the saved files are not right on the disk images"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read and unmounted a USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

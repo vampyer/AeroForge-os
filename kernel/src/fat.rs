@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 
 use crate::block::BlockDevice;
 use crate::sync::SleepMutex;
+use crate::vfs;
 
 pub struct FatVolume {
     pub dev: Arc<dyn BlockDevice>,
@@ -30,7 +31,7 @@ pub struct FatVolume {
     /// Data clusters: valid cluster numbers are 2..clusters + 2.
     clusters: u32,
     fsinfo: Option<u64>,
-    pub label: String,
+    label: String,
     state: SleepMutex<State>,
 }
 
@@ -43,22 +44,15 @@ struct State {
 }
 
 #[derive(Clone, Debug)]
-pub struct DirEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u32,
+struct DirEntry {
+    name: String,
+    is_dir: bool,
+    size: u32,
     cluster: u32,
     short: [u8; 11],
     /// Index of the 8.3 entry in its directory, and how many long-name entries precede it.
     slot: u32,
     lfn: u32,
-}
-
-impl DirEntry {
-    /// A directory entry standing for another volume's mount point.
-    pub fn mount_point(name: &str) -> Self {
-        Self { name: String::from(name), is_dir: true, size: 0, cluster: 0, short: [b' '; 11], slot: 0, lfn: 0 }
-    }
 }
 
 const END_OF_CHAIN: u32 = 0x0FFF_FFF8;
@@ -134,13 +128,11 @@ impl FatVolume {
 
     // ------------------------------------------------------------ public
 
-    pub fn list(&self, path: &str) -> Res<Vec<DirEntry>> {
+    pub fn list(&self, path: &str) -> Res<Vec<vfs::DirEntry>> {
         let st = &mut *self.state.lock();
         let dir = self.lookup(st, path)?;
-        if !dir.is_dir {
-            return Ok(vec![dir]);
-        }
-        Ok(parse_dir(&self.read_dir_raw(st, dir.cluster)?.1))
+        let entries = if dir.is_dir { parse_dir(&self.read_dir_raw(st, dir.cluster)?.1) } else { vec![dir] };
+        Ok(entries.into_iter().map(|e| vfs::DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64 }).collect())
     }
 
     /// Reads up to `limit` bytes of a file.
@@ -651,7 +643,7 @@ fn short_entry(short: &[u8; 11], case: u8, attr: u8, cluster: u32, size: u32, ti
 }
 
 /// FAT time and date words for now (1980-01-01 if the clock can't be read).
-fn timestamp() -> (u16, u16) {
+pub fn timestamp() -> (u16, u16) {
     match crate::rtc::now() {
         Some(t) if (1980..2108).contains(&t.year) => (
             (t.hour as u16) << 11 | (t.minute as u16) << 5 | (t.second as u16 / 2),
@@ -665,7 +657,7 @@ fn timestamp() -> (u16, u16) {
 
 /// Windows' rules: no control characters or "*/:<>?\|, not just dots or
 /// spaces, no trailing dot or space, at most 255 UTF-16 units.
-fn check_name(name: &str) -> Res<()> {
+pub fn check_name(name: &str) -> Res<()> {
     if name.is_empty() || name.trim_matches(|c| c == '.' || c == ' ').is_empty() {
         return Err("bad file name");
     }
@@ -772,4 +764,31 @@ fn lfn_entries(name: &str, sum: u8) -> Vec<[u8; 32]> {
         out.push(e);
     }
     out
+}
+
+impl vfs::Volume for FatVolume {
+    fn kind(&self) -> &'static str {
+        "FAT32"
+    }
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn dev(&self) -> &Arc<dyn BlockDevice> {
+        &self.dev
+    }
+    fn list(&self, path: &str) -> Res<Vec<vfs::DirEntry>> {
+        FatVolume::list(self, path)
+    }
+    fn read_file(&self, path: &str, limit: usize) -> Res<Vec<u8>> {
+        FatVolume::read_file(self, path, limit)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> Res<()> {
+        FatVolume::write_file(self, path, data)
+    }
+    fn create_dir(&self, path: &str) -> Res<()> {
+        FatVolume::create_dir(self, path)
+    }
+    fn remove(&self, path: &str) -> Res<()> {
+        FatVolume::remove(self, path)
+    }
 }
