@@ -1,13 +1,16 @@
 //! Bluetooth host: finds USB Bluetooth adapters through the xHCI driver,
 //! loads MediaTek firmware where the adapter needs it, brings each adapter
 //! up over HCI, scans for classic (inquiry) and Bluetooth LE devices, pairs
-//! with and reads classic Bluetooth gamepads (HID over L2CAP), and records
-//! from Bluetooth headset microphones (hands-free profile, SCO voice).
+//! with and reads classic Bluetooth gamepads (HID over L2CAP) and LE
+//! gamepads (HID over GATT), and records from Bluetooth headset microphones
+//! (hands-free profile, SCO voice).
 //! A kernel thread owns the adapters; the shell talks to it through jobs.
 
+mod crypto;
 mod hfp;
 mod hid;
 mod l2cap;
+mod le;
 mod rfcomm;
 mod scoframe;
 mod sdp;
@@ -64,6 +67,9 @@ pub struct Bond {
     /// A headset: its hands-free RFCOMM channel, and true if it only has
     /// the older Headset profile.
     pub audio: Option<(u8, bool)>,
+    /// An LE device: its keys and, for a gamepad, its report characteristics.
+    pub le: Option<le::Keys>,
+    pub gatt: Vec<le::Report>,
 }
 
 /// A paired headset with a microphone.
@@ -129,7 +135,7 @@ static SCAN: IrqMutex<Option<ScanJob>> = IrqMutex::new(None);
 static PAIR: IrqMutex<Option<PairJob>> = IrqMutex::new(None);
 
 const BOOT_SCAN_SECONDS: u32 = 3;
-const PAIR_TIMEOUT: u64 = 30 * apic::TIMER_HZ;
+pub(super) const PAIR_TIMEOUT: u64 = 30 * apic::TIMER_HZ;
 /// How long the voice link may take to come up.
 const VOICE_TIMEOUT: u64 = 10 * apic::TIMER_HZ;
 /// How long a reconnected headset gets to open RFCOMM before we do.
@@ -217,10 +223,19 @@ pub fn bt_thread(_: u64) {
             j.address
         });
         if let Some(address) = pair {
-            // The adapter that saw the device in a scan, else the first one up.
-            let seen = FOUND.lock().iter().find(|f| f.address == address && !f.le).map(|f| f.adapter);
-            match hosts.iter_mut().filter(|h| h.up).find(|h| seen.is_none_or(|i| i == h.index)) {
-                Some(h) => h.pair(address),
+            // The adapter that saw the device in a scan, else the first one
+            // up; a device seen only over LE pairs over LE.
+            let seen = {
+                let found = FOUND.lock();
+                found.iter().find(|f| f.address == address && !f.le).or_else(|| found.iter().find(|f| f.address == address))
+                    .map(|f| (f.adapter, f.le, f.random))
+            };
+            match hosts.iter_mut().filter(|h| h.up).find(|h| seen.is_none_or(|s| s.0 == h.index)) {
+                Some(h) => match seen {
+                    Some((_, true, random)) if h.le_capable => h.le_pair(address, random),
+                    Some((_, true, _)) => finish_pair(Err(String::from("this adapter has no Bluetooth LE"))),
+                    _ => h.pair(address),
+                },
                 None => finish_pair(Err(String::from("no Bluetooth adapter is up"))),
             }
         }
@@ -238,6 +253,7 @@ pub fn bt_thread(_: u64) {
             h.service();
             h.check_pairing();
             h.check_audio();
+            h.check_le();
         }
         sched::sleep_ticks(1);
     }
@@ -368,6 +384,7 @@ const OP_LE_SET_EVENT_MASK: u16 = 0x2001;
 const OP_LE_READ_BUFFER_SIZE: u16 = 0x2002;
 const OP_LE_SET_SCAN_PARAMS: u16 = 0x200B;
 const OP_LE_SET_SCAN_ENABLE: u16 = 0x200C;
+const OP_LE_CREATE_CONNECTION: u16 = 0x200D;
 
 const EV_INQUIRY_COMPLETE: u8 = 0x01;
 const EV_INQUIRY_RESULT: u8 = 0x02;
@@ -421,6 +438,13 @@ pub(super) struct Host {
     /// set it up (so we take it down after recording).
     voice: Option<(u16, u16, bool)>,
     rec: Option<Rec>,
+    le_capable: bool,
+    le_init: le::Initiating,
+    le_retry: u64,
+    /// The adapter's separate buffers for LE data, if it has them:
+    /// (packet size, free packets) and what waits for them.
+    le_buffers: Option<(u16, u16)>,
+    le_out: VecDeque<Vec<u8>>,
 }
 
 /// A recording in progress.
@@ -443,7 +467,8 @@ impl Host {
         Host { index, id, name, up: false, evt: Vec::new(), acl: Vec::new(), events: VecDeque::new(),
             acl_in: VecDeque::new(), commands: VecDeque::new(), command_credits: 1, waiting: None, reply: None,
             acl_out: VecDeque::new(), acl_credits: 0, acl_mtu: 0, inquiry_done: false, conns: Vec::new(),
-            pair_deadline: None, sco: VecDeque::new(), sco_in: VecDeque::new(), voice: None, rec: None }
+            pair_deadline: None, sco: VecDeque::new(), sco_in: VecDeque::new(), voice: None, rec: None,
+            le_capable: false, le_init: le::Initiating::None, le_retry: 0, le_buffers: None, le_out: VecDeque::new() }
     }
 
     fn bring_up(&mut self) -> Result<(), String> {
@@ -483,8 +508,13 @@ impl Host {
         if le {
             self.cmd(OP_LE_SET_EVENT_MASK, &0x1Fu64.to_le_bytes())?;
             let lb = self.cmd(OP_LE_READ_BUFFER_SIZE, &[])?;
-            if mtu == 0 && lb.len() >= 4 {
-                (mtu, packets) = (u16::from_le_bytes([lb[1], lb[2]]), lb[3] as u16);
+            if lb.len() >= 4 && lb[3] != 0 {
+                let own = (u16::from_le_bytes([lb[1], lb[2]]), lb[3] as u16);
+                if mtu == 0 {
+                    (mtu, packets) = own;
+                } else {
+                    self.le_buffers = Some(own);
+                }
             }
         }
         self.acl_mtu = mtu;
@@ -496,6 +526,7 @@ impl Host {
         ad.manufacturer = u16::from_le_bytes([v[5], v[6]]);
         ad.address.copy_from_slice(&a[1..7]);
         ad.le = le;
+        self.le_capable = le;
         ad.acl_mtu = mtu;
         ad.acl_packets = packets;
         self.up = true;
@@ -602,6 +633,18 @@ impl Host {
             }
             self.acl_credits -= 1;
         }
+        while let Some((size, free)) = self.le_buffers.filter(|b| b.1 > 0) {
+            let Some(pkt) = self.le_out.pop_front() else { break };
+            if unsafe { dhi::aero_xhci_bt_send(self.id, dhi::BT_ACL, pkt.as_ptr(), pkt.len() as u32) } != 0 {
+                console::print_colored(console::YELLOW, format_args!("[WARN] {}: could not send LE data\n", self.name));
+                continue;
+            }
+            self.le_buffers = Some((size, free - 1));
+        }
+    }
+
+    fn is_le(&self, handle: u16) -> bool {
+        self.conns.iter().any(|c| c.handle == handle && c.le.is_some())
     }
 
     /// Queues a command without waiting for its answer.
@@ -639,20 +682,28 @@ impl Host {
 
     /// Queues an ACL packet (handle, first or continuing fragment).
     fn send_acl(&mut self, handle: u16, data: &[u8]) {
-        let mtu = self.acl_mtu.max(27) as usize;
+        let le = self.is_le(handle);
+        let own = le && self.le_buffers.is_some();
+        let mtu = if own { self.le_buffers.unwrap().0 } else { self.acl_mtu }.max(27) as usize;
         for (i, part) in data.chunks(mtu).enumerate() {
-            let flags: u16 = if i == 0 { 0x2000 } else { 0x1000 };
+            // LE links take only non-flushable first fragments.
+            let flags: u16 = if i > 0 { 0x1000 } else if le { 0x0000 } else { 0x2000 };
             let mut pkt = Vec::with_capacity(4 + part.len());
             pkt.extend_from_slice(&(handle | flags).to_le_bytes());
             pkt.extend_from_slice(&(part.len() as u16).to_le_bytes());
             pkt.extend_from_slice(part);
-            self.acl_out.push_back(pkt);
+            if own {
+                self.le_out.push_back(pkt);
+            } else {
+                self.acl_out.push_back(pkt);
+            }
         }
         self.flush();
     }
 
     /// Classic inquiry and an LE active scan side by side for `seconds`.
     fn scan(&mut self, seconds: u32) {
+        self.le_pause();
         let le = ADAPTERS.lock()[self.index].le;
         let units = ((seconds * 100).div_ceil(128)).clamp(1, 0x30) as u8;
         self.inquiry_done = false;
@@ -706,6 +757,7 @@ impl Host {
         if let Some(deadline) = self.pair_deadline {
             if sched::ticks() > deadline {
                 self.pair_deadline = None;
+                self.le_pair_timeout();
                 let address = PAIR.lock().as_ref().map(|j| j.address);
                 if let Some(c) = address.and_then(|a| self.conns.iter().find(|c| c.address == a)) {
                     let p = [c.handle as u8, (c.handle >> 8) as u8, 0x13];
@@ -893,6 +945,8 @@ impl Host {
                     } else {
                         Ok(alloc::vec![0])
                     });
+                } else if opcode == OP_LE_CREATE_CONNECTION {
+                    self.le_create_status(p[0]);
                 } else if p[0] != 0 && opcode == OP_CREATE_CONNECTION {
                     if let Some(a) = PAIR.lock().as_ref().map(|j| j.address) {
                         self.pair_failed(&a, alloc::format!("could not connect: {}", hci_error(p[0])));
@@ -903,8 +957,13 @@ impl Host {
                 for h in p[1..].chunks_exact(4).take(p[0] as usize) {
                     // Voice packets are not flow controlled.
                     let handle = u16::from_le_bytes([h[0], h[1]]) & 0x0FFF;
-                    if self.voice.is_none_or(|v| v.0 != handle) {
-                        self.acl_credits += u16::from_le_bytes([h[2], h[3]]);
+                    let n = u16::from_le_bytes([h[2], h[3]]);
+                    if self.voice.is_some_and(|v| v.0 == handle) {
+                        continue;
+                    }
+                    match self.le_buffers {
+                        Some((size, free)) if self.is_le(handle) => self.le_buffers = Some((size, free + n)),
+                        _ => self.acl_credits += n,
                     }
                 }
             }
@@ -934,6 +993,7 @@ impl Host {
                     parse_ad(eir, f);
                 });
             }
+            EV_LE_META if !p.is_empty() && p[0] == le::LE_CONNECTION_COMPLETE => self.le_connected(p),
             EV_LE_META if p.len() >= 2 && p[0] == LE_ADVERTISING_REPORT => {
                 let mut r = &p[2..];
                 for _ in 0..p[1] {
@@ -1111,7 +1171,8 @@ impl Host {
                 let mut bonds = BONDS.lock();
                 match bonds.iter_mut().find(|b| b.address == a) {
                     Some(b) => b.key = key,
-                    None => bonds.push(Bond { adapter: self.index, address: a, key, name, descriptor: Vec::new(), audio: None }),
+                    None => bonds.push(Bond { adapter: self.index, address: a, key, name, descriptor: Vec::new(), audio: None, le: None,
+                        gatt: Vec::new() }),
                 }
             }
             EV_AUTHENTICATION_COMPLETE if p.len() >= 3 => {
@@ -1134,6 +1195,9 @@ impl Host {
             EV_ENCRYPTION_CHANGE if p.len() >= 4 => {
                 let handle = u16::from_le_bytes([p[1], p[2]]) & 0x0FFF;
                 let Some(i) = self.conns.iter().position(|c| c.handle == handle) else { return };
+                if self.conns[i].le.is_some() {
+                    return self.le_encryption(i, p[0] == 0 && p[3] != 0, p[0]);
+                }
                 if p[0] != 0 || p[3] == 0 {
                     let a = self.conns[i].address;
                     self.pair_failed(&a, alloc::format!("encryption failed: {}", hci_error(p[0])));

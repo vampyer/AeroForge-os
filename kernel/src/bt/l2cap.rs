@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use super::{hfp, hid, rfcomm, sdp, Host, BONDS, GAMEPADS};
+use super::{hfp, hid, le, rfcomm, sdp, Host, BONDS, GAMEPADS};
 
 const SIGNALLING_CID: u16 = 0x0001;
 const FIRST_DYNAMIC_CID: u16 = 0x0040;
@@ -72,6 +72,8 @@ pub struct Conn {
     /// A reconnected headset that has not opened RFCOMM by then gets it
     /// opened by us.
     pub rfcomm_deadline: Option<u64>,
+    /// An LE link: pairing and GATT state.
+    pub le: Option<alloc::boxed::Box<le::Le>>,
 }
 
 impl Conn {
@@ -82,7 +84,7 @@ impl Conn {
             .unwrap_or_default();
         Conn { handle, address, outgoing, encrypted: false, layout, channels: Vec::new(), rx: Vec::new(),
             next_cid: FIRST_DYNAMIC_CID, next_id: 1, sdp_transaction: 0, sdp_lists: Vec::new(), ready: false,
-            held: Vec::new(), sdp_uuid: 0, audio, rfcomm: None, ag: None, audio_ready: false, rfcomm_deadline: None }
+            held: Vec::new(), sdp_uuid: 0, audio, rfcomm: None, ag: None, audio_ready: false, rfcomm_deadline: None, le: None }
     }
 
     fn channel(&mut self, local: u16) -> Option<&mut Channel> {
@@ -117,14 +119,21 @@ impl Host {
         let frame: Vec<u8> = c.rx.drain(..).collect();
         let cid = u16::from_le_bytes([frame[2], frame[3]]);
         let payload = &frame[4..4 + len];
-        if cid == SIGNALLING_CID {
+        if self.conns[i].le.is_some() {
+            match cid {
+                le::ATT_CID => self.on_att(i, payload),
+                le::SIGNAL_CID => self.on_le_signal(i, payload),
+                le::SMP_CID => self.on_smp(i, payload),
+                _ => {}
+            }
+        } else if cid == SIGNALLING_CID {
             self.on_signalling(i, payload);
         } else {
             self.on_channel_data(i, cid, payload);
         }
     }
 
-    fn send_frame(&mut self, conn: usize, cid: u16, payload: &[u8]) {
+    pub(super) fn send_frame(&mut self, conn: usize, cid: u16, payload: &[u8]) {
         let mut f = Vec::with_capacity(4 + payload.len());
         f.extend_from_slice(&(payload.len() as u16).to_le_bytes());
         f.extend_from_slice(&cid.to_le_bytes());

@@ -13,13 +13,16 @@
 # recording must hear its 440 Hz tone, before and after it reconnects on its
 # own; and 'sound test' must play a 440 Hz tone on the emulated HD Audio card,
 # measured in the WAV file QEMU records, and the 'melody' program must play its
-# four notes through the audio system calls. Intended for CI (design doc, Phase 0).
+# four notes through the audio system calls; last, 'bt pair' and 'gamepad' for
+# the simulated LE gamepad: it must pair (SMP), be read over HID over GATT,
+# report its input, reconnect on its own with the stored long-term key and
+# report again. Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OVMF_CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}
 OVMF_VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}
-TIMEOUT=${TIMEOUT:-120}
+TIMEOUT=${TIMEOUT:-180}
 LOG=build/boot-test.log
 
 make iso >/dev/null
@@ -54,7 +57,7 @@ trap 'kill $QEMU_PID $FAKEBT_PID 2>/dev/null || true' EXIT
 fail() {
     echo "FAIL: $1"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|WARN' | tail -8 | tr -d '\r' | tr '\n' ';') | fakebt: $(grep -a 'FAIL\|voice\|reconnect' "$FAKEBT_LOG" | tail -6 | tr -d '\r' | tr '\n' ';')"
+        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|gamepad\|WARN' | tail -8 | tr -d '\r' | tr '\n' ';') | fakebt: $(grep -a 'FAIL\|voice\|reconnect\|LE\|SMP\|GATT' "$FAKEBT_LOG" | tail -6 | tr -d '\r' | tr '\n' ';')"
     fi
     shift
     for f in "$@"; do cat "$f"; done
@@ -82,13 +85,19 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; type_keys $'sound test 440 1\n'; STAGE=7
     elif [ $STAGE = 7 ] && grep -q "  played \|sound: " "$LOG"; then
         sleep 1; type_keys $'run melody\n'; STAGE=8
+    elif [ $STAGE = 8 ] && grep -q "\[melody\] \(played\|no sound\)" "$LOG"; then
+        sleep 1; type_keys $'bt pair C0:FF:EE:00:12:34\n'; STAGE=9
+    elif [ $STAGE = 9 ] && grep -q "\"BLE Pad\" paired and connected\|bt pair: " "$LOG"; then
+        sleep 1; type_keys $'gamepad\n'; STAGE=10
+    elif [ $STAGE = 10 ] && [ "$(grep -c 'gamepad C0:FF:EE:00:12:34 .* connected (' "$LOG")" -ge 2 ]; then
+        sleep 1; type_keys $'gamepad\n'; STAGE=11
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 8 ] && grep -q "\[melody\] \(played\|no sound\)" "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = 11 ] && [ "$(grep -c '"BLE Pad" on hci0' "$LOG")" -ge 2 ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -128,8 +137,12 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[melody\] played 4 notes" "$LOG" || { fail "the melody program could not play"; }
         [ "$(echo "$TONE" | grep -cE "^tone 0\.(29|30|31) s, (52[0-9]|66[0-9]|78[0-9]|10[45][0-9]) Hz")" = 4 ] \
             || { fail "the melody program's four notes were not heard on the sound card ($TONE)"; }
+        grep -q "\"BLE Pad\" paired and connected (4 axes, hat, 12 buttons)" "$LOG" || { fail "LE gamepad did not pair" "$FAKEBT_LOG"; }
+        grep -q "buttons: 4 5, hat left, axes: X +0 Y -127 Z +0 Rz +0" "$LOG" || { fail "LE gamepad input not decoded" "$FAKEBT_LOG"; }
+        grep -q "LE reconnect OK" "$FAKEBT_LOG" || { fail "LE gamepad could not reconnect with the stored key" "$FAKEBT_LOG"; }
+        grep -q "buttons: 6 11, hat up-right, axes: X +127 Y +0 Z -127 Rz +0" "$LOG" || { fail "LE gamepad input after the reconnect not decoded" "$FAKEBT_LOG"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

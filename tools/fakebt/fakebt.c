@@ -13,8 +13,8 @@
  * (0a12:0001) that needs no firmware.
  *
  * Once up it answers the HCI commands the AeroForge host sends and, during a
- * scan, reports a classic gamepad, a classic headset and an LE gamepad. The
- * classic gamepad and headset can be paired and used (see below).
+ * scan, reports a classic gamepad, a classic headset and an LE gamepad. All
+ * three can be paired and used (see below).
  *
  * Build: cc -O2 -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser -lm
  * Run:   build/fakebt <socket> <firmware file> [--generic] */
@@ -288,7 +288,7 @@ static void scan_results(void) {
     queue_event(0.6, h, 2 + 255);
 }
 
-static void le_report(void) {
+static void le_advertising_report(void) {
     /* LE gamepad advertising with a random address: flags, appearance 0x03C4
      * (gamepad), the HID service (0x1812) and a name. */
     const uint8_t ad[] = {2, 0x01, 0x06, 3, 0x19, 0xC4, 0x03, 3, 0x03, 0x12, 0x18,
@@ -364,7 +364,8 @@ static struct device *by_handle(uint16_t h) {
 
 /* Device actions on a timer. */
 enum { ACT_NONE, ACT_REPORTS, ACT_POWER_OFF, ACT_PAGE_HOST, ACT_OPEN_CONTROL, ACT_REPORTS_AFTER_RECONNECT,
-       ACT_HS_POWER_OFF, ACT_HS_PAGE_HOST, ACT_HS_OPEN_SDP };
+       ACT_HS_POWER_OFF, ACT_HS_PAGE_HOST, ACT_HS_OPEN_SDP, ACT_LE_CONNECT, ACT_LE_REPORTS, ACT_LE_POWER_OFF,
+       ACT_LE_ADVERTISE, ACT_LE_REPORTS_AFTER_RECONNECT };
 struct action { double at; int what; };
 static struct action actions[8];
 
@@ -785,6 +786,471 @@ static void iso_pump(void) {
     }
 }
 
+/* ---- the LE gamepad: SMP (legacy Just Works), GATT, HID over GATT ----------
+ *
+ * "BLE Pad" at C0:FF:EE:00:12:34 (random static address). The host connects,
+ * pairs with LE legacy pairing (the confirm and random values are checked
+ * with AES like a real device), encrypts with the short-term key and gets
+ * the gamepad's long-term key. Its GATT server has the GAP and HID services;
+ * the HID characteristics need an encrypted link. Once the host turns on
+ * the input report's notifications the pad sends input; then it turns off,
+ * advertises again a moment later and expects the host to reconnect by
+ * itself and encrypt with the stored long-term key. */
+
+static const uint8_t LE_ADDR[6] = {0x34, 0x12, 0x00, 0xEE, 0xFF, 0xC0};
+static const uint8_t HOST_ADDR[6] = {0x01, 0x12, 0xF0, 0xAE, 0x0D, 0xF0};
+static const uint8_t LE_LTK[16] = {'B', 'L', 'E', 'P', 'a', 'd', 'L', 'o', 'n', 'g', 'T', 'e', 'r', 'm', 'K', 'y'};
+static const uint8_t LE_RAND[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+#define LE_EDIV 0x2468
+#define LE_HANDLE 0x0050
+#define LE_SERVER_MTU 64
+
+static struct {
+    int advertising;      /* connectable (pairing mode at first, after power-on later) */
+    int initiating;       /* the host's LE Create Connection is pending */
+    int accept_list;      /* ... filtered by the accept list */
+    int in_accept_list;
+    int connected, encrypted, bonded, reconnecting, reconnected, notify;
+    uint16_t mtu;
+    uint8_t preq[7], pres[7], mconfirm[16], srand[16], stk[16];
+    int confirmed, random_ok;
+} le = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, {0}, {0}, {0}, {0}, {0}, 0, 0};
+
+/* AES-128 (FIPS-197), for the pairing functions c1 and s1. */
+static const uint8_t SBOX[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
+
+static uint8_t xtime(uint8_t b) { return (uint8_t)((b << 1) ^ (b & 0x80 ? 0x1b : 0)); }
+
+/* Big-endian (most significant byte first) key, block and result. */
+static void aes128(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+    uint8_t rk[11][16], s[16], t[16];
+    memcpy(rk[0], key, 16);
+    uint8_t rcon = 1;
+    for (int r = 1; r < 11; ++r) {
+        const uint8_t *p = rk[r - 1];
+        const uint8_t w[4] = {(uint8_t)(SBOX[p[13]] ^ rcon), SBOX[p[14]], SBOX[p[15]], SBOX[p[12]]};
+        for (int i = 0; i < 4; ++i) rk[r][i] = p[i] ^ w[i];
+        for (int i = 4; i < 16; ++i) rk[r][i] = p[i] ^ rk[r][i - 4];
+        rcon = xtime(rcon);
+    }
+    for (int i = 0; i < 16; ++i) s[i] = in[i] ^ rk[0][i];
+    for (int r = 1; r < 11; ++r) {
+        for (int i = 0; i < 16; ++i) s[i] = SBOX[s[i]];
+        memcpy(t, s, 16);
+        for (int c = 0; c < 4; ++c)
+            for (int row = 0; row < 4; ++row) s[4 * c + row] = t[4 * ((c + row) % 4) + row];
+        if (r != 10)
+            for (int c = 0; c < 4; ++c) {
+                const uint8_t a0 = s[4 * c], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
+                const uint8_t all = a0 ^ a1 ^ a2 ^ a3;
+                s[4 * c] = a0 ^ all ^ xtime(a0 ^ a1);
+                s[4 * c + 1] = a1 ^ all ^ xtime(a1 ^ a2);
+                s[4 * c + 2] = a2 ^ all ^ xtime(a2 ^ a3);
+                s[4 * c + 3] = a3 ^ all ^ xtime(a3 ^ a0);
+            }
+        for (int i = 0; i < 16; ++i) s[i] ^= rk[r][i];
+    }
+    memcpy(out, s, 16);
+}
+
+/* Bluetooth's security functions on little-endian (over-the-air) values,
+ * the way Linux writes them: reverse, AES, reverse. */
+static void rev(uint8_t *d, const uint8_t *s, int n) {
+    for (int i = 0; i < n; ++i) d[i] = s[n - 1 - i];
+}
+
+static void smp_e(const uint8_t k[16], const uint8_t in[16], uint8_t out[16]) {
+    uint8_t kb[16], ib[16], ob[16];
+    rev(kb, k, 16);
+    rev(ib, in, 16);
+    aes128(kb, ib, ob);
+    rev(out, ob, 16);
+}
+
+static void smp_c1(const uint8_t r[16], uint8_t res[16]) {
+    const uint8_t k[16] = {0};
+    uint8_t p1[16], p2[16] = {0};
+    p1[0] = 0; /* initiator (host): public address */
+    p1[1] = 1; /* responder (pad): random address */
+    memcpy(p1 + 2, le.preq, 7);
+    memcpy(p1 + 9, le.pres, 7);
+    memcpy(p2, LE_ADDR, 6);
+    memcpy(p2 + 6, HOST_ADDR, 6);
+    uint8_t t[16];
+    for (int i = 0; i < 16; ++i) t[i] = r[i] ^ p1[i];
+    smp_e(k, t, t);
+    for (int i = 0; i < 16; ++i) t[i] ^= p2[i];
+    smp_e(k, t, res);
+}
+
+static void le_send(uint16_t cid, const uint8_t *payload, int n) {
+    if (acl_out_count == 32) {
+        say("FAIL: ACL queue full");
+        return;
+    }
+    uint8_t *p = acl_out[acl_out_count].data;
+    p[0] = LE_HANDLE & 0xFF;
+    p[1] = (LE_HANDLE >> 8) | 0x20;
+    p[2] = (uint8_t)(n + 4);
+    p[3] = (uint8_t)((n + 4) >> 8);
+    p[4] = (uint8_t)n;
+    p[5] = (uint8_t)(n >> 8);
+    p[6] = (uint8_t)cid;
+    p[7] = (uint8_t)(cid >> 8);
+    memcpy(p + 8, payload, n);
+    acl_out[acl_out_count++].len = n + 8;
+    acl_pump();
+}
+
+static void le_connection_complete(void) {
+    const uint8_t e[] = {0x3E, 19, 0x01, 0, LE_HANDLE & 0xFF, LE_HANDLE >> 8, 0 /* host is central */, 1,
+                         LE_ADDR[0], LE_ADDR[1], LE_ADDR[2], LE_ADDR[3], LE_ADDR[4], LE_ADDR[5],
+                         12, 0, 0, 0, 200, 0, 0};
+    queue_event(0.1, e, sizeof e);
+    le.initiating = 0;
+    le.advertising = 0;
+    le.connected = 1;
+    le.encrypted = 0;
+    le.mtu = 23;
+    le.confirmed = le.random_ok = 0;
+    say("LE pad connected%s", le.accept_list ? " (the host was waiting for it)" : "");
+}
+
+/* The pad's attribute table. */
+struct attr { uint16_t type; const uint8_t *value; int len; int secure; };
+static const uint8_t SVC_GAP[] = {0x00, 0x18}, SVC_HID[] = {0x12, 0x18};
+static const uint8_t CH_NAME[] = {0x02, 0x03, 0x00, 0x00, 0x2A};
+static const uint8_t NAME[] = "BLE Pad";
+static const uint8_t CH_INFO[] = {0x02, 0x06, 0x00, 0x4A, 0x2A};
+static const uint8_t INFO[] = {0x11, 0x01, 0x00, 0x02};
+static const uint8_t CH_MAP[] = {0x02, 0x08, 0x00, 0x4B, 0x2A};
+static const uint8_t CH_REPORT[] = {0x12, 0x0A, 0x00, 0x4D, 0x2A};
+static uint8_t REPORT[7] = {0x80, 0x80, 0x80, 0x80, 8, 0, 0};
+static uint8_t CCCD[2];
+static const uint8_t REPORT_REF[] = {0x01, 0x01}; /* ID 1, input */
+static const uint8_t CH_MODE[] = {0x06, 0x0E, 0x00, 0x4E, 0x2A};
+static uint8_t MODE[] = {0x01};
+static const struct attr ATTRS[] = {
+    {0, NULL, 0, 0},
+    {0x2800, SVC_GAP, 2, 0},                 /* 1 */
+    {0x2803, CH_NAME, 5, 0},                 /* 2 */
+    {0x2A00, NAME, 7, 0},                    /* 3 */
+    {0x2800, SVC_HID, 2, 0},                 /* 4 */
+    {0x2803, CH_INFO, 5, 0},                 /* 5 */
+    {0x2A4A, INFO, 4, 1},                    /* 6 */
+    {0x2803, CH_MAP, 5, 0},                  /* 7 */
+    {0x2A4B, GP_DESCRIPTOR, sizeof GP_DESCRIPTOR, 1}, /* 8 */
+    {0x2803, CH_REPORT, 5, 0},               /* 9 */
+    {0x2A4D, REPORT, 7, 1},                  /* 10 */
+    {0x2902, CCCD, 2, 1},                    /* 11 */
+    {0x2908, REPORT_REF, 2, 1},              /* 12 */
+    {0x2803, CH_MODE, 5, 0},                 /* 13 */
+    {0x2A4E, MODE, 1, 1},                    /* 14 */
+};
+#define LAST_ATTR 14
+
+static void att_error(uint8_t op, uint16_t handle, uint8_t code) {
+    const uint8_t e[] = {0x01, op, (uint8_t)handle, (uint8_t)(handle >> 8), code};
+    le_send(4, e, sizeof e);
+}
+
+static void le_report(uint8_t x, uint8_t y, uint8_t z, uint8_t rz, uint8_t hat, uint16_t buttons) {
+    const uint8_t r[] = {x, y, z, rz, hat, (uint8_t)buttons, (uint8_t)(buttons >> 8)};
+    memcpy(REPORT, r, 7);
+    if (!le.connected || !le.encrypted || !(CCCD[0] & 1)) {
+        say("FAIL: input report with notifications off or the link unencrypted");
+        return;
+    }
+    uint8_t n[3 + 7] = {0x1B, 10, 0};
+    memcpy(n + 3, r, 7);
+    le_send(4, n, sizeof n);
+}
+
+static void att_request(const uint8_t *d, int n) {
+    const uint8_t op = d[0];
+    const uint16_t a = n >= 3 ? d[1] | d[2] << 8 : 0, b = n >= 5 ? d[3] | d[4] << 8 : 0;
+    const uint16_t type = n >= 7 ? d[5] | d[6] << 8 : 0;
+    uint8_t r[LE_SERVER_MTU];
+    int k = 0;
+    switch (op) {
+    case 0x02: /* Exchange MTU */
+        le.mtu = a < LE_SERVER_MTU ? (a < 23 ? 23 : a) : LE_SERVER_MTU;
+        r[k++] = 0x03; r[k++] = LE_SERVER_MTU; r[k++] = 0;
+        break;
+    case 0x10: /* Read By Group Type: primary services */
+        if (type != 0x2800) return att_error(op, a, 0x10);
+        r[k++] = 0x11; r[k++] = 6;
+        for (int h = a; h <= LAST_ATTR && h <= b && k + 6 <= le.mtu; ++h) {
+            if (ATTRS[h].type != 0x2800) continue;
+            int end = h + 1;
+            while (end <= LAST_ATTR && ATTRS[end].type != 0x2800) ++end;
+            --end;
+            r[k++] = (uint8_t)h; r[k++] = 0; r[k++] = (uint8_t)end; r[k++] = 0;
+            r[k++] = ATTRS[h].value[0]; r[k++] = ATTRS[h].value[1];
+        }
+        if (k == 2) return att_error(op, a, 0x0A);
+        break;
+    case 0x04: /* Find Information */
+        r[k++] = 0x05; r[k++] = 1;
+        for (int h = a; h <= LAST_ATTR && h <= b && k + 4 <= le.mtu; ++h) {
+            r[k++] = (uint8_t)h; r[k++] = 0; r[k++] = (uint8_t)ATTRS[h].type; r[k++] = (uint8_t)(ATTRS[h].type >> 8);
+        }
+        if (k == 2) return att_error(op, a, 0x0A);
+        break;
+    case 0x08: /* Read By Type: not used by the host, but answer it */
+        return att_error(op, a, 0x0A);
+    case 0x0A: case 0x0C: { /* Read, Read Blob */
+        const int off = op == 0x0C ? b : 0;
+        if (a == 0 || a > LAST_ATTR) return att_error(op, a, 0x01);
+        if (ATTRS[a].secure && !le.encrypted) {
+            say("host read handle %u before encrypting: refused", a);
+            return att_error(op, a, 0x0F); /* insufficient encryption */
+        }
+        if (off > ATTRS[a].len) return att_error(op, a, 0x07);
+        int len = ATTRS[a].len - off;
+        if (len > le.mtu - 1) len = le.mtu - 1;
+        r[k++] = op + 1;
+        memcpy(r + k, ATTRS[a].value + off, len);
+        k += len;
+        if (a == 8 && off + len == ATTRS[a].len) say("GATT: host read the report map (%d bytes)", ATTRS[a].len);
+        break;
+    }
+    case 0x12: /* Write Request */
+        if (a != 11) return att_error(op, a, 0x03);
+        if (!le.encrypted) return att_error(op, a, 0x0F);
+        CCCD[0] = n >= 4 ? d[3] : 0;
+        say("GATT: host turned input report notifications %s", CCCD[0] & 1 ? "on" : "off");
+        r[k++] = 0x13;
+        if ((CCCD[0] & 1) && !le.notify) {
+            le.notify = 1;
+            schedule(0.4, le.reconnecting ? ACT_LE_REPORTS_AFTER_RECONNECT : ACT_LE_REPORTS);
+        }
+        break;
+    case 0x52: /* Write Command */
+        return;
+    case 0x1E: /* Handle Value Confirmation */
+        return;
+    default:
+        if (op & 1) return; /* a response from the host's (empty) server */
+        say("FAIL: unexpected ATT request %#x", op);
+        return att_error(op, a, 0x06);
+    }
+    le_send(4, r, k);
+}
+
+static void smp_send(const uint8_t *d, int n) { le_send(6, d, n); }
+
+static void smp_request(const uint8_t *d, int n) {
+    switch (d[0]) {
+    case 0x01: { /* Pairing Request */
+        if (n < 7) return;
+        say("SMP: pairing request: IO %u, auth %#x, key size %u, keys %#x/%#x", d[1], d[3], d[4], d[5], d[6]);
+        if (!(d[6] & 1)) say("FAIL: host did not ask for the encryption key");
+        memcpy(le.preq, d, 7);
+        const uint8_t res[] = {0x02, 0x03, 0x00, 0x01, 16, 0x00, 0x01};
+        memcpy(le.pres, res, 7);
+        le.bonded = 0;
+        smp_send(res, 7);
+        break;
+    }
+    case 0x03: /* Pairing Confirm: answer with ours */
+        if (n < 17) return;
+        memcpy(le.mconfirm, d + 1, 16);
+        for (int i = 0; i < 16; ++i) le.srand[i] = (uint8_t)(rand() & 0xFF);
+        {
+            uint8_t c[17] = {0x03};
+            smp_c1(le.srand, c + 1);
+            smp_send(c, 17);
+        }
+        break;
+    case 0x04: { /* Pairing Random: check the host's confirm value */
+        if (n < 17) return;
+        uint8_t check[16];
+        smp_c1(d + 1, check);
+        if (memcmp(check, le.mconfirm, 16) != 0) {
+            say("FAIL: SMP: the host's confirm value does not match its random value");
+            const uint8_t f[] = {0x05, 0x04};
+            smp_send(f, 2);
+            return;
+        }
+        le.random_ok = 1;
+        say("SMP: host's confirm value checks out");
+        uint8_t r[17] = {0x04};
+        memcpy(r + 1, le.srand, 16);
+        smp_send(r, 17);
+        /* STK = s1(TK = 0, Srand, Mrand) */
+        uint8_t rr[16];
+        memcpy(rr, d + 1, 8);
+        memcpy(rr + 8, le.srand, 8);
+        const uint8_t k[16] = {0};
+        smp_e(k, rr, le.stk);
+        break;
+    }
+    case 0x05:
+        say("FAIL: host aborted pairing (reason %#x)", n > 1 ? d[1] : 0);
+        break;
+    default:
+        say("FAIL: unexpected SMP command %#x", d[0]);
+    }
+}
+
+static void le_acl(const uint8_t *p, int n) {
+    const int len = p[4] | p[5] << 8;
+    const uint16_t cid = p[6] | p[7] << 8;
+    if (len + 8 > n) {
+        say("FAIL: fragmented LE L2CAP frame from the host");
+        return;
+    }
+    if (!le.connected) {
+        say("FAIL: LE data for a closed connection");
+        return;
+    }
+    if (cid == 4) att_request(p + 8, len);
+    else if (cid == 6) smp_request(p + 8, len);
+    else if (cid == 5) { /* LE signalling: responses to our requests */ }
+    else say("FAIL: LE data on CID %#x", cid);
+}
+
+/* Encryption with the short-term key (pairing) or the long-term key
+ * (reconnect). Returns the HCI status. */
+static uint8_t le_start_encryption(const uint8_t *a, int n) {
+    if (n < 28) return 0x12;
+    const uint8_t *rnd = a + 2, *ltk = a + 12;
+    const uint16_t ediv = a[10] | a[11] << 8;
+    if (le.random_ok && !le.bonded) {
+        if (memcmp(ltk, le.stk, 16) != 0 || ediv != 0) {
+            say("FAIL: host encrypted with the wrong short-term key");
+            return 0x06;
+        }
+        say("LE pad: link encrypted with the short-term key, sending the long-term key");
+        uint8_t info[17] = {0x06};
+        memcpy(info + 1, LE_LTK, 16);
+        smp_send(info, 17);
+        uint8_t id[11] = {0x07, LE_EDIV & 0xFF, LE_EDIV >> 8};
+        memcpy(id + 3, LE_RAND, 8);
+        smp_send(id, 11);
+        le.bonded = 1;
+        return 0;
+    }
+    if (le.bonded && memcmp(ltk, LE_LTK, 16) == 0 && ediv == LE_EDIV && memcmp(rnd, LE_RAND, 8) == 0) {
+        say("LE reconnect OK: the host encrypted with the stored long-term key");
+        return 0;
+    }
+    say("FAIL: host encrypted with an unknown key");
+    return 0x06;
+}
+
+/* HCI commands for the LE pad. Returns 1 if handled. */
+static int le_command(uint16_t op, const uint8_t *a, int n) {
+    const uint8_t ok = 0;
+    switch (op) {
+    case 0x200D: /* LE Create Connection */
+        command_status(op, 0);
+        if (n < 25) return 1;
+        le.initiating = 1;
+        le.accept_list = a[4];
+        if (!le.accept_list && (memcmp(a + 6, LE_ADDR, 6) != 0 || a[5] != 1)) {
+            say("FAIL: LE connection to an unknown device");
+            return 1;
+        }
+        say("host connects over LE%s", le.accept_list ? " to any paired device (accept list)" : "");
+        if (le.advertising && (!le.accept_list || le.in_accept_list)) schedule(0.2, ACT_LE_CONNECT);
+        return 1;
+    case 0x200E: /* LE Create Connection Cancel */
+        command_complete(op, &ok, 1);
+        if (le.initiating) {
+            le.initiating = 0;
+            const uint8_t e[] = {0x3E, 19, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            queue_event(0.05, e, sizeof e);
+        }
+        return 1;
+    case 0x2010: /* LE Clear Filter Accept List */
+        le.in_accept_list = 0;
+        command_complete(op, &ok, 1);
+        return 1;
+    case 0x2011: /* LE Add Device To Filter Accept List */
+        if (n >= 7 && a[0] == 1 && memcmp(a + 1, LE_ADDR, 6) == 0) le.in_accept_list = 1;
+        command_complete(op, &ok, 1);
+        return 1;
+    case 0x2013: /* LE Connection Update */
+        command_status(op, 0);
+        return 1;
+    case 0x2019: { /* LE Enable Encryption */
+        command_status(op, 0);
+        if (!le.connected) return 1;
+        const uint8_t status = le_start_encryption(a, n);
+        const uint8_t e[] = {0x08, 4, status, LE_HANDLE & 0xFF, LE_HANDLE >> 8, status == 0};
+        queue_event(0.05, e, sizeof e);
+        le.encrypted = status == 0;
+        return 1;
+    }
+    case 0x0406: /* Disconnect */
+        if (n < 2 || ((a[0] | a[1] << 8) & 0x0FFF) != LE_HANDLE) return 0;
+        command_status(op, 0);
+        if (le.connected) {
+            const uint8_t e[] = {0x05, 4, 0, LE_HANDLE & 0xFF, LE_HANDLE >> 8, 0x16};
+            queue_event(0.05, e, sizeof e);
+            le.connected = 0;
+            say("host disconnected the LE pad (reason %#x)", n >= 3 ? a[2] : 0);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void le_actions(int what) {
+    switch (what) {
+    case ACT_LE_CONNECT:
+        if (le.initiating) le_connection_complete();
+        break;
+    case ACT_LE_REPORTS:
+        /* Stick up, d-pad left, buttons 4 and 5. */
+        le_report(0x80, 0x00, 0x80, 0x80, 6, 0x0018);
+        say("LE input reports sent");
+        schedule(3.0, ACT_LE_POWER_OFF);
+        break;
+    case ACT_LE_POWER_OFF: {
+        const uint8_t e[] = {0x05, 4, 0, LE_HANDLE & 0xFF, LE_HANDLE >> 8, 0x13};
+        queue_event(0, e, sizeof e);
+        le.connected = le.encrypted = 0;
+        le.notify = 0;
+        le.reconnecting = 1;
+        say("LE pad turned off");
+        schedule(1.5, ACT_LE_ADVERTISE);
+        break;
+    }
+    case ACT_LE_ADVERTISE:
+        le.advertising = 1;
+        say("LE pad turned on, advertising");
+        if (le.initiating && le.accept_list && le.in_accept_list) schedule(0.2, ACT_LE_CONNECT);
+        else if (!le.initiating) say("the host is not waiting for the LE pad (yet)");
+        break;
+    case ACT_LE_REPORTS_AFTER_RECONNECT:
+        /* Stick right, Z full down, d-pad up-right, buttons 6 and 11. */
+        le_report(0xFF, 0x80, 0x00, 0x80, 1, 0x0420);
+        le.reconnected = 1;
+        say("LE input reports sent after the reconnect");
+        break;
+    }
+}
+
 /* ---- connections and security ---- */
 
 static void connection_complete(struct device *v, uint8_t status) {
@@ -905,6 +1371,10 @@ static void device_acl(const uint8_t *p, int n) {
     const uint16_t handle = (p[0] | p[1] << 8) & 0x0FFF;
     const uint8_t done[] = {0x13, 5, 1, (uint8_t)handle, (uint8_t)(handle >> 8), 1, 0};
     queue_event(0, done, sizeof done);
+    if (handle == LE_HANDLE) {
+        le_acl(p, n);
+        return;
+    }
     struct device *v = by_handle(handle);
     if (!v || !v->connected) {
         say("FAIL: ACL data for unknown connection %#x", handle);
@@ -936,6 +1406,7 @@ static void device_acl(const uint8_t *p, int n) {
 /* HCI commands about connections and security. Returns 1 if handled. */
 static int device_command(uint16_t op, const uint8_t *a, int n) {
     struct device *v = NULL;
+    if (le_command(op, a, n)) return 1;
     switch (op) {
     case 0x0405: case 0x0409: case 0x040A: case 0x040B: case 0x040C: case 0x040D: case 0x040E:
     case 0x042B: case 0x042C: case 0x042D: case 0x0434:
@@ -1134,6 +1605,8 @@ static void device_actions(void) {
         case ACT_HS_OPEN_SDP:
             ch_connect(&headset, 0x0001);
             break;
+        default:
+            le_actions(what);
         }
     }
 }
@@ -1241,7 +1714,7 @@ static void send_due_events(void) {
     }
     if (le_scanning && le_report_at && t >= le_report_at) {
         le_report_at = 0;
-        le_report();
+        le_advertising_report();
     }
     if (!interrupt_started) return;
     int i = 0;
@@ -1557,8 +2030,9 @@ int main(int argc, char **argv) {
         send_due_events();
         if (usbredirparser_has_data_to_write(parser) && usbredirparser_do_write(parser) != 0) break;
     }
-    say("QEMU went away after %d HCI command(s)%s%s, %ld bytes of voice back from the host", commands,
+    say("QEMU went away after %d HCI command(s)%s%s%s, %ld bytes of voice back from the host", commands,
         gamepad.reconnected ? ", gamepad paired, used and reconnected" : gamepad.paired ? ", gamepad paired" : "",
-        headset.paired ? ", headset paired" : "", iso_out_bytes);
+        headset.paired ? ", headset paired" : "",
+        le.reconnected ? ", LE pad paired, used and reconnected" : le.bonded ? ", LE pad paired" : "", iso_out_bytes);
     return 0;
 }
