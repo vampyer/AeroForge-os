@@ -76,8 +76,9 @@ impl Shell {
                 kprintln!("  ping <ip>   send 4 ICMP echo requests");
                 kprintln!("  bt          Bluetooth adapters");
                 kprintln!("  bt scan [s] look for Bluetooth devices for s seconds (default 5)");
-                kprintln!("  bt pair <address>  pair a Bluetooth gamepad (put it in pairing mode first)");
+                kprintln!("  bt pair <address>  pair a Bluetooth gamepad or headset (put it in pairing mode first)");
                 kprintln!("  gamepad     Bluetooth gamepads and what they are pressing");
+                kprintln!("  mic [record [s]]  Bluetooth headset microphones; record and show level and pitch");
                 kprintln!("  disks       disks and partitions");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
@@ -262,6 +263,32 @@ impl Shell {
                         bt::hat_name(g.pad.hat), axes);
                 }
             }
+            "mic" => match arg.split_once(' ').unwrap_or((arg, "")) {
+                ("", _) => {
+                    let list = bt::HEADSETS.lock();
+                    if list.is_empty() {
+                        kprintln!("  no microphones; pair a Bluetooth headset with 'bt pair <address>' (see 'bt scan')");
+                    }
+                    for h in list.iter() {
+                        let adapter = bt::ADAPTERS.lock().get(h.adapter).map_or(String::from("?"), |a| a.name.clone());
+                        kprintln!("  {} \"{}\" on {}, Bluetooth {}, {}", bt::addr_string(&h.address), h.name, adapter, h.profile,
+                            if h.connected { "connected" } else { "not connected" });
+                    }
+                }
+                ("record", secs) => {
+                    let secs = if secs.is_empty() { 3 } else { secs.trim().parse::<u32>().unwrap_or(3).clamp(1, 30) };
+                    kprintln!("  recording {} s...", secs);
+                    match bt::record(secs) {
+                        Ok(r) => {
+                            let pitch = if r.pitch > 0 { alloc::format!(", pitch about {} Hz", r.pitch) } else { String::from(", silence") };
+                            kprintln!("  \"{}\": {}.{} s, {} samples at 8 kHz, peak {}%, RMS {}%{}", r.name, r.tenths / 10,
+                                r.tenths % 10, r.samples, r.peak, r.rms, pitch);
+                        }
+                        Err(e) => console::print_colored(YELLOW, format_args!("  mic: {}\n", e)),
+                    }
+                }
+                _ => console::print_colored(YELLOW, format_args!("  usage: mic [record [seconds]]\n")),
+            },
             "disks" => {
                 for d in block::DEVICES.lock().iter() {
                     match vfs::mount_point_of(d.name()) {

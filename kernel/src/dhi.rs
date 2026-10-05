@@ -106,6 +106,7 @@ pub struct NetInfo {
 
 pub const BT_COMMAND: u8 = 1;
 pub const BT_ACL: u8 = 2;
+pub const BT_SCO: u8 = 3;
 pub const BT_EVENT: u8 = 4;
 
 #[repr(C)]
@@ -141,6 +142,7 @@ extern "C" {
     pub fn aero_xhci_bt(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
     pub fn aero_xhci_bt_send(bt: i32, kind: u8, data: *const u8, len: u32) -> i32;
     pub fn aero_xhci_bt_recv(bt: i32, kind: *mut u8, data: *mut u8, max: u32) -> i32;
+    pub fn aero_xhci_bt_sco(bt: i32, alt: u8) -> i32;
     pub fn aero_btmtk_is_mediatek(vendor: u16, product: u16) -> i32;
     pub fn aero_btmtk_chip(ops: *const DhiOps, bt: i32, out: *mut BtmtkChip) -> i32;
     pub fn aero_btmtk_setup(ops: *const DhiOps, bt: i32, firmware: *const u8, size: u32, out: *mut BtmtkResult) -> i32;

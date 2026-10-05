@@ -55,7 +55,7 @@ struct Trb {
 };
 static_assert(sizeof(Trb) == 16);
 
-constexpr uint32_t kTrbNormal = 1, kTrbSetup = 2, kTrbData = 3, kTrbStatus = 4, kTrbLink = 6;
+constexpr uint32_t kTrbNormal = 1, kTrbSetup = 2, kTrbData = 3, kTrbStatus = 4, kTrbIsoch = 5, kTrbLink = 6;
 constexpr uint32_t kTrbEnableSlot = 9, kTrbAddressDevice = 11, kTrbConfigureEndpoint = 12,
                    kTrbEvaluateContext = 13, kTrbResetEndpoint = 14, kTrbSetTrDequeue = 16;
 constexpr uint32_t kEvtTransfer = 32, kEvtCommandDone = 33;
@@ -67,6 +67,7 @@ constexpr uint32_t kTrbChain = 1u << 4;    // next TRB belongs to the same trans
 constexpr uint32_t kTrbIoc = 1u << 5;      // interrupt on completion
 constexpr uint32_t kTrbIdt = 1u << 6;      // immediate data (setup stage)
 constexpr uint32_t kTrbDirIn = 1u << 16;
+constexpr uint32_t kTrbSia = 1u << 31;     // isochronous: start as soon as possible
 
 constexpr uint32_t kCcSuccess = 1, kCcStall = 6, kCcShortPacket = 13;
 
@@ -83,6 +84,10 @@ constexpr int kBtEventBuf = 512;
 constexpr int kBtAclBuf = 1024;
 constexpr int kBtQueue = 32;          // received Bluetooth chunks waiting for the kernel
 constexpr int kMaxBt = 2;             // Bluetooth adapters per controller
+constexpr int kScoTrbs = 16;          // isochronous voice transfers in flight, each way
+constexpr int kScoBuf = 64;           // one isochronous packet (largest SCO alternate setting: 63)
+constexpr int kScoQueue = 256;        // received voice packets waiting for the kernel
+constexpr int kScoAlts = 8;
 
 // ---- small helpers ----
 
@@ -214,6 +219,15 @@ struct Device {
     Ring evt_ring{};
     dhi_dma bt_bufs{};                     // kBtTrbs event buffers, then kBtTrbs ACL buffers
     uint32_t evt_queued = 0, evt_done = 0, acl_queued = 0, acl_done = 0;
+
+    // Voice (SCO) on the second interface: isochronous endpoints whose
+    // packet size depends on the alternate setting (0 = no bandwidth).
+    int8_t sco_iface = -1;
+    uint8_t sco_alt = 0, sco_in_dci = 0, sco_out_dci = 0, sco_interval = 0;
+    uint16_t sco_in_mps[kScoAlts] = {}, sco_out_mps[kScoAlts] = {};
+    Ring sco_in_ring{}, sco_out_ring{};
+    dhi_dma sco_bufs{};                    // kScoTrbs IN packets, then kScoTrbs OUT packets
+    uint32_t sco_in_queued = 0, sco_in_done = 0, sco_out_queued = 0, sco_out_done = 0;
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -295,6 +309,8 @@ public:
             const uint32_t code = bulk(d, false, d.ms_buf.phys, len);
             if (code == kCcStall) clear_halt(d, false);
             rc = code == kCcSuccess ? 0 : -1;
+        } else if (type == DHI_BT_SCO) {
+            rc = send_sco(d, data, len);
         }
         unlock();
         return rc;
@@ -306,6 +322,7 @@ public:
         if (!try_lock()) return 0;
         process_events();
         BtQueue& q = bt_queues_[devices_[dev].bt];
+        ScoQueue& sq = sco_queues_[devices_[dev].bt];
         int32_t n = 0;
         if (q.tail != q.head) {
             const BtChunk& c = q.chunks[q.tail];
@@ -313,6 +330,12 @@ public:
             *type = c.type;
             for (int32_t i = 0; i < n; ++i) out[i] = c.data[i];
             q.tail = (q.tail + 1) % kBtQueue;
+        } else if (sq.tail != sq.head) {
+            const ScoChunk& c = sq.chunks[sq.tail];
+            n = int32_t(c.len < max ? c.len : max);
+            *type = DHI_BT_SCO;
+            for (int32_t i = 0; i < n; ++i) out[i] = c.data[i];
+            sq.tail = (sq.tail + 1) % kScoQueue;
         }
         unlock();
         return n;
@@ -335,6 +358,18 @@ public:
             for (int i = 0; i < n; ++i) data[i] = buf[i];
         unlock();
         return n;
+    }
+
+    // Selects the voice interface's alternate setting (0 stops voice) and,
+    // for a nonzero one, starts receiving. 0 = ok.
+    int32_t bt_sco(int32_t dev, uint8_t alt) {
+        if (dev < 0 || dev >= count_ || devices_[dev].bt < 0) return -1;
+        Device& d = devices_[dev];
+        if (d.sco_iface < 0 || alt >= kScoAlts || (alt && !d.sco_in_mps[alt])) return -1;
+        lock();
+        const int32_t rc = select_sco(d, alt) ? 0 : -1;
+        unlock();
+        return rc;
     }
 
     // USB disk `index` (counting only mass-storage devices that came up).
@@ -766,6 +801,7 @@ private:
     // Finds the first HID boot keyboard or mouse interface and its interrupt-IN endpoint.
     void parse_config(Device& d, const uint8_t* b, int len) {
         bool in_boot_hid = false, in_storage = false, in_bt = false;
+        int sco_alt = -1;
         for (int off = 0; off + 2 <= len && b[off] >= 2; off += b[off]) {
             const uint8_t type = b[off + 1];
             if (type == 4 && off + 9 <= len) {  // interface
@@ -789,6 +825,24 @@ private:
                 // Bluetooth primary controller: only interface 0, alternate 0 (SCO audio lives on 1).
                 in_bt = !d.bt_iface_seen && b[off + 5] == 0xE0 && b[off + 6] == 1 && b[off + 7] == 1 && b[off + 3] == 0;
                 if (in_bt) d.bt_iface_seen = true;
+                // Its voice interface: the next E0/01/01 interface, each alternate setting.
+                sco_alt = -1;
+                if (d.bt_iface_seen && !in_bt && b[off + 5] == 0xE0 && b[off + 6] == 1 && b[off + 7] == 1 &&
+                    b[off + 3] < kScoAlts && (d.sco_iface < 0 || d.sco_iface == b[off + 2])) {
+                    d.sco_iface = int8_t(b[off + 2]);
+                    sco_alt = b[off + 3];
+                }
+            } else if (type == 5 && off + 7 <= len && sco_alt >= 0 && (b[off + 3] & 3) == 1) {  // isochronous
+                const uint8_t addr = b[off + 2];
+                const uint16_t mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
+                if (addr & 0x80) {
+                    d.sco_in_dci = uint8_t((addr & 0xF) * 2 + 1);
+                    d.sco_in_mps[sco_alt] = mps;
+                } else {
+                    d.sco_out_dci = uint8_t((addr & 0xF) * 2);
+                    d.sco_out_mps[sco_alt] = mps;
+                }
+                d.sco_interval = b[off + 6];
             } else if (type == 5 && off + 7 <= len && in_bt) {  // Bluetooth endpoints
                 const uint8_t addr = b[off + 2], attr = b[off + 3];
                 const uint16_t mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
@@ -936,6 +990,115 @@ private:
                               uint64_t(d.acl_queued++ % kBtTrbs) * kBtAclBuf;
         d.ring_in.push(uint32_t(phys), uint32_t(phys >> 32), kBtAclBuf, trb_type(kTrbNormal) | kTrbIoc | kTrbIsp);
         ring_doorbell(d.slot, d.in_dci);
+    }
+
+    // ------------------------------------------------------- Bluetooth voice
+
+    // Drops the old isochronous endpoints, switches the alternate setting and
+    // adds the new ones (xHCI 4.6.6: Configure Endpoint with drop and add flags).
+    bool select_sco(Device& d, uint8_t alt) {
+        if (alt == d.sco_alt) return true;
+        if (!d.sco_bufs.virt) {
+            if (!d.sco_in_ring.init(ops_) || (d.sco_out_dci && !d.sco_out_ring.init(ops_))) return false;
+            if (ops_->dma_alloc(2 * kScoTrbs * kScoBuf, &d.sco_bufs) != 0) return false;
+        }
+        const uint32_t bits = (1u << d.sco_in_dci) | (d.sco_out_dci ? 1u << d.sco_out_dci : 0);
+        if (d.sco_alt) {
+            for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(d.in_ctx.virt)[i] = 0;
+            volatile uint32_t* control_ctx = ctx(d.in_ctx, 0);
+            control_ctx[0] = bits;
+            control_ctx[1] = 1;
+            volatile uint32_t* sl = ctx(d.in_ctx, 1);
+            const volatile uint32_t* out_slot = ctx(d.out_ctx, 0);
+            for (int i = 0; i < 4; ++i) sl[i] = out_slot[i];
+            sl[3] = 0;
+            command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr);
+            d.sco_alt = 0;
+        }
+        if (control(d, 0x01, 11, alt, uint16_t(d.sco_iface), 0, 0) < 0) {  // SET_INTERFACE
+            clear_ep0_halt(d);
+            return false;
+        }
+        if (alt == 0) return true;
+
+        // Interval as 2^n * 125 us: high speed counts microframes, full speed frames.
+        const uint32_t b_interval = d.sco_interval ? d.sco_interval : 1;
+        const uint32_t interval = d.info.speed >= 3 ? b_interval - 1 : b_interval - 1 + 3;
+        for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(d.in_ctx.virt)[i] = 0;
+        volatile uint32_t* control_ctx = ctx(d.in_ctx, 0);
+        control_ctx[1] = 1u | bits;
+        volatile uint32_t* sl = ctx(d.in_ctx, 1);
+        const volatile uint32_t* out_slot = ctx(d.out_ctx, 0);
+        for (int i = 0; i < 4; ++i) sl[i] = out_slot[i];
+        const uint32_t last_now = (sl[0] >> 27) & 0x1F;
+        uint32_t last = d.sco_in_dci > d.sco_out_dci ? d.sco_in_dci : d.sco_out_dci;
+        if (last_now > last) last = last_now;
+        sl[0] = (sl[0] & ~(0x1Fu << 27)) | (last << 27);
+        sl[3] = 0;
+        const auto setup = [&](uint8_t dci, uint16_t mps, uint32_t ep_type, const Ring& ring) {
+            volatile uint32_t* ep = ctx(d.in_ctx, 1 + dci);
+            ep[0] = interval << 16;
+            ep[1] = (uint32_t(mps) << 16) | (ep_type << 3);  // isochronous: no error retries
+            const uint64_t deq = ring.dequeue_for_reset();
+            ep[2] = uint32_t(deq);
+            ep[3] = uint32_t(deq >> 32);
+            ep[4] = (uint32_t(mps) << 16) | mps;  // max ESIT payload, average TRB length
+        };
+        setup(d.sco_in_dci, d.sco_in_mps[alt], 5, d.sco_in_ring);
+        if (d.sco_out_dci) setup(d.sco_out_dci, d.sco_out_mps[alt], 1, d.sco_out_ring);
+        if (command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr) != kCcSuccess)
+            return false;
+        d.sco_alt = alt;
+        d.sco_in_queued = d.sco_in_done = 0;
+        d.sco_out_queued = d.sco_out_done = 0;
+        for (int i = 0; i < kScoTrbs; ++i) queue_sco_in(d);
+        return true;
+    }
+
+    void queue_sco_in(Device& d) {
+        if (!d.sco_alt) return;
+        const uint64_t phys = d.sco_bufs.phys + uint64_t(d.sco_in_queued++ % kScoTrbs) * kScoBuf;
+        d.sco_in_ring.push(uint32_t(phys), uint32_t(phys >> 32), d.sco_in_mps[d.sco_alt],
+                           trb_type(kTrbIsoch) | kTrbIoc | kTrbIsp | kTrbSia);
+        ring_doorbell(d.slot, d.sco_in_dci);
+    }
+
+    void sco_received(Device& d, uint32_t slot, uint32_t code, uint32_t left) {
+        if (code != kCcSuccess && code != kCcShortPacket) return;
+        const uint32_t size = d.sco_in_mps[d.sco_alt];
+        const uint32_t len = left < size ? size - left : 0;
+        if (len == 0) return;
+        ScoQueue& q = sco_queues_[d.bt];
+        const int next = (q.head + 1) % kScoQueue;
+        if (next == q.tail) {
+            ++q.dropped;
+            return;
+        }
+        const auto* src = static_cast<const uint8_t*>(d.sco_bufs.virt) + slot * kScoBuf;
+        ScoChunk& c = q.chunks[q.head];
+        c.len = uint8_t(len);
+        for (uint32_t i = 0; i < len; ++i) c.data[i] = src[i];
+        q.head = next;
+    }
+
+    // One SCO packet (header included), split into isochronous packets.
+    int32_t send_sco(Device& d, const uint8_t* data, uint32_t len) {
+        if (!d.sco_alt || !d.sco_out_dci) return -1;
+        const uint32_t mps = d.sco_out_mps[d.sco_alt];
+        if (mps == 0) return -1;
+        process_events();
+        const uint32_t packets = (len + mps - 1) / mps;
+        if (d.sco_out_queued - d.sco_out_done + packets > kScoTrbs) return -1;  // full: drop it
+        for (uint32_t off = 0; off < len; off += mps) {
+            const uint32_t n = len - off < mps ? len - off : mps;
+            const uint32_t slot = kScoTrbs + d.sco_out_queued++ % kScoTrbs;
+            auto* buf = static_cast<uint8_t*>(d.sco_bufs.virt) + slot * kScoBuf;
+            for (uint32_t i = 0; i < n; ++i) buf[i] = data[off + i];
+            const uint64_t phys = d.sco_bufs.phys + uint64_t(slot) * kScoBuf;
+            d.sco_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), n, trb_type(kTrbIsoch) | kTrbIoc | kTrbSia);
+        }
+        ring_doorbell(d.slot, d.sco_out_dci);
+        return 0;
     }
 
     // Copies a finished event or ACL transfer into the adapter's queue.
@@ -1224,6 +1387,11 @@ private:
         } else if (d->bt >= 0 && ep == d->in_dci) {
             bt_received(*d, 2, kBtTrbs + d->acl_done++ % kBtTrbs, kBtAclBuf, code, d2 & 0xFFFFFF);
             queue_bt_acl(*d);
+        } else if (d->bt >= 0 && d->sco_alt && ep == d->sco_in_dci) {
+            sco_received(*d, d->sco_in_done++ % kScoTrbs, code, d2 & 0xFFFFFF);
+            queue_sco_in(*d);
+        } else if (d->bt >= 0 && ep == d->sco_out_dci) {
+            ++d->sco_out_done;
         } else if ((d->storage || d->bt >= 0) && (ep == d->in_dci || ep == d->out_dci)) {
             d->bulk_code = code;
             d->bulk_done = true;
@@ -1370,6 +1538,16 @@ private:
         uint32_t dropped = 0;
     };
     BtQueue bt_queues_[kMaxBt]{};
+    struct ScoChunk {
+        uint8_t len = 0;
+        uint8_t data[kScoBuf] = {};
+    };
+    struct ScoQueue {
+        ScoChunk chunks[kScoQueue]{};
+        int head = 0, tail = 0;
+        uint32_t dropped = 0;
+    };
+    ScoQueue sco_queues_[kMaxBt]{};
     int bt_count_ = 0;
     dhi_input_event queue_[kEventQueue]{};
     int q_head_ = 0, q_tail_ = 0;
@@ -1410,6 +1588,11 @@ extern "C" int32_t aero_xhci_bt_send(int32_t bt, uint8_t type, const void* data,
 extern "C" int32_t aero_xhci_bt_recv(int32_t bt, uint8_t* type, void* data, uint32_t max) {
     if (bt < 0 || bt / kMaxDevices >= g_count || data == nullptr || type == nullptr) return -1;
     return g_controllers[bt / kMaxDevices].bt_recv(bt % kMaxDevices, type, static_cast<uint8_t*>(data), max);
+}
+
+extern "C" int32_t aero_xhci_bt_sco(int32_t bt, uint8_t alt) {
+    if (bt < 0 || bt / kMaxDevices >= g_count) return -1;
+    return g_controllers[bt / kMaxDevices].bt_sco(bt % kMaxDevices, alt);
 }
 
 extern "C" int32_t aero_xhci_bt_control(int32_t bt, uint8_t req_type, uint8_t request, uint16_t value,

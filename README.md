@@ -47,7 +47,7 @@ prefer) comes later; those drives also offer bulk-only, so they work now.
 
 Since 0.8 USB Bluetooth adapters come up. The xHCI driver carries HCI over USB (commands on
 the control endpoint, events on the interrupt endpoint, ACL data on the bulk endpoints), the
-kernel's Bluetooth host (`kernel/src/bt.rs`) brings each adapter up (reset, version, address,
+kernel's Bluetooth host (`kernel/src/bt/`) brings each adapter up (reset, version, address,
 buffer sizes, event masks) and scans for classic devices (inquiry with extended results) and
 Bluetooth LE devices (active scan) side by side, showing each device's name, signal strength
 and kind (gamepad, keyboard, mouse, headset, ...). MediaTek MT7921 and MT7922 adapters (the
@@ -70,9 +70,22 @@ standard gamepad works without a per-model driver; `gamepad` shows what each pad
 A paired pad reconnects by itself when switched on (the adapter keeps page scan on and accepts
 only paired devices). Pairings live in memory until AeroForge gets a writable disk, so pads have
 to be paired again after a restart. Programs cannot read the gamepad yet, and Bluetooth LE
-gamepads (HID over GATT) and the microphone come next. The simulated adapter also plays a
-classic gamepad that pairs, sends input, switches off and on and reconnects, which the boot
-test drives through the shell.
+gamepads (HID over GATT) come next. The simulated adapter also plays a classic gamepad that
+pairs, sends input, switches off and on and reconnects, which the boot test drives through the
+shell.
+
+Since 0.10 Bluetooth headset microphones work. `bt pair <address>` on a headset finds no HID
+record over SDP, so it looks up the hands-free (or the older headset) record for the RFCOMM
+channel, opens RFCOMM (TS 07.10 with credit flow control) and acts as the audio gateway: it
+answers the headset's AT commands as a phone with no call would, until the service level
+connection is up. `mic record [seconds]` then opens a voice (SCO) link, 16-bit samples at 8 kHz
+over CVSD, which arrive through the adapter's isochronous USB endpoint (the xHCI driver
+switches the voice interface's alternate setting and queues isochronous transfers), and reports
+the length, peak and RMS level and the pitch; `mic` lists headsets. AeroForge also answers SDP
+queries for its own audio gateway record, so a paired headset that is switched on reconnects by
+itself. There is no sound output or audio API for programs yet: that comes with the HDA driver.
+The simulated headset pairs, holds a 440 Hz tone up to its microphone, switches off and on and
+reconnects, and the boot test records it before and after.
 
 | Area | Status |
 |---|---|
@@ -86,13 +99,13 @@ test drives through the shell.
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
-| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, Bluetooth HCI transport, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
-| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection against the simulated adapter, the security audit and self-test, the config read and the whole IPC demo |
+| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -130,7 +143,9 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
   src/pci.rs              PCIe enumeration
   src/{block,fat,vfs}.rs  block devices and partitions, FAT32, the mount at /
   src/bt/                 Bluetooth host: HCI bring-up, scanning, pairing (mod.rs),
-                          L2CAP (l2cap.rs), SDP (sdp.rs), HID gamepads (hid.rs)
+                          L2CAP (l2cap.rs), SDP client and server (sdp.rs), HID
+                          gamepads (hid.rs), RFCOMM (rfcomm.rs), hands-free audio
+                          gateway (hfp.rs)
   src/modules.rs          boot modules: user programs and firmware
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
@@ -153,7 +168,7 @@ tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/dis
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 tools/make-usb-disk.sh    builds the USB stick image (MBR + FAT32) from tools/usb-files/
 tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
-tools/fakebt/             simulated USB Bluetooth adapter and gamepad for QEMU (usbredir, C)
+tools/fakebt/             simulated USB Bluetooth adapter, gamepad and headset for QEMU (usbredir, C)
 tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)
 ```
 

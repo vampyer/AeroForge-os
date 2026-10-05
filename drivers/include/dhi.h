@@ -151,6 +151,7 @@ int32_t aero_xhci_bt(int32_t ctrl, int32_t index, dhi_usb_device *out);
 
 #define DHI_BT_COMMAND 1u  /* HCI packet types, as in the UART transport */
 #define DHI_BT_ACL     2u
+#define DHI_BT_SCO     3u  /* voice: sent on, and received from, the isochronous endpoints */
 #define DHI_BT_EVENT   4u
 
 /* Sends one HCI command (on EP0) or ACL packet (on bulk OUT), header
@@ -162,6 +163,12 @@ int32_t aero_xhci_bt_send(int32_t bt, uint8_t type, const void *data, uint32_t l
  * packets: the caller reassembles. Returns the length, or 0 if nothing is
  * waiting. Never blocks. */
 int32_t aero_xhci_bt_recv(int32_t bt, uint8_t *type, void *data, uint32_t max);
+
+/* Selects the alternate setting of the adapter's voice (SCO) interface:
+ * 0 stops voice, a higher one gives more isochronous bandwidth (2 for one
+ * 16-bit CVSD link). Received voice then arrives as DHI_BT_SCO chunks
+ * (one isochronous packet each). 0 = ok. */
+int32_t aero_xhci_bt_sco(int32_t bt, uint8_t alt);
 
 /* A raw control transfer on EP0 for vendor set-up (firmware download).
  * Returns the bytes transferred, or -1 (for example on a STALL). */
