@@ -33,6 +33,11 @@ fn on_irq() {
 
 pub static CONTROLLERS: IrqMutex<Vec<Controller>> = IrqMutex::new(Vec::new());
 
+/// Do all USB controllers raise interrupts (so their events need no polling)?
+pub fn interrupts_on() -> bool {
+    CONTROLLERS.lock().iter().all(|c| c.irq.is_some())
+}
+
 pub static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 pub static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
 pub static MOUSE_BUTTONS: AtomicU32 = AtomicU32::new(0);
@@ -180,7 +185,7 @@ pub fn poll_thread(_: u64) {
 ", c.id)),
         }
     }
-    let with_irq = CONTROLLERS.lock().iter().all(|c| c.irq.is_some());
+    let with_irq = interrupts_on();
     loop {
         for (k, &id) in ids.iter().enumerate() {
             let n = unsafe { dhi::aero_xhci_poll(id, events.as_mut_ptr(), events.len() as i32) };

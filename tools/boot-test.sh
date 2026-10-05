@@ -48,7 +48,9 @@
 # 'spreadtest' leaves its busy threads at one, three, one and three per CPU:
 # periodic balancing must even them out although no CPU goes idle.
 # 'wakeups' counts timer interrupts per CPU over a second: cpu0, which only
-# runs the (sleeping) shell, must be tickless, with no more than 5.
+# runs the (sleeping) shell, must be tickless, with no more than 5, and
+# all CPUs together must take fewer than 100 (one ticking CPU's worth): the
+# USB, network, mixer and Bluetooth threads must not wake every tick.
 # Last, 'irq'
 # must show that the
 # USB, NVMe and SATA (AHCI) controllers and the igb network card have been
@@ -309,6 +311,8 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }
         grep -q "^  cpu0: [0-5] timer interrupts" "$LOG" \
             || { fail "an idle CPU kept taking timer ticks (tickless idle not working)"; }
+        grep -qE "^  [0-9]{1,2} timer interrupts in 1 s on" "$LOG" \
+            || { fail "the CPUs took 100 or more timer interrupts in an idle second: a kernel thread is still waking every tick"; }
         grep -q "xhci0: MSI-X interrupts on, polling at once when events arrive" "$LOG" || { fail "USB controller interrupts (MSI-X) not set up"; }
         grep -q "vector 0x[0-9a-f]*  MSI-X -> cpu[0-9]* *[1-9][0-9]* interrupts  xhci0" "$LOG" || { fail "the USB controller raised no interrupts"; }
         grep -q "nvme0: MSI-X completion interrupts on" "$LOG" || { fail "NVMe completion interrupts (MSI-X) not set up"; }

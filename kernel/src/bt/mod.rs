@@ -264,7 +264,15 @@ pub fn bt_thread(_: u64) {
             h.check_audio();
             h.check_le();
         }
-        WAKE.wait(1); // a USB interrupt (HCI event or data) ends it early
+        // A USB interrupt (HCI event or data) or a new job from the shell
+        // ends the wait early. With interrupts and nothing in progress the
+        // timeout only bounds the deadline checks, so it can be 100 ms and
+        // an idle CPU is not woken every tick.
+        let busy = !crate::usb::interrupts_on()
+            || PAIR.lock().as_ref().is_some_and(|j| j.result.is_none())
+            || RECORD.lock().as_ref().is_some_and(|j| j.result.is_none())
+            || hosts.iter().any(|h| h.up && h.busy());
+        WAKE.wait(if busy { 1 } else { 10 });
     }
 }
 
@@ -281,6 +289,7 @@ pub fn scan(seconds: u32) -> Result<(), &'static str> {
         FOUND.lock().clear();
         *job = Some(ScanJob { seconds, done: false });
     }
+    WAKE.signal();
     while SCAN.lock().as_ref().is_some_and(|j| !j.done) {
         sched::sleep_ticks(10);
     }
@@ -300,6 +309,7 @@ pub fn pair(address: [u8; 6]) -> Result<String, String> {
         }
         *job = Some(PairJob { address, started: false, result: None });
     }
+    WAKE.signal();
     loop {
         if let Some(r) = PAIR.lock().as_ref().and_then(|j| j.result.clone()) {
             return r;
@@ -318,6 +328,7 @@ pub fn record(seconds: u32) -> Result<Recording, String> {
         }
         *job = Some(RecordJob { seconds, started: false, result: None });
     }
+    WAKE.signal();
     loop {
         if let Some(r) = RECORD.lock().as_ref().and_then(|j| j.result.clone()) {
             return r;
@@ -611,6 +622,13 @@ impl Host {
 
     /// Handles everything that arrived and sends whatever the controller has
     /// room for.
+    /// Is anything under way that needs servicing every tick: voice audio,
+    /// a recording, or packets and commands still waiting to go out?
+    fn busy(&self) -> bool {
+        self.voice.is_some() || self.rec.is_some() || self.waiting.is_some()
+            || !self.commands.is_empty() || !self.acl_out.is_empty() || !self.le_out.is_empty()
+    }
+
     fn service(&mut self) {
         self.pump();
         while let Some(ev) = self.events.pop_front() {
