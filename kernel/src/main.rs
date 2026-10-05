@@ -25,6 +25,7 @@ mod limine;
 mod memory;
 mod modules;
 mod net;
+mod ntfs;
 mod pci;
 mod percpu;
 mod pic;
@@ -242,10 +243,11 @@ extern "C" fn kmain() -> ! {
     }
     let mounts = vfs::mount_all();
     for m in &mounts {
-        kok!("{} volume \"{}\" on {} mounted at {}", m.vol.kind(), m.vol.label(), m.vol.dev().name(), m.path);
+        kok!("{} volume \"{}\" on {} mounted at {}{}", m.vol.kind(), m.vol.label(), m.vol.dev().name(), m.path,
+            if m.vol.read_only() { " (read-only)" } else { "" });
     }
     if mounts.is_empty() {
-        kprintln!("[WARN] no FAT32 or exFAT volume found, running without files");
+        kprintln!("[WARN] no FAT32, exFAT or NTFS volume found, running without files");
     }
 
     // ---- Scheduler ----

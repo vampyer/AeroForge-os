@@ -92,6 +92,7 @@ fn fs_error(e: &'static str) -> i64 {
         "file not found" | "not a directory" | "no filesystem mounted" | "no filesystem mounted at /" => E_NOTFOUND,
         "disk full" => E_FULL,
         "already exists" => E_EXISTS,
+        "NTFS volumes are read-only for now" => E_RIGHTS,
         _ => E_INVAL,
     }
 }

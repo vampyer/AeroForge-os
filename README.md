@@ -190,6 +190,21 @@ many-cluster file, saves five checkpoints into a folder (enough to grow it), ove
 deletes a file and creates a folder. After QEMU exits, `fsck.exfat` must find the stick clean
 and `tools/exfat.py` must read back what was saved.
 
+Since 0.21 NTFS drives, the ones Windows lives on, can be read. NTFS volumes are mounted
+read-only at `/<device>` (never at `/`). The driver reads the Master File Table, including
+records split across several MFT entries by an attribute list, walks folder index B-trees,
+follows the cluster runs of fragmented files, and reads holes in sparse files as zeros.
+Lookups use the volume's own `$UpCase` table. Metadata files and `$Recycle.Bin` are hidden
+from the root listing, as in Explorer. Compressed and encrypted files are refused, and so are
+writes: NTFS keeps a journal that a writer has to honour, which is a project of its own. A
+BitLocker-encrypted volume gets a warning to unlock it in Windows. The test drive is checked
+in as `tools/ntfs-test.part.xz` (about 110 KiB), because folders and fragmented, sparse and compressed
+files can only be put on NTFS by a real NTFS driver: `tools/make-ntfs-image.sh` rebuilds it with
+ntfs-3g, as root. The boot test attaches it as a second SATA drive. It lists a folder of 300
+photos (deep enough for an index B-tree), reads a file three folders down, and checks the
+fragmented and sparse files against checksums from ntfs-3g. It also checks that a compressed
+file and a write are refused.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -204,11 +219,11 @@ and `tools/exfat.py` must read back what was saved.
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
 | C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads and writes up to 8 KiB per command, flush), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ/WRITE DMA EXT, FLUSH CACHE EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI reads, writes and cache sync, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) and an **HD Audio** driver (CORB/RIRB, codec widget graph, output routing, one 48 kHz stereo output stream) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
-| Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and **exFAT**, both with case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
+| Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and **exFAT**, read-only **NTFS**, all with case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, an NTFS drive's folders and fragmented and sparse files, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -224,7 +239,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
 5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X) and one queue pair per CPU; AHCI interrupts and NCQ; USB Attached SCSI (UAS), xHCI MSI-X interrupts and hotplug; virtio-net, network interrupts, and sockets for user programs.
-6. Filesystems move to user-space servers behind IPC, as the design says; NTFS (read-only on real drives at first).
+6. Filesystems move to user-space servers behind IPC, as the design says; NTFS writes and compressed NTFS files.
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and TLB shootdowns so permission changes reach every CPU at once.
 
 ## Layout
@@ -245,7 +260,7 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
   src/{ipc,syscall}.rs    IPC ports, name service, system call table
   src/{acpi,smp}.rs       firmware tables, application processors
   src/pci.rs              PCIe enumeration
-  src/{block,fat,exfat,vfs}.rs  block devices and partitions, FAT32, exFAT, the mount table
+  src/{block,fat,exfat,ntfs,vfs}.rs  block devices and partitions, FAT32, exFAT, NTFS, the mount table
   src/bt/                 Bluetooth host: HCI bring-up, scanning, pairing (mod.rs),
                           L2CAP (l2cap.rs), SDP client and server (sdp.rs), HID
                           gamepads (hid.rs), RFCOMM (rfcomm.rs), hands-free audio
@@ -276,6 +291,8 @@ tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/dis
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 tools/make-usb-disk.sh    builds the USB stick images (MBR + FAT32 or exFAT) from tools/usb-files/ and tools/usb2-files/
 tools/exfat.py            puts files on an exFAT image and reads them back (boot test)
+tools/make-ntfs-disk.sh   builds the NTFS test drive from tools/ntfs-test.part.xz
+tools/make-ntfs-image.sh  rebuilds tools/ntfs-test.part.xz with ntfs-3g (needs root)
 tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
 tools/fakebt/             simulated USB Bluetooth adapter, gamepads and headset for QEMU (usbredir, C)
 tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)

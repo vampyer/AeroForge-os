@@ -1,5 +1,6 @@
 //! The (very) early file namespace. Every FAT32 and exFAT volume is
-//! mounted, readable and writable: the first one found at boot at "/", each further one at
+//! mounted readable and writable, and NTFS volumes read-only: the first
+//! writable one found at boot at "/", each further one at
 //! "/<device name>" (for example "/sata0p1"). Volumes on USB disks plugged
 //! in later are mounted the same way and go away when the disk is
 //! unplugged. Real mount tables, more filesystems and user-space filesystem
@@ -13,6 +14,7 @@ use alloc::vec::Vec;
 use crate::block::{BlockDevice, DEVICES};
 use crate::exfat::ExfatVolume;
 use crate::fat::FatVolume;
+use crate::ntfs::NtfsVolume;
 use crate::sync::IrqMutex;
 
 #[derive(Clone, Debug)]
@@ -35,6 +37,9 @@ pub trait Volume: Send + Sync {
     fn kind(&self) -> &'static str;
     fn label(&self) -> &str;
     fn dev(&self) -> &Arc<dyn BlockDevice>;
+    fn read_only(&self) -> bool {
+        false
+    }
     fn list(&self, path: &str) -> Result<Vec<DirEntry>, &'static str>;
     /// Reads up to `limit` bytes of a file.
     fn read_file(&self, path: &str, limit: usize) -> Result<Vec<u8>, &'static str>;
@@ -63,17 +68,31 @@ pub fn mount_all() -> Vec<Arc<Mount>> {
     MOUNTS.lock().clone()
 }
 
-/// Mounts `dev` if it holds a FAT32 or exFAT volume and is not mounted yet.
+/// Mounts `dev` if it holds a FAT32, exFAT or NTFS volume and is not mounted yet.
 pub fn mount(dev: Arc<dyn BlockDevice>) -> Option<Arc<Mount>> {
     if mount_point_of(dev.name()).is_some() {
         return None;
     }
-    let vol: alloc::boxed::Box<dyn Volume> = match FatVolume::mount(dev.clone()) {
-        Ok(v) => alloc::boxed::Box::new(v),
-        Err(_) => alloc::boxed::Box::new(ExfatVolume::mount(dev).ok()?),
+    let vol: alloc::boxed::Box<dyn Volume> = if let Ok(v) = FatVolume::mount(dev.clone()) {
+        alloc::boxed::Box::new(v)
+    } else if let Ok(v) = ExfatVolume::mount(dev.clone()) {
+        alloc::boxed::Box::new(v)
+    } else {
+        match NtfsVolume::mount(dev.clone()) {
+            Ok(v) => alloc::boxed::Box::new(v),
+            Err("BitLocker-encrypted volume") => {
+                crate::console::print_colored(crate::console::YELLOW, format_args!(
+                    "[WARN] {} is encrypted with BitLocker: unlock it in Windows (or turn BitLocker off) to read it here\n",
+                    dev.name()));
+                return None;
+            }
+            Err(_) => return None,
+        }
     };
     let mut mounts = MOUNTS.lock();
-    let path = if mounts.is_empty() { String::from("/") } else { format!("/{}", vol.dev().name()) };
+    // "/" goes to the first writable volume; the others get "/<device>".
+    let root_taken = mounts.iter().any(|m| m.path == "/");
+    let path = if !root_taken && !vol.read_only() { String::from("/") } else { format!("/{}", vol.dev().name()) };
     let m = Arc::new(Mount { path, vol });
     mounts.push(m.clone());
     Some(m)
