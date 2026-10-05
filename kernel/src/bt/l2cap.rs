@@ -306,7 +306,7 @@ impl Host {
                 let c = &mut self.conns[conn];
                 c.sdp_transaction = 1;
                 c.sdp_lists.clear();
-                let req = sdp::request(1, &[]);
+                let req = sdp::request(1, sdp::HID_SERVICE, sdp::HID_DESCRIPTOR_LIST, &[]);
                 self.send_frame(conn, local_remote(&self.conns[conn], local), &req);
             }
             PSM_HID_CONTROL => {
@@ -359,7 +359,7 @@ impl Host {
         match result {
             Ok(cont) if !cont.is_empty() => {
                 c.sdp_transaction = c.sdp_transaction.wrapping_add(1);
-                let req = sdp::request(c.sdp_transaction, &cont);
+                let req = sdp::request(c.sdp_transaction, sdp::HID_SERVICE, sdp::HID_DESCRIPTOR_LIST, &cont);
                 let remote = local_remote(c, local);
                 self.send_frame(conn, remote, &req);
             }
