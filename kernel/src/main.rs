@@ -26,6 +26,7 @@ mod ipc;
 mod limine;
 mod memory;
 mod modules;
+mod msi;
 mod net;
 mod ntfs;
 mod pci;

@@ -159,6 +159,10 @@ int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device *out);
  * and gamepads again. */
 uint32_t aero_xhci_generation(int32_t ctrl);
 
+/* Turns on the controller's event interrupt (interrupter 0). The kernel
+ * sets up MSI-X or MSI first; the next aero_xhci_poll acknowledges it. */
+void aero_xhci_enable_irq(int32_t ctrl);
+
 /* USB mass storage (bulk-only transport, SCSI) found during init. Fills
  * `out` for the controller's disk `index` (0, 1, ...) and returns a disk id
  * for aero_xhci_read, or -1 when there is no such disk. */

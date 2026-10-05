@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::interrupts::InterruptFrame;
 use crate::process::Process;
@@ -361,6 +361,72 @@ pub fn sleep_ticks(n: u64) {
         }
         schedule();
     });
+}
+
+/// Sleeps up to `n` ticks, unless `flag` is set (checked under the run
+/// queue lock, so a `wake_sleeper` after setting the flag is never lost).
+fn sleep_ticks_unless(n: u64, flag: &AtomicBool) {
+    arch::without_interrupts(|| {
+        {
+            let mut rq = percpu::this().rq.lock();
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let cur = rq.current.clone().unwrap();
+            cur.wake_at.store(ticks() + n.max(1), Ordering::Relaxed);
+            cur.set_state(State::Sleeping);
+            rq.sleepers.push(cur);
+        }
+        schedule();
+    });
+}
+
+/// Ends a thread's sleep early (it runs as soon as its CPU gets to it).
+pub fn wake_sleeper(t: &Arc<Thread>) {
+    let Some(cpu) = percpu::get(t.cpu) else { return };
+    let woke = {
+        let mut rq = cpu.rq.lock();
+        if t.state() == State::Sleeping {
+            rq.sleepers.retain(|s| !Arc::ptr_eq(s, t));
+            t.set_state(State::Ready);
+            rq.ready.push_back(t.clone());
+            true
+        } else {
+            false
+        }
+    };
+    if woke && cpu.index != percpu::this().index {
+        crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
+    }
+}
+
+/// Something one kernel thread waits for, such as a device interrupt, with
+/// a timeout so a missed signal only costs latency. One waiter at a time.
+pub struct Event {
+    pending: AtomicBool,
+    waiter: IrqMutex<Option<Arc<Thread>>>,
+}
+
+impl Event {
+    pub const fn new() -> Self {
+        Self { pending: AtomicBool::new(false), waiter: IrqMutex::new(None) }
+    }
+
+    /// Waits until signalled or `ticks` pass. True if it was signalled.
+    pub fn wait(&self, ticks: u64) -> bool {
+        *self.waiter.lock() = Some(current());
+        sleep_ticks_unless(ticks, &self.pending);
+        *self.waiter.lock() = None;
+        self.pending.swap(false, Ordering::SeqCst)
+    }
+
+    /// Safe from interrupt handlers.
+    pub fn signal(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+        if let Some(t) = self.waiter.lock().clone() {
+            wake_sleeper(&t);
+        }
+    }
 }
 
 /// Marks the current thread blocked. The caller must have put it on some wait

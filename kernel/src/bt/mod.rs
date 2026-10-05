@@ -131,6 +131,9 @@ struct PairJob {
     result: Option<Result<String, String>>,
 }
 
+/// Signalled by USB controller interrupts (see usb::IRQ).
+pub static WAKE: sched::Event = sched::Event::new();
+
 pub static ADAPTERS: IrqMutex<Vec<Adapter>> = IrqMutex::new(Vec::new());
 pub static FOUND: IrqMutex<Vec<Found>> = IrqMutex::new(Vec::new());
 pub static BONDS: IrqMutex<Vec<Bond>> = IrqMutex::new(Vec::new());
@@ -261,7 +264,7 @@ pub fn bt_thread(_: u64) {
             h.check_audio();
             h.check_le();
         }
-        sched::sleep_ticks(1);
+        WAKE.wait(1); // a USB interrupt (HCI event or data) ends it early
     }
 }
 
@@ -682,7 +685,7 @@ impl Host {
                 self.command_credits = self.command_credits.max(1);
                 return Err(alloc::format!("no answer to HCI command {:04x}", opcode));
             }
-            sched::sleep_ticks(1);
+            WAKE.wait(1);
         }
     }
 
