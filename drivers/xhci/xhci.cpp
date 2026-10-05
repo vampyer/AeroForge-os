@@ -78,6 +78,11 @@ constexpr int kMaxDevices = 16;
 constexpr int kReportTrbs = 16;       // interrupt-IN transfers kept in flight
 constexpr int kReportSize = 16;
 constexpr int kEventQueue = 128;
+constexpr int kBtTrbs = 8;            // Bluetooth event and ACL-in transfers kept in flight
+constexpr int kBtEventBuf = 512;
+constexpr int kBtAclBuf = 1024;
+constexpr int kBtQueue = 32;          // received Bluetooth chunks waiting for the kernel
+constexpr int kMaxBt = 2;             // Bluetooth adapters per controller
 
 // ---- small helpers ----
 
@@ -198,6 +203,17 @@ struct Device {
     char serial[21] = {};
     volatile bool bulk_done = false;
     volatile uint32_t bulk_code = 0;
+
+    // Bluetooth HCI transport (USB class E0/01/01): commands on EP0, events
+    // on an interrupt-IN endpoint, ACL data on the bulk pair (in_*/out_*, as
+    // for storage; a device is one or the other).
+    int8_t bt = -1;                        // index into the controller's Bluetooth queues
+    bool bt_iface_seen = false;
+    uint8_t evt_dci = 0, evt_interval = 0;
+    uint16_t evt_mps = 0;
+    Ring evt_ring{};
+    dhi_dma bt_bufs{};                     // kBtTrbs event buffers, then kBtTrbs ACL buffers
+    uint32_t evt_queued = 0, evt_done = 0, acl_queued = 0, acl_done = 0;
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -243,14 +259,81 @@ public:
         if (base_ == nullptr) return 0;
         // A disk read on another CPU owns the event ring right now; its
         // events (including key presses) are queued and handed out next time.
-        if (__atomic_exchange_n(&busy_, true, __ATOMIC_ACQUIRE)) return 0;
+        if (!try_lock()) return 0;
         process_events();
         int32_t n = 0;
         while (n < max && q_tail_ != q_head_) {
             out[n++] = queue_[q_tail_];
             q_tail_ = (q_tail_ + 1) % kEventQueue;
         }
-        __atomic_store_n(&busy_, false, __ATOMIC_RELEASE);
+        unlock();
+        return n;
+    }
+
+    // Bluetooth adapter `index` on this controller: its device number, or -1.
+    int32_t bt_device(int32_t index, dhi_usb_device* out) const {
+        for (int i = 0; i < count_; ++i) {
+            if (devices_[i].bt == index) {
+                if (out) *out = devices_[i].info;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // HCI command (type 1) on EP0 or ACL data (type 2) on bulk OUT. 0 = ok.
+    int32_t bt_send(int32_t dev, uint8_t type, const uint8_t* data, uint32_t len) {
+        if (dev < 0 || dev >= count_ || devices_[dev].bt < 0 || len == 0 || len > 2048) return -1;
+        Device& d = devices_[dev];
+        lock();
+        auto* buf = static_cast<uint8_t*>(d.ms_buf.virt);
+        for (uint32_t i = 0; i < len; ++i) buf[i] = data[i];
+        int32_t rc = -1;
+        if (type == 1) {
+            rc = control(d, 0x20, 0, 0, 0, uint16_t(len), d.ms_buf.phys) == int(len) ? 0 : -1;
+        } else if (type == 2) {
+            const uint32_t code = bulk(d, false, d.ms_buf.phys, len);
+            if (code == kCcStall) clear_halt(d, false);
+            rc = code == kCcSuccess ? 0 : -1;
+        }
+        unlock();
+        return rc;
+    }
+
+    // Next received chunk (type 4 event bytes, 2 ACL bytes): length, or 0.
+    int32_t bt_recv(int32_t dev, uint8_t* type, uint8_t* out, uint32_t max) {
+        if (dev < 0 || dev >= count_ || devices_[dev].bt < 0) return -1;
+        if (!try_lock()) return 0;
+        process_events();
+        BtQueue& q = bt_queues_[devices_[dev].bt];
+        int32_t n = 0;
+        if (q.tail != q.head) {
+            const BtChunk& c = q.chunks[q.tail];
+            n = int32_t(c.len < max ? c.len : max);
+            *type = c.type;
+            for (int32_t i = 0; i < n; ++i) out[i] = c.data[i];
+            q.tail = (q.tail + 1) % kBtQueue;
+        }
+        unlock();
+        return n;
+    }
+
+    // A raw control transfer on EP0, for vendor set-up (firmware download).
+    // Returns the bytes transferred or -1.
+    int32_t bt_control(int32_t dev, uint8_t req_type, uint8_t request, uint16_t value, uint16_t index,
+                       uint8_t* data, uint16_t len) {
+        if (dev < 0 || dev >= count_ || devices_[dev].bt < 0 || len > 2048) return -1;
+        Device& d = devices_[dev];
+        lock();
+        auto* buf = static_cast<uint8_t*>(d.ms_buf.virt);
+        const bool in = req_type & 0x80;
+        if (!in)
+            for (uint16_t i = 0; i < len; ++i) buf[i] = data[i];
+        const int n = control(d, req_type, request, value, index, len, d.ms_buf.phys);
+        if (n < 0) clear_ep0_halt(d);
+        if (in && n > 0)
+            for (int i = 0; i < n; ++i) data[i] = buf[i];
+        unlock();
         return n;
     }
 
@@ -271,13 +354,13 @@ public:
         Device& d = devices_[dev];
         if (count == 0 || lba + count > d.disk.block_count || uint64_t(count) * d.disk.block_size > d.disk.max_transfer)
             return -1;
-        while (__atomic_exchange_n(&busy_, true, __ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+        lock();
         int rc = -1;
         for (int attempt = 0; attempt < 2 && rc != 0; ++attempt) {
             rc = read_blocks(d, lba, count, buf_phys);
             if (rc == 1) request_sense(d);  // clears the error so the retry can work
         }
-        __atomic_store_n(&busy_, false, __ATOMIC_RELEASE);
+        unlock();
         return rc == 0 ? 0 : -1;
     }
 
@@ -451,6 +534,8 @@ private:
         ++count_;
         if (d.hid != HidKind::None && !start_hid(d)) d.hid = HidKind::None;
         if (d.storage && !start_storage(d)) d.storage = false;
+        if (d.bt_iface_seen && d.evt_dci && d.in_dci && d.out_dci && bt_count_ < kMaxBt && start_bt(d))
+            d.bt = int8_t(bt_count_++);
 
         static const char* const kSpeed[] = {"?", "full speed", "low speed", "high speed", "SuperSpeed", "SuperSpeed+ 10 Gb/s", "SuperSpeed+ 20 Gb/s"};
         Line l;
@@ -463,6 +548,7 @@ private:
         } else if (d.info.iface_class == 8) {
             l.s(", mass storage (not usable)");
         }
+        if (d.bt >= 0) l.s(", Bluetooth adapter");
         const bool hub = d.info.dev_class == 9 || d.info.iface_class == 9;
         if (hub) l.s(", hub");
         ops_->log(l.str());
@@ -679,7 +765,7 @@ private:
 
     // Finds the first HID boot keyboard or mouse interface and its interrupt-IN endpoint.
     void parse_config(Device& d, const uint8_t* b, int len) {
-        bool in_boot_hid = false, in_storage = false;
+        bool in_boot_hid = false, in_storage = false, in_bt = false;
         for (int off = 0; off + 2 <= len && b[off] >= 2; off += b[off]) {
             const uint8_t type = b[off + 1];
             if (type == 4 && off + 9 <= len) {  // interface
@@ -699,6 +785,25 @@ private:
                 if (in_storage) {
                     d.ms_iface = b[off + 2];
                     d.in_addr = d.out_addr = 0;
+                }
+                // Bluetooth primary controller: only interface 0, alternate 0 (SCO audio lives on 1).
+                in_bt = !d.bt_iface_seen && b[off + 5] == 0xE0 && b[off + 6] == 1 && b[off + 7] == 1 && b[off + 3] == 0;
+                if (in_bt) d.bt_iface_seen = true;
+            } else if (type == 5 && off + 7 <= len && in_bt) {  // Bluetooth endpoints
+                const uint8_t addr = b[off + 2], attr = b[off + 3];
+                const uint16_t mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
+                if ((attr & 3) == 3 && (addr & 0x80)) {
+                    d.evt_dci = uint8_t((addr & 0xF) * 2 + 1);
+                    d.evt_mps = mps;
+                    d.evt_interval = b[off + 6];
+                } else if ((attr & 3) == 2 && (addr & 0x80)) {
+                    d.in_addr = addr;
+                    d.in_dci = uint8_t((addr & 0xF) * 2 + 1);
+                    d.in_mps = mps;
+                } else if ((attr & 3) == 2) {
+                    d.out_addr = addr;
+                    d.out_dci = uint8_t((addr & 0xF) * 2);
+                    d.out_mps = mps;
                 }
             } else if (type == 5 && off + 7 <= len && in_storage) {  // bulk endpoint
                 const uint8_t addr = b[off + 2], attr = b[off + 3];
@@ -768,6 +873,90 @@ private:
         report_len_[d.slot] = uint8_t(hid_mps_ < kReportSize ? hid_mps_ : kReportSize);
         for (int i = 0; i < kReportTrbs; ++i) queue_report(d);
         return true;
+    }
+
+    // ------------------------------------------------------------ Bluetooth
+
+    bool start_bt(Device& d) {
+        if (!d.evt_ring.init(ops_) || !d.ring_in.init(ops_) || !d.ring_out.init(ops_)) return false;
+        if (ops_->dma_alloc(kBtTrbs * (kBtEventBuf + kBtAclBuf), &d.bt_bufs) != 0) return false;
+        if (ops_->dma_alloc(4096, &d.ms_buf) != 0) return false;  // outgoing commands and ACL
+
+        uint32_t interval = 0;  // as for HID: 2^n * 125 us
+        if (d.info.speed >= 3) {
+            interval = d.evt_interval ? d.evt_interval - 1u : 0u;
+        } else {
+            const uint32_t micro = uint32_t(d.evt_interval ? d.evt_interval : 1) * 8;
+            while ((2u << interval) <= micro) ++interval;
+        }
+
+        for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(d.in_ctx.virt)[i] = 0;
+        volatile uint32_t* control_ctx = ctx(d.in_ctx, 0);
+        control_ctx[1] = 1u | (1u << d.evt_dci) | (1u << d.in_dci) | (1u << d.out_dci);
+        volatile uint32_t* sl = ctx(d.in_ctx, 1);
+        const volatile uint32_t* out_slot = ctx(d.out_ctx, 0);
+        for (int i = 0; i < 4; ++i) sl[i] = out_slot[i];
+        uint32_t last = d.evt_dci;
+        if (d.in_dci > last) last = d.in_dci;
+        if (d.out_dci > last) last = d.out_dci;
+        sl[0] = (sl[0] & ~(0x1Fu << 27)) | (last << 27);
+        sl[3] = 0;
+        const auto setup = [&](uint8_t dci, uint16_t mps, uint32_t ep_type, const Ring& ring, uint32_t ep0,
+                               uint32_t avg) {
+            volatile uint32_t* ep = ctx(d.in_ctx, 1 + dci);
+            ep[0] = ep0;
+            ep[1] = (uint32_t(mps) << 16) | (ep_type << 3) | (3u << 1);
+            ep[2] = uint32_t(ring.phys()) | 1;
+            ep[3] = uint32_t(ring.phys() >> 32);
+            ep[4] = avg;
+        };
+        setup(d.evt_dci, d.evt_mps, 7, d.evt_ring, interval << 16, (uint32_t(d.evt_mps) << 16) | d.evt_mps);
+        setup(d.in_dci, d.in_mps, 6, d.ring_in, 0, 3072);
+        setup(d.out_dci, d.out_mps, 2, d.ring_out, 0, 3072);
+        if (command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr) != kCcSuccess)
+            return false;
+
+        for (int i = 0; i < kBtTrbs; ++i) {
+            queue_bt_event(d);
+            queue_bt_acl(d);
+        }
+        return true;
+    }
+
+    // Transfers complete in the order they were queued, so the n-th
+    // completion on a ring always belongs to buffer n % kBtTrbs.
+    void queue_bt_event(Device& d) {
+        const uint64_t phys = d.bt_bufs.phys + uint64_t(d.evt_queued++ % kBtTrbs) * kBtEventBuf;
+        d.evt_ring.push(uint32_t(phys), uint32_t(phys >> 32), kBtEventBuf, trb_type(kTrbNormal) | kTrbIoc | kTrbIsp);
+        ring_doorbell(d.slot, d.evt_dci);
+    }
+
+    void queue_bt_acl(Device& d) {
+        const uint64_t phys = d.bt_bufs.phys + uint64_t(kBtTrbs) * kBtEventBuf +
+                              uint64_t(d.acl_queued++ % kBtTrbs) * kBtAclBuf;
+        d.ring_in.push(uint32_t(phys), uint32_t(phys >> 32), kBtAclBuf, trb_type(kTrbNormal) | kTrbIoc | kTrbIsp);
+        ring_doorbell(d.slot, d.in_dci);
+    }
+
+    // Copies a finished event or ACL transfer into the adapter's queue.
+    // `slot` counts event buffers first, then ACL buffers.
+    void bt_received(Device& d, uint8_t type, uint32_t slot, uint32_t size, uint32_t code, uint32_t left) {
+        if (code != kCcSuccess && code != kCcShortPacket) return;
+        const uint32_t len = left < size ? size - left : 0;
+        if (len == 0) return;
+        BtQueue& q = bt_queues_[d.bt];
+        const int next = (q.head + 1) % kBtQueue;
+        if (next == q.tail) {
+            ++q.dropped;
+            return;
+        }
+        const uint32_t offset = slot < kBtTrbs ? slot * kBtEventBuf : kBtTrbs * kBtEventBuf + (slot - kBtTrbs) * kBtAclBuf;
+        const auto* src = static_cast<const uint8_t*>(d.bt_bufs.virt) + offset;
+        BtChunk& c = q.chunks[q.head];
+        c.type = type;
+        c.len = uint16_t(len);
+        for (uint32_t i = 0; i < len; ++i) c.data[i] = src[i];
+        q.head = next;
     }
 
     // ------------------------------------------------------- mass storage
@@ -949,6 +1138,14 @@ private:
         control(d, 0x02, 1, 0, in ? d.in_addr : d.out_addr, 0, 0);  // CLEAR_FEATURE(ENDPOINT_HALT)
     }
 
+    // A STALL on EP0 (a vendor request the device refuses) halts it in the
+    // controller; reset it and skip past the abandoned TRBs. The device
+    // side clears itself at the next SETUP.
+    void clear_ep0_halt(Device& d) {
+        command(0, 0, trb_type(kTrbResetEndpoint) | (1u << 16) | (uint32_t(d.slot) << 24), nullptr);
+        command(d.ep0.dequeue_for_reset(), 0, trb_type(kTrbSetTrDequeue) | (1u << 16) | (uint32_t(d.slot) << 24), nullptr);
+    }
+
     // Bulk-only mass storage reset, then clear both endpoints (BOT 5.3.4).
     void reset_recovery(Device& d) {
         control(d, 0x21, 0xFF, 0, d.ms_iface, 0, 0);
@@ -1021,7 +1218,13 @@ private:
             d->ctrl_code = code;
             d->ctrl_left = d2 & 0xFFFFFF;
             d->ctrl_done = true;
-        } else if (d->storage && (ep == d->in_dci || ep == d->out_dci)) {
+        } else if (d->bt >= 0 && ep == d->evt_dci) {
+            bt_received(*d, 4, d->evt_done++ % kBtTrbs, kBtEventBuf, code, d2 & 0xFFFFFF);
+            queue_bt_event(*d);
+        } else if (d->bt >= 0 && ep == d->in_dci) {
+            bt_received(*d, 2, kBtTrbs + d->acl_done++ % kBtTrbs, kBtAclBuf, code, d2 & 0xFFFFFF);
+            queue_bt_acl(*d);
+        } else if ((d->storage || d->bt >= 0) && (ep == d->in_dci || ep == d->out_dci)) {
             d->bulk_code = code;
             d->bulk_done = true;
         } else if (ep == d->dci) {
@@ -1149,7 +1352,25 @@ private:
     uint16_t hid_mps_ = 8;
 
     bool caps_ = false;
-    bool busy_ = false;  // event ring owner: a disk read or the poll thread
+    bool busy_ = false;  // event ring owner: a disk read, a Bluetooth call or the poll thread
+    bool try_lock() { return !__atomic_exchange_n(&busy_, true, __ATOMIC_ACQUIRE); }
+    void lock() {
+        while (__atomic_exchange_n(&busy_, true, __ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+    }
+    void unlock() { __atomic_store_n(&busy_, false, __ATOMIC_RELEASE); }
+
+    struct BtChunk {
+        uint8_t type = 0;
+        uint16_t len = 0;
+        uint8_t data[kBtAclBuf] = {};
+    };
+    struct BtQueue {
+        BtChunk chunks[kBtQueue]{};
+        int head = 0, tail = 0;
+        uint32_t dropped = 0;
+    };
+    BtQueue bt_queues_[kMaxBt]{};
+    int bt_count_ = 0;
     dhi_input_event queue_[kEventQueue]{};
     int q_head_ = 0, q_tail_ = 0;
 };
@@ -1172,6 +1393,30 @@ extern "C" int32_t aero_xhci_init(const dhi_ops* ops, uint64_t mmio_phys, int32_
 extern "C" int32_t aero_xhci_poll(int32_t ctrl, dhi_input_event* out, int32_t max) {
     if (ctrl < 0 || ctrl >= g_count || out == nullptr) return 0;
     return g_controllers[ctrl].poll(out, max);
+}
+
+// Bluetooth ids: controller * kMaxDevices + device number.
+extern "C" int32_t aero_xhci_bt(int32_t ctrl, int32_t index, dhi_usb_device* out) {
+    if (ctrl < 0 || ctrl >= g_count) return -1;
+    const int32_t dev = g_controllers[ctrl].bt_device(index, out);
+    return dev < 0 ? -1 : ctrl * kMaxDevices + dev;
+}
+
+extern "C" int32_t aero_xhci_bt_send(int32_t bt, uint8_t type, const void* data, uint32_t len) {
+    if (bt < 0 || bt / kMaxDevices >= g_count || data == nullptr) return -1;
+    return g_controllers[bt / kMaxDevices].bt_send(bt % kMaxDevices, type, static_cast<const uint8_t*>(data), len);
+}
+
+extern "C" int32_t aero_xhci_bt_recv(int32_t bt, uint8_t* type, void* data, uint32_t max) {
+    if (bt < 0 || bt / kMaxDevices >= g_count || data == nullptr || type == nullptr) return -1;
+    return g_controllers[bt / kMaxDevices].bt_recv(bt % kMaxDevices, type, static_cast<uint8_t*>(data), max);
+}
+
+extern "C" int32_t aero_xhci_bt_control(int32_t bt, uint8_t req_type, uint8_t request, uint16_t value,
+                                        uint16_t index, void* data, uint16_t len) {
+    if (bt < 0 || bt / kMaxDevices >= g_count || (len > 0 && data == nullptr)) return -1;
+    return g_controllers[bt / kMaxDevices].bt_control(bt % kMaxDevices, req_type, request, value, index,
+                                                      static_cast<uint8_t*>(data), len);
 }
 
 extern "C" int32_t aero_xhci_disk(int32_t ctrl, int32_t index, dhi_block_info* out) {

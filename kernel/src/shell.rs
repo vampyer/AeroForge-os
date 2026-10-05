@@ -5,7 +5,7 @@ use alloc::string::String;
 use core::sync::atomic::Ordering;
 
 use crate::console::{self, CYAN, YELLOW};
-use crate::{acpi, apic, arch, block, dhi, interrupts, ipc, kprint, kprintln, memory, modules, net, pci, percpu, process, sched, smp, usb, vfs};
+use crate::{acpi, apic, arch, block, bt, dhi, interrupts, ipc, kprint, kprintln, memory, modules, net, pci, percpu, process, sched, smp, usb, vfs};
 
 /// Kernel thread entry.
 pub fn run(_: u64) {
@@ -74,6 +74,8 @@ impl Shell {
                 kprintln!("  mouse       USB mouse pointer position and buttons");
                 kprintln!("  ifconfig    network cards, link and address");
                 kprintln!("  ping <ip>   send 4 ICMP echo requests");
+                kprintln!("  bt          Bluetooth adapters");
+                kprintln!("  bt scan [s] look for Bluetooth devices for s seconds (default 5)");
                 kprintln!("  disks       disks and partitions");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
@@ -86,7 +88,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.7, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.8, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
@@ -182,6 +184,46 @@ impl Shell {
                 }
                 Err(_) => console::print_colored(YELLOW, format_args!("  usage: ping <a.b.c.d>\n")),
             },
+            "bt" => match arg.split_once(' ').unwrap_or((arg, "")) {
+                ("", _) => {
+                    let list = bt::ADAPTERS.lock();
+                    if list.is_empty() {
+                        kprintln!("  no Bluetooth adapters");
+                    }
+                    for a in list.iter() {
+                        let state = if a.up {
+                            alloc::format!("up, Bluetooth {}, address {}, made by {}{}", bt::version_name(a.hci_version),
+                                bt::addr_string(&a.address), bt::manufacturer_name(a.manufacturer), if a.le { ", LE" } else { "" })
+                        } else if let Some(e) = &a.error {
+                            alloc::format!("down: {}", e)
+                        } else {
+                            String::from("starting")
+                        };
+                        kprintln!("  {}  USB {:04x}:{:04x}{}  {}", a.name, a.usb.vendor, a.usb.product,
+                            a.chip.as_ref().map_or(String::new(), |c| alloc::format!(" ({})", c)), state);
+                    }
+                    drop(list);
+                    let found = bt::FOUND.lock();
+                    if !found.is_empty() {
+                        kprintln!("  {} device(s) seen in the last scan, 'bt scan' to refresh", found.len());
+                    }
+                }
+                ("scan", secs) => {
+                    let secs = if secs.is_empty() { 5 } else { secs.parse::<u32>().unwrap_or(5).clamp(1, 60) };
+                    kprintln!("  scanning for {} s...", secs);
+                    match bt::scan(secs) {
+                        Ok(()) => {
+                            let found = bt::FOUND.lock();
+                            for f in found.iter() {
+                                kprintln!("  {}", bt::describe(f));
+                            }
+                            kprintln!("  {} device(s) found", found.len());
+                        }
+                        Err(e) => console::print_colored(YELLOW, format_args!("  bt: {}\n", e)),
+                    }
+                }
+                _ => console::print_colored(YELLOW, format_args!("  usage: bt [scan [seconds]]\n")),
+            },
             "disks" => {
                 for d in block::DEVICES.lock().iter() {
                     match vfs::mount_point_of(d.name()) {
@@ -265,7 +307,7 @@ impl Shell {
 
 fn program_list() -> String {
     let mut s = String::new();
-    for (i, m) in modules::list().iter().enumerate() {
+    for (i, m) in modules::programs().enumerate() {
         if i > 0 {
             s.push_str(", ");
         }

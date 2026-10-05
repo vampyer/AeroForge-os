@@ -144,6 +144,30 @@ int32_t aero_xhci_disk(int32_t ctrl, int32_t index, dhi_block_info *out);
  * while another CPU runs aero_xhci_poll. */
 int32_t aero_xhci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
 
+/* Bluetooth adapters (USB class E0/01/01) found during init. Fills `out` for
+ * the controller's adapter `index` (0, 1, ...) and returns an adapter id, or
+ * -1 when there is no such adapter. */
+int32_t aero_xhci_bt(int32_t ctrl, int32_t index, dhi_usb_device *out);
+
+#define DHI_BT_COMMAND 1u  /* HCI packet types, as in the UART transport */
+#define DHI_BT_ACL     2u
+#define DHI_BT_EVENT   4u
+
+/* Sends one HCI command (on EP0) or ACL packet (on bulk OUT), header
+ * included. 0 = ok. */
+int32_t aero_xhci_bt_send(int32_t bt, uint8_t type, const void *data, uint32_t len);
+
+/* Copies the next received chunk of the event or ACL byte stream into
+ * `data` and its type into `type`. Chunks are USB transfers, not whole
+ * packets: the caller reassembles. Returns the length, or 0 if nothing is
+ * waiting. Never blocks. */
+int32_t aero_xhci_bt_recv(int32_t bt, uint8_t *type, void *data, uint32_t max);
+
+/* A raw control transfer on EP0 for vendor set-up (firmware download).
+ * Returns the bytes transferred, or -1 (for example on a STALL). */
+int32_t aero_xhci_bt_control(int32_t bt, uint8_t req_type, uint8_t request, uint16_t value,
+                             uint16_t index, void *data, uint16_t len);
+
 /* ---- Intel Ethernet driver, e1000/e1000e family (drivers/e1000) ---- */
 
 typedef struct dhi_net_info {
@@ -181,6 +205,35 @@ int32_t aero_igc_init(const dhi_ops *ops, uint64_t mmio_phys, uint16_t device_id
 int32_t aero_igc_send(int32_t nic, const void *frame, uint32_t len);
 int32_t aero_igc_recv(int32_t nic, void *frame, uint32_t max);
 int32_t aero_igc_link(int32_t nic, uint32_t *speed_mbps);
+
+/* ---- MediaTek Bluetooth set-up (drivers/btmtk) ----
+ * MT7921 and MT7922 adapters boot with a ROM only: the firmware patch has to
+ * be downloaded before ordinary HCI commands work. */
+
+typedef struct dhi_btmtk_chip {
+    uint32_t dev_id;       /* 0x7961 = MT7921, 0x7922 = MT7922 */
+    uint32_t fw_version;
+    uint32_t flavor;
+    uint32_t supported;    /* 1 if aero_btmtk_setup knows this chip */
+    char     firmware[64]; /* linux-firmware path, e.g. mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin */
+} dhi_btmtk_chip;
+
+typedef struct dhi_btmtk_result {
+    uint32_t sections;     /* firmware sections downloaded */
+    uint32_t bytes;        /* firmware bytes downloaded */
+    char     error[48];    /* why it failed, empty on success */
+} dhi_btmtk_result;
+
+/* 1 if the USB adapter vendor:product is a MediaTek Bluetooth chip. */
+int32_t aero_btmtk_is_mediatek(uint16_t vendor, uint16_t product);
+
+/* Reads the chip id and firmware version over the Bluetooth adapter `bt`
+ * (an aero_xhci_bt id) and names the firmware file it needs. 0 = ok. */
+int32_t aero_btmtk_chip(const dhi_ops *ops, int32_t bt, dhi_btmtk_chip *out);
+
+/* Downloads `firmware` and switches the Bluetooth function on. 0 = ok. */
+int32_t aero_btmtk_setup(const dhi_ops *ops, int32_t bt, const void *firmware, uint32_t size,
+                         dhi_btmtk_result *out);
 
 #ifdef __cplusplus
 }

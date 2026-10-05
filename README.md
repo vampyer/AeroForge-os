@@ -6,7 +6,7 @@ A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Every CI run uploads the built ISO as a workflow artifact (Actions tab, "boot test" run, Artifacts).
 
-## What works today (milestone 0.7)
+## What works today (milestone 0.8)
 
 Boots on UEFI through Limine, brings up every CPU, and starts **aerosmss**, the first user
 process. aerosmss starts an `echod` service and three clients; the clients run in ring 3 on
@@ -45,6 +45,22 @@ in QEMU at 5 Gb/s and at full speed behind two nested hubs). Disk reads and the 
 polling share the controller safely across CPUs. UAS (the faster protocol some USB 3 SSDs
 prefer) comes later; those drives also offer bulk-only, so they work now.
 
+Since 0.8 USB Bluetooth adapters come up. The xHCI driver carries HCI over USB (commands on
+the control endpoint, events on the interrupt endpoint, ACL data on the bulk endpoints), the
+kernel's Bluetooth host (`kernel/src/bt.rs`) brings each adapter up (reset, version, address,
+buffer sizes, event masks) and scans for classic devices (inquiry with extended results) and
+Bluetooth LE devices (active scan) side by side, showing each device's name, signal strength
+and kind (gamepad, keyboard, mouse, headset, ...). MediaTek MT7921 and MT7922 adapters (the
+Bluetooth half of MediaTek Wi-Fi cards) boot with a ROM only, so `drivers/btmtk` downloads
+their firmware patch first, a port of Linux's btmtk set-up. The firmware comes from
+linux-firmware at build time (`tools/fetch-firmware.sh`, pinned commit and SHA-256 sums) and
+is loaded from `/boot/firmware/mediatek/`; MediaTek's licence allows redistribution for use
+with MediaTek devices and is shipped next to it. Adapters that need no firmware (most generic
+dongles) work directly. QEMU has no Bluetooth device, so `tools/fakebt` simulates an MT7921
+adapter over usbredir: it checks every downloaded firmware byte against the file and answers
+scans with a classic gamepad, an LE gamepad and a headset. Pairing and gamepad input come next,
+then the microphone. Realtek and Intel adapters need their own firmware loaders (later).
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -57,13 +73,13 @@ prefer) comes later; those drives also offer bulk-only, so they work now.
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
-| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, Bluetooth HCI transport, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
-| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the security audit and self-test, the config read and the whole IPC demo |
+| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download and a Bluetooth scan against the simulated adapter, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -100,6 +116,8 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
   src/{acpi,smp}.rs       firmware tables, application processors
   src/pci.rs              PCIe enumeration
   src/{block,fat,vfs}.rs  block devices and partitions, FAT32, the mount at /
+  src/bt.rs               Bluetooth host: adapter bring-up over HCI, scanning
+  src/modules.rs          boot modules: user programs and firmware
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
   src/{console,fb,serial}.rs    output: serial, framebuffer, desktop art
@@ -115,28 +133,31 @@ drivers/ahci/             AHCI (SATA) driver (C++)
 drivers/xhci/             xHCI (USB 3) driver (C++)
 drivers/e1000/            Intel Ethernet driver, e1000/e1000e (C++)
 drivers/igc/              Intel Ethernet driver, igb/igc: I210/I211, I225/I226 (C++)
+drivers/btmtk/            MediaTek Bluetooth firmware loader, MT7921/MT7922 (C++)
 tools/boot-test.sh        headless QEMU boot test
 tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/disk-files/
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 tools/make-usb-disk.sh    builds the USB stick image (MBR + FAT32) from tools/usb-files/
+tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
+tools/fakebt/             simulated USB Bluetooth adapter for QEMU (usbredir, C)
 ```
 
 ## Building and running
 
 Requirements: Rust stable with the `x86_64-unknown-none` target, `clang++` and `llvm-ar`,
-`xorriso`, `git`, `gdisk`, `dosfstools`, `mtools`, QEMU (`qemu-system-x86_64`) and OVMF UEFI firmware.
+`xorriso`, `git`, `curl`, `gdisk`, `dosfstools`, `mtools`, `libusbredirparser-dev` (for the boot test), QEMU (`qemu-system-x86_64`) and OVMF UEFI firmware.
 
 On Ubuntu/Debian:
 
 ```sh
-sudo apt install clang llvm lld xorriso gdisk dosfstools mtools qemu-system-x86 ovmf
+sudo apt install clang llvm lld xorriso curl gdisk dosfstools mtools libusbredirparser-dev qemu-system-x86 ovmf
 rustup target add x86_64-unknown-none
 ```
 
 Then:
 
 ```sh
-make                    # builds build/aeroforge.iso (fetches Limine binaries on first run)
+make                    # builds build/aeroforge.iso (fetches Limine and the Bluetooth firmware on first run)
 make disk               # (re)builds build/disk.img (NVMe drive) and build/sata.img (SATA drive)
 make run                # QEMU window; type into the AeroKernel shell
 make run-headless       # serial log on stdout, no window
