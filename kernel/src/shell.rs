@@ -84,6 +84,9 @@ impl Shell {
                 kprintln!("  diskwrite <disk> <lba> <n>  write, flush and read back a test pattern (unused blocks only)");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
+                kprintln!("  write <path> <text>  save a line of text as a file (replacing it); quote a path with spaces");
+                kprintln!("  mkdir <path>  create a directory");
+                kprintln!("  rm <path>   delete a file or an empty directory");
                 kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
                 kprintln!("  mem         buddy allocator, slab heap and paging");
                 kprintln!("  cpu         processor and SMP status");
@@ -343,6 +346,25 @@ impl Shell {
                     }
                 }
             }
+            // A path with spaces goes in double quotes.
+            "write" => match arg.strip_prefix('"').and_then(|a| a.split_once("\" ")).or_else(|| arg.split_once(' ')) {
+                Some((path, text)) => {
+                    let data = alloc::format!("{}\n", text);
+                    match vfs::write(path, data.as_bytes()) {
+                        Ok(()) => kprintln!("  wrote {} bytes to {}", data.len(), path),
+                        Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", path, e)),
+                    }
+                }
+                None => console::print_colored(YELLOW, format_args!("  usage: write <path> <text>\n")),
+            },
+            "mkdir" => match vfs::create_dir(arg) {
+                Ok(()) => kprintln!("  created directory {}", arg),
+                Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
+            },
+            "rm" => match vfs::remove(arg) {
+                Ok(()) => kprintln!("  deleted {}", arg),
+                Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
+            },
             "diskwrite" => {
                 let mut args = arg.split_whitespace();
                 let dev = args.next().unwrap_or("");

@@ -25,7 +25,11 @@
 # and 'padtest' must read them again; a second USB stick plugged into the
 # hub must be mounted and readable, and unmounted when it is pulled out;
 # last, 'diskwrite' must write, flush and read back a test pattern on the
-# NVMe, SATA and USB disks, and the disk images must hold it after QEMU exits.
+# NVMe, SATA and USB disks, and the disk images must hold it after QEMU exits;
+# then the 'savetest' program saves, overwrites and deletes files through the
+# file system calls and the shell saves and deletes files on the SATA and USB
+# disks; after QEMU exits every volume must pass fsck.fat and mtools must read
+# the saved files back.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -141,13 +145,24 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; type_keys $'diskwrite usb0 1000 80\n'; STAGE=22
     elif [ $STAGE = 22 ] && grep -q "to usb0 at LBA 1000\|diskwrite: " "$LOG"; then
         sleep 1; type_keys $'diskwrite nvme0p1 1000 80\n'; STAGE=23
+    elif [ $STAGE = 23 ] && grep -q "diskwrite: give a whole disk" "$LOG"; then
+        # Saving files: a program, then the shell on the SATA and USB disks.
+        sleep 1; type_keys $'run savetest\n'; STAGE=24
+    elif [ $STAGE = 24 ] && grep -q "\[savetest\] " "$LOG"; then
+        sleep 1; type_keys $'mkdir /sata0p1/docs\n'; STAGE=25
+    elif [ $STAGE = 25 ] && grep -q "created directory /sata0p1/docs\|  /sata0p1/docs: " "$LOG"; then
+        sleep 1; type_keys $'write "/sata0p1/docs/Hello World.txt" Saved from AeroForge on SATA\n'; STAGE=26
+    elif [ $STAGE = 26 ] && grep -q "bytes to /sata0p1/docs/Hello World.txt\|  /sata0p1/docs/Hello World.txt: " "$LOG"; then
+        sleep 1; type_keys $'write /usb0p1/usbnote.txt Saved from AeroForge on USB\n'; STAGE=27
+    elif [ $STAGE = 27 ] && grep -q "bytes to /usb0p1/usbnote.txt\|  /usb0p1/usbnote.txt: " "$LOG"; then
+        sleep 1; type_keys $'rm /usb0p1/usb.txt\n'; STAGE=28
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 23 ] && grep -q "diskwrite: give a whole disk" "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = 28 ] && grep -q "deleted /usb0p1/usb.txt\|  /usb0p1/usb.txt: " "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -219,8 +234,14 @@ for _ in $(seq "$TIMEOUT"); do
         python3 tools/check-disk-write.py build/disk.img nvme0 1000 80 || { fail "the NVMe disk image lacks the written data"; }
         python3 tools/check-disk-write.py build/sata.img sata0 1000 80 || { fail "the SATA disk image lacks the written data"; }
         python3 tools/check-disk-write.py build/usb.img usb0 1000 80 || { fail "the USB disk image lacks the written data"; }
+        grep -q "\[savetest\] saved 12 slots, read them back, overwrote slot 1 and deleted slots 3-12: OK" "$LOG" || { fail "the savetest program could not save its files"; }
+        grep -q "created directory /sata0p1/docs" "$LOG" || { fail "the shell could not create a directory on the SATA disk"; }
+        grep -q "wrote 29 bytes to /sata0p1/docs/Hello World.txt" "$LOG" || { fail "the shell could not save a file on the SATA disk"; }
+        grep -q "wrote 28 bytes to /usb0p1/usbnote.txt" "$LOG" || { fail "the shell could not save a file on the USB stick"; }
+        grep -q "deleted /usb0p1/usb.txt" "$LOG" || { fail "the shell could not delete a file on the USB stick"; }
+        python3 tools/check-fat-files.py build || { fail "the saved files are not right on the disk images"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read and unmounted a USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read and unmounted a USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

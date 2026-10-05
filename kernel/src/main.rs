@@ -28,6 +28,7 @@ mod pci;
 mod percpu;
 mod pic;
 mod process;
+mod rtc;
 mod sched;
 mod security;
 mod serial;
@@ -240,7 +241,7 @@ extern "C" fn kmain() -> ! {
     }
     let mounts = vfs::mount_all();
     for m in &mounts {
-        kok!("FAT32 volume \"{}\" on {} mounted at {} (read-only)", m.vol.label, m.vol.dev.name(), m.path);
+        kok!("FAT32 volume \"{}\" on {} mounted at {}", m.vol.label, m.vol.dev.name(), m.path);
     }
     if mounts.is_empty() {
         kprintln!("[WARN] no FAT32 volume found, running without files");

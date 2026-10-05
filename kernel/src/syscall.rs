@@ -31,6 +31,12 @@ pub const SYS_FILE_READ: u64 = 15;
 pub const SYS_AUDIO_WRITE: u64 = 16;
 pub const SYS_AUDIO_QUEUED: u64 = 17;
 pub const SYS_GAMEPAD_READ: u64 = 18;
+pub const SYS_FILE_WRITE: u64 = 19;
+pub const SYS_FILE_DELETE: u64 = 20;
+pub const SYS_DIR_CREATE: u64 = 21;
+
+/// Largest file one SYS_FILE_WRITE can save.
+const MAX_FILE_WRITE: u64 = 8 * 1024 * 1024;
 
 const E_BADHANDLE: i64 = -1;
 const E_FAULT: i64 = -2;
@@ -71,6 +77,23 @@ fn check_writable(ptr: u64, len: u64) -> Result<(), i64> {
 
 fn to_user(ptr: u64, data: &[u8]) -> Result<(), i64> {
     security::copy_to_user(ptr, data).then_some(()).ok_or(E_FAULT)
+}
+
+/// Programs may not change /system (the boot configuration) until files
+/// have owners and permissions; the kernel shell still can.
+fn writable_by_programs(path: &str) -> Result<(), i64> {
+    let first = path.split('/').find(|p| !p.is_empty()).unwrap_or("");
+    if first.eq_ignore_ascii_case("system") { Err(E_RIGHTS) } else { Ok(()) }
+}
+
+/// A file system error as a system call error code.
+fn fs_error(e: &'static str) -> i64 {
+    match e {
+        "file not found" | "not a directory" | "no filesystem mounted" | "no filesystem mounted at /" => E_NOTFOUND,
+        "disk full" => E_FULL,
+        "already exists" => E_EXISTS,
+        _ => E_INVAL,
+    }
 }
 
 fn port_handle(proc_: &process::Process, h: u64, need: u32) -> Result<alloc::sync::Arc<Port>, i64> {
@@ -206,6 +229,27 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             let data = vfs::read(&path, a3 as usize).map_err(|_| E_NOTFOUND)?;
             to_user(a2, &data)?;
             Ok(data.len() as u64)
+        }
+        SYS_FILE_WRITE => {
+            // Creates or replaces a whole file from a user buffer; returns the bytes written.
+            let path = user_str(a0, a1)?;
+            writable_by_programs(&path)?;
+            if a3 > MAX_FILE_WRITE {
+                return Err(E_INVAL);
+            }
+            let data = user_bytes(a2, a3)?;
+            vfs::write(&path, &data).map_err(fs_error)?;
+            Ok(a3)
+        }
+        SYS_FILE_DELETE => {
+            let path = user_str(a0, a1)?;
+            writable_by_programs(&path)?;
+            vfs::remove(&path).map_err(fs_error).map(|_| 0)
+        }
+        SYS_DIR_CREATE => {
+            let path = user_str(a0, a1)?;
+            writable_by_programs(&path)?;
+            vfs::create_dir(&path).map_err(fs_error).map(|_| 0)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
         SYS_AUDIO_WRITE => {

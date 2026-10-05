@@ -1,5 +1,5 @@
-//! The (very) early file namespace. Every FAT32 volume is mounted
-//! read-only: the first one found at boot at "/", each further one at
+//! The (very) early file namespace. Every FAT32 volume is mounted, readable
+//! and writable: the first one found at boot at "/", each further one at
 //! "/<device name>" (for example "/sata0p1"). Volumes on USB disks plugged
 //! in later are mounted the same way and go away when the disk is
 //! unplugged. Real mount tables, more filesystems and user-space filesystem
@@ -99,6 +99,34 @@ pub fn list(path: &str) -> Result<Vec<DirEntry>, &'static str> {
 pub fn read(path: &str, limit: usize) -> Result<Vec<u8>, &'static str> {
     let (m, inner) = resolve(path)?;
     m.vol.read_file(inner, limit)
+}
+
+/// The volume `path` is on and the path inside it, which must name
+/// something inside the volume (not a mount point itself).
+fn resolve_entry(path: &str) -> Result<(Arc<Mount>, &str), &'static str> {
+    let (m, inner) = resolve(path)?;
+    if is_root(inner) {
+        return Err("bad file name");
+    }
+    Ok((m, inner))
+}
+
+/// Creates the file at `path`, or replaces what it holds.
+pub fn write(path: &str, data: &[u8]) -> Result<(), &'static str> {
+    let (m, inner) = resolve_entry(path)?;
+    m.vol.write_file(inner, data)
+}
+
+/// Creates a directory.
+pub fn create_dir(path: &str) -> Result<(), &'static str> {
+    let (m, inner) = resolve_entry(path)?;
+    m.vol.create_dir(inner)
+}
+
+/// Deletes a file or an empty directory.
+pub fn remove(path: &str) -> Result<(), &'static str> {
+    let (m, inner) = resolve_entry(path)?;
+    m.vol.remove(inner)
 }
 
 /// Where a block device is mounted, if anywhere.
