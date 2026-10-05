@@ -95,6 +95,7 @@ pub fn speed_name(speed: u8) -> &'static str {
         3 => "480 Mb/s",
         4 => "5 Gb/s",
         5 => "10 Gb/s",
+        6 => "20 Gb/s",
         _ => "?",
     }
 }
