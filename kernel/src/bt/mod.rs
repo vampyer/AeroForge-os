@@ -1,11 +1,14 @@
 //! Bluetooth host: finds USB Bluetooth adapters through the xHCI driver,
 //! loads MediaTek firmware where the adapter needs it, brings each adapter
-//! up over HCI, scans for classic (inquiry) and Bluetooth LE devices, and
-//! pairs with and reads classic Bluetooth gamepads (HID over L2CAP).
+//! up over HCI, scans for classic (inquiry) and Bluetooth LE devices, pairs
+//! with and reads classic Bluetooth gamepads (HID over L2CAP), and records
+//! from Bluetooth headset microphones (hands-free profile, SCO voice).
 //! A kernel thread owns the adapters; the shell talks to it through jobs.
 
+mod hfp;
 mod hid;
 mod l2cap;
+mod rfcomm;
 mod sdp;
 
 use alloc::collections::VecDeque;
@@ -57,6 +60,32 @@ pub struct Bond {
     pub key: [u8; 16],
     pub name: String,
     pub descriptor: Vec<u8>,
+    /// A headset: its hands-free RFCOMM channel, and true if it only has
+    /// the older Headset profile.
+    pub audio: Option<(u8, bool)>,
+}
+
+/// A paired headset with a microphone.
+pub struct Headset {
+    pub adapter: usize,
+    pub address: [u8; 6],
+    pub name: String,
+    pub connected: bool,
+    pub profile: &'static str,
+}
+
+/// What a recording heard.
+#[derive(Clone)]
+pub struct Recording {
+    pub name: String,
+    /// Length in tenths of a second.
+    pub tenths: u32,
+    pub samples: usize,
+    /// Percent of full scale.
+    pub peak: u32,
+    pub rms: u32,
+    /// From the zero crossings: the main pitch of a steady sound.
+    pub pitch: u32,
 }
 
 /// A paired gamepad and what it is pressing right now.
@@ -77,6 +106,12 @@ struct ScanJob {
     done: bool,
 }
 
+struct RecordJob {
+    seconds: u32,
+    started: bool,
+    result: Option<Result<Recording, String>>,
+}
+
 struct PairJob {
     address: [u8; 6],
     started: bool,
@@ -87,11 +122,19 @@ pub static ADAPTERS: IrqMutex<Vec<Adapter>> = IrqMutex::new(Vec::new());
 pub static FOUND: IrqMutex<Vec<Found>> = IrqMutex::new(Vec::new());
 pub static BONDS: IrqMutex<Vec<Bond>> = IrqMutex::new(Vec::new());
 pub static GAMEPADS: IrqMutex<Vec<Gamepad>> = IrqMutex::new(Vec::new());
+pub static HEADSETS: IrqMutex<Vec<Headset>> = IrqMutex::new(Vec::new());
+static RECORD: IrqMutex<Option<RecordJob>> = IrqMutex::new(None);
 static SCAN: IrqMutex<Option<ScanJob>> = IrqMutex::new(None);
 static PAIR: IrqMutex<Option<PairJob>> = IrqMutex::new(None);
 
 const BOOT_SCAN_SECONDS: u32 = 3;
 const PAIR_TIMEOUT: u64 = 30 * apic::TIMER_HZ;
+/// How long the voice link may take to come up.
+const VOICE_TIMEOUT: u64 = 10 * apic::TIMER_HZ;
+/// How long a reconnected headset gets to open RFCOMM before we do.
+const RFCOMM_WAIT: u64 = 3 * apic::TIMER_HZ;
+/// USB alternate setting for one 16-bit voice link.
+const SCO_ALT: u8 = 2;
 
 /// Lists the Bluetooth adapters the xHCI driver set up. Returns how many.
 pub fn probe() -> usize {
@@ -180,9 +223,20 @@ pub fn bt_thread(_: u64) {
                 None => finish_pair(Err(String::from("no Bluetooth adapter is up"))),
             }
         }
+        let record = RECORD.lock().as_mut().filter(|j| !j.started).map(|j| {
+            j.started = true;
+            j.seconds
+        });
+        if let Some(seconds) = record {
+            match hosts.iter_mut().filter(|h| h.up).find(|h| h.conns.iter().any(|c| c.audio_ready)) {
+                Some(h) => h.record(seconds),
+                None => finish_record(Err(String::from("no headset is connected; pair one with 'bt pair <address>'"))),
+            }
+        }
         for h in hosts.iter_mut().filter(|h| h.up) {
             h.service();
             h.check_pairing();
+            h.check_audio();
         }
         sched::sleep_ticks(1);
     }
@@ -228,6 +282,32 @@ pub fn pair(address: [u8; 6]) -> Result<String, String> {
     }
 }
 
+/// Records `seconds` from the connected headset's microphone (from the
+/// shell) and waits for the result.
+pub fn record(seconds: u32) -> Result<Recording, String> {
+    {
+        let mut job = RECORD.lock();
+        if job.as_ref().is_some_and(|j| j.result.is_none()) {
+            return Err(String::from("a recording is already running"));
+        }
+        *job = Some(RecordJob { seconds, started: false, result: None });
+    }
+    loop {
+        if let Some(r) = RECORD.lock().as_ref().and_then(|j| j.result.clone()) {
+            return r;
+        }
+        sched::sleep_ticks(10);
+    }
+}
+
+fn finish_record(result: Result<Recording, String>) {
+    if let Some(j) = RECORD.lock().as_mut() {
+        if j.result.is_none() {
+            j.result = Some(result);
+        }
+    }
+}
+
 fn finish_pair(result: Result<String, String>) {
     if let Some(j) = PAIR.lock().as_mut() {
         if j.result.is_none() {
@@ -268,6 +348,9 @@ const OP_IO_CAPABILITY_REPLY: u16 = 0x042B;
 const OP_USER_CONFIRMATION_REPLY: u16 = 0x042C;
 const OP_USER_CONFIRMATION_NEGATIVE_REPLY: u16 = 0x042D;
 const OP_IO_CAPABILITY_NEGATIVE_REPLY: u16 = 0x0434;
+const OP_SETUP_SYNCHRONOUS_CONNECTION: u16 = 0x0428;
+const OP_ACCEPT_SYNCHRONOUS_CONNECTION: u16 = 0x0429;
+const OP_WRITE_VOICE_SETTING: u16 = 0x0C26;
 const OP_WRITE_DEFAULT_LINK_POLICY: u16 = 0x080F;
 const OP_SET_EVENT_MASK: u16 = 0x0C01;
 const OP_RESET: u16 = 0x0C03;
@@ -303,6 +386,7 @@ const EV_EXTENDED_INQUIRY_RESULT: u8 = 0x2F;
 const EV_IO_CAPABILITY_REQUEST: u8 = 0x31;
 const EV_USER_CONFIRMATION_REQUEST: u8 = 0x33;
 const EV_SIMPLE_PAIRING_COMPLETE: u8 = 0x36;
+const EV_SYNCHRONOUS_CONNECTION_COMPLETE: u8 = 0x2C;
 const EV_LE_META: u8 = 0x3E;
 const LE_ADVERTISING_REPORT: u8 = 0x02;
 
@@ -329,6 +413,23 @@ pub(super) struct Host {
     inquiry_done: bool,
     conns: Vec<l2cap::Conn>,
     pair_deadline: Option<u64>,
+    sco: Vec<u8>,
+    sco_in: VecDeque<Vec<u8>>,
+    /// The voice link (SCO handle, ACL handle of its device) and whether we
+    /// set it up (so we take it down after recording).
+    voice: Option<(u16, u16, bool)>,
+    rec: Option<Rec>,
+}
+
+/// A recording in progress.
+struct Rec {
+    acl: u16,
+    seconds: u32,
+    /// Waiting for the voice link until, then recording until.
+    deadline: u64,
+    recording: bool,
+    samples: Vec<i16>,
+    odd: Option<u8>,
 }
 
 impl Host {
@@ -340,7 +441,7 @@ impl Host {
         Host { index, id, name, up: false, evt: Vec::new(), acl: Vec::new(), events: VecDeque::new(),
             acl_in: VecDeque::new(), commands: VecDeque::new(), command_credits: 1, waiting: None, reply: None,
             acl_out: VecDeque::new(), acl_credits: 0, acl_mtu: 0, inquiry_done: false, conns: Vec::new(),
-            pair_deadline: None }
+            pair_deadline: None, sco: Vec::new(), sco_in: VecDeque::new(), voice: None, rec: None }
     }
 
     fn bring_up(&mut self) -> Result<(), String> {
@@ -373,6 +474,8 @@ impl Host {
             console::print_colored(console::YELLOW, format_args!("[WARN] {}: no Secure Simple Pairing ({}), PIN pairing only\n", self.name, e));
         }
         self.cmd(OP_WRITE_DEFAULT_LINK_POLICY, &[0x05, 0x00]).ok();
+        // Voice: 16-bit signed linear samples, CVSD over the air.
+        self.cmd(OP_WRITE_VOICE_SETTING, &[0x60, 0x00]).ok();
         self.cmd(OP_WRITE_SCAN_ENABLE, &[0x02])?;
         let (mut mtu, mut packets) = (u16::from_le_bytes([b[1], b[2]]), u16::from_le_bytes([b[4], b[5]]));
         if le {
@@ -442,6 +545,7 @@ impl Host {
             match kind {
                 dhi::BT_EVENT => self.evt.extend_from_slice(&buf[..n as usize]),
                 dhi::BT_ACL => self.acl.extend_from_slice(&buf[..n as usize]),
+                dhi::BT_SCO => self.sco.extend_from_slice(&buf[..n as usize]),
                 _ => {}
             }
         }
@@ -452,6 +556,10 @@ impl Host {
         while self.acl.len() >= 4 && self.acl.len() >= 4 + u16::from_le_bytes([self.acl[2], self.acl[3]]) as usize {
             let len = 4 + u16::from_le_bytes([self.acl[2], self.acl[3]]) as usize;
             self.acl_in.push_back(self.acl.drain(..len).collect());
+        }
+        while self.sco.len() >= 3 && self.sco.len() >= 3 + self.sco[2] as usize {
+            let len = 3 + self.sco[2] as usize;
+            self.sco_in.push_back(self.sco.drain(..len).collect());
         }
     }
 
@@ -464,6 +572,9 @@ impl Host {
         }
         while let Some(pkt) = self.acl_in.pop_front() {
             self.on_acl(&pkt);
+        }
+        while let Some(pkt) = self.sco_in.pop_front() {
+            self.on_sco(&pkt);
         }
         self.flush();
     }
@@ -640,6 +751,117 @@ impl Host {
         }
     }
 
+    /// Called once a headset's hands-free connection is up.
+    fn audio_ready(&mut self, conn: usize) {
+        let c = &self.conns[conn];
+        let address = c.address;
+        let profile = if c.audio.is_some_and(|a| a.1) { "headset profile" } else { "hands-free" };
+        let name = self.device_name(&address);
+        {
+            let mut list = HEADSETS.lock();
+            match list.iter_mut().find(|h| h.address == address) {
+                Some(h) => {
+                    h.connected = true;
+                    h.profile = profile;
+                }
+                None => list.push(Headset { adapter: self.index, address, name: name.clone(), connected: true, profile }),
+            }
+        }
+        crate::kok!("{}: headset {} \"{}\" connected ({})", self.name, addr_string(&address), name, profile);
+        if pairing_with(&address) {
+            self.pair_deadline = None;
+            finish_pair(Ok(alloc::format!("\"{}\" paired and connected (headset with microphone, {})", name, profile)));
+        }
+    }
+
+    fn audio_lost(&mut self, conn: usize) {
+        let address = self.conns[conn].address;
+        let mut list = HEADSETS.lock();
+        if let Some(h) = list.iter_mut().find(|h| h.address == address && h.connected) {
+            h.connected = false;
+            let name = h.name.clone();
+            drop(list);
+            crate::kok!("{}: headset {} \"{}\" disconnected", self.name, addr_string(&address), name);
+        }
+    }
+
+    /// Reconnected headsets that did not open RFCOMM themselves, and the
+    /// recording's deadlines.
+    fn check_audio(&mut self) {
+        let now = sched::ticks();
+        for i in 0..self.conns.len() {
+            if self.conns[i].rfcomm_deadline.is_some_and(|d| now > d) {
+                self.open_rfcomm(i);
+            }
+        }
+        let Some(r) = self.rec.as_ref() else { return };
+        if now <= r.deadline {
+            return;
+        }
+        if r.recording {
+            self.finish_recording();
+        } else {
+            self.rec = None;
+            self.end_voice();
+            finish_record(Err(String::from("the voice link did not come up")));
+        }
+    }
+
+    /// Starts a recording on the connected headset: set up the voice link
+    /// (unless the headset has one open already) and collect its samples.
+    fn record(&mut self, seconds: u32) {
+        let Some(c) = self.conns.iter().find(|c| c.audio_ready) else {
+            finish_record(Err(String::from("no headset is connected")));
+            return;
+        };
+        let acl = c.handle;
+        let mut rec = Rec { acl, seconds, deadline: sched::ticks() + VOICE_TIMEOUT, recording: false,
+            samples: Vec::new(), odd: None };
+        if self.voice.is_some_and(|v| v.1 == acl) {
+            rec.recording = true;
+            rec.deadline = sched::ticks() + seconds as u64 * apic::TIMER_HZ;
+        } else {
+            let mut p = acl.to_le_bytes().to_vec();
+            p.extend_from_slice(&sync_params());
+            self.send_cmd(OP_SETUP_SYNCHRONOUS_CONNECTION, &p);
+        }
+        self.rec = Some(rec);
+    }
+
+    /// One voice packet: keep its samples while recording and answer with
+    /// silence (the link carries both directions).
+    fn on_sco(&mut self, pkt: &[u8]) {
+        let handle = u16::from_le_bytes([pkt[0], pkt[1]]) & 0x0FFF;
+        if self.voice.is_none_or(|v| v.0 != handle) {
+            return;
+        }
+        if let Some(r) = self.rec.as_mut().filter(|r| r.recording) {
+            for &b in &pkt[3..] {
+                match r.odd.take() {
+                    Some(lo) => r.samples.push(i16::from_le_bytes([lo, b])),
+                    None => r.odd = Some(b),
+                }
+            }
+        }
+        let mut silence = pkt.to_vec();
+        silence[3..].fill(0);
+        unsafe { dhi::aero_xhci_bt_send(self.id, dhi::BT_SCO, silence.as_ptr(), silence.len() as u32) };
+    }
+
+    fn finish_recording(&mut self) {
+        let Some(r) = self.rec.take() else { return };
+        let name = self.conns.iter().find(|c| c.handle == r.acl).map_or(String::from("?"), |c| self.device_name(&c.address));
+        self.end_voice();
+        finish_record(Ok(analyse(name, &r.samples)));
+    }
+
+    /// Takes down a voice link we set up.
+    fn end_voice(&mut self) {
+        if let Some((handle, _, true)) = self.voice {
+            self.send_cmd(OP_DISCONNECT, &[handle as u8, (handle >> 8) as u8, 0x13]);
+        }
+    }
+
     fn on_event(&mut self, ev: &[u8]) {
         let p = &ev[2..];
         match ev[0] {
@@ -673,7 +895,11 @@ impl Host {
             }
             EV_NUMBER_OF_COMPLETED_PACKETS if !p.is_empty() => {
                 for h in p[1..].chunks_exact(4).take(p[0] as usize) {
-                    self.acl_credits += u16::from_le_bytes([h[2], h[3]]);
+                    // Voice packets are not flow controlled.
+                    let handle = u16::from_le_bytes([h[0], h[1]]) & 0x0FFF;
+                    if self.voice.is_none_or(|v| v.0 != handle) {
+                        self.acl_credits += u16::from_le_bytes([h[2], h[3]]);
+                    }
                 }
             }
             EV_INQUIRY_COMPLETE => self.inquiry_done = true,
@@ -719,8 +945,21 @@ impl Host {
             // ---- connections
             EV_CONNECTION_REQUEST if p.len() >= 10 => {
                 let a = addr(&p[..6]);
+                if p[9] != 1 {
+                    // A voice link from a connected headset.
+                    if self.voice.is_none() && self.conns.iter().any(|c| c.address == a && c.audio_ready) {
+                        let mut r = a.to_vec();
+                        r.extend_from_slice(&sync_params());
+                        self.send_cmd(OP_ACCEPT_SYNCHRONOUS_CONNECTION, &r);
+                    } else {
+                        let mut r = a.to_vec();
+                        r.push(0x0D); // limited resources
+                        self.send_cmd(OP_REJECT_CONNECTION, &r);
+                    }
+                    return;
+                }
                 // Only paired devices may connect (a gamepad reconnecting).
-                if p[9] == 1 && BONDS.lock().iter().any(|b| b.address == a && b.adapter == self.index) {
+                if BONDS.lock().iter().any(|b| b.address == a && b.adapter == self.index) {
                     let mut r = a.to_vec();
                     r.push(0x00); // become the central
                     self.send_cmd(OP_ACCEPT_CONNECTION, &r);
@@ -732,12 +971,12 @@ impl Host {
             }
             EV_CONNECTION_COMPLETE if p.len() >= 11 => {
                 let a = addr(&p[3..9]);
+                if p[9] != 1 {
+                    return; // voice links complete with their own event
+                }
                 if p[0] != 0 {
                     self.pair_failed(&a, alloc::format!("connection failed: {}", hci_error(p[0])));
                     return;
-                }
-                if p[9] != 1 {
-                    return; // SCO link: not used yet
                 }
                 let handle = u16::from_le_bytes([p[1], p[2]]) & 0x0FFF;
                 let outgoing = pairing_with(&a);
@@ -746,9 +985,53 @@ impl Host {
                 // Authenticate (pair, or prove the stored key) and encrypt.
                 self.send_cmd(OP_AUTHENTICATION_REQUESTED, &handle.to_le_bytes());
             }
+            EV_SYNCHRONOUS_CONNECTION_COMPLETE if p.len() >= 10 => {
+                let a = addr(&p[3..9]);
+                let handle = u16::from_le_bytes([p[1], p[2]]) & 0x0FFF;
+                let Some(acl) = self.conns.iter().find(|c| c.address == a).map(|c| c.handle) else { return };
+                let ours = self.rec.as_ref().is_some_and(|r| r.acl == acl && !r.recording);
+                if p[0] != 0 {
+                    if ours {
+                        self.rec = None;
+                        finish_record(Err(alloc::format!("the headset refused the voice link: {}", hci_error(p[0]))));
+                    }
+                    return;
+                }
+                self.voice = Some((handle, acl, ours));
+                if unsafe { dhi::aero_xhci_bt_sco(self.id, SCO_ALT) } != 0 {
+                    console::print_colored(console::YELLOW, format_args!(
+                        "[WARN] {}: the adapter's USB voice endpoints could not be set up\n", self.name));
+                    if ours {
+                        self.rec = None;
+                        self.end_voice();
+                        finish_record(Err(String::from("the adapter's USB voice endpoints could not be set up")));
+                    }
+                    return;
+                }
+                self.sco.clear();
+                if let Some(r) = self.rec.as_mut().filter(|r| r.acl == acl) {
+                    r.recording = true;
+                    r.deadline = sched::ticks() + r.seconds as u64 * apic::TIMER_HZ;
+                }
+            }
             EV_DISCONNECTION_COMPLETE if p.len() >= 4 && p[0] == 0 => {
                 let handle = u16::from_le_bytes([p[1], p[2]]) & 0x0FFF;
+                if self.voice.is_some_and(|v| v.0 == handle) {
+                    self.voice = None;
+                    unsafe { dhi::aero_xhci_bt_sco(self.id, 0) };
+                    if self.rec.as_ref().is_some_and(|r| r.recording) {
+                        self.finish_recording();
+                    }
+                    return;
+                }
                 if let Some(i) = self.conns.iter().position(|c| c.handle == handle) {
+                    if self.conns[i].audio_ready {
+                        self.audio_lost(i);
+                    }
+                    if self.rec.as_ref().is_some_and(|r| r.acl == handle) {
+                        self.rec = None;
+                        finish_record(Err(alloc::format!("the headset disconnected: {}", hci_error(p[3]))));
+                    }
                     let c = self.conns.remove(i);
                     let mut pads = GAMEPADS.lock();
                     if let Some(g) = pads.iter_mut().find(|g| g.address == c.address && g.connected) {
@@ -822,7 +1105,7 @@ impl Host {
                 let mut bonds = BONDS.lock();
                 match bonds.iter_mut().find(|b| b.address == a) {
                     Some(b) => b.key = key,
-                    None => bonds.push(Bond { adapter: self.index, address: a, key, name, descriptor: Vec::new() }),
+                    None => bonds.push(Bond { adapter: self.index, address: a, key, name, descriptor: Vec::new(), audio: None }),
                 }
             }
             EV_AUTHENTICATION_COMPLETE if p.len() >= 3 => {
@@ -859,6 +1142,9 @@ impl Host {
                     self.start_sdp(i);
                 } else {
                     self.release_held(i);
+                    if self.conns[i].audio.is_some() {
+                        self.conns[i].rfcomm_deadline = Some(sched::ticks() + RFCOMM_WAIT);
+                    }
                 }
             }
             _ => {}
@@ -881,6 +1167,62 @@ impl Host {
         }
         update(f);
     }
+}
+
+/// Synchronous connection parameters: 8000 bytes/s each way, any latency,
+/// 16-bit linear samples with CVSD air coding, any retransmission, and the
+/// SCO and EV3 packet types without the EDR ones.
+fn sync_params() -> [u8; 15] {
+    let mut p = [0u8; 15];
+    p[0..4].copy_from_slice(&8000u32.to_le_bytes());
+    p[4..8].copy_from_slice(&8000u32.to_le_bytes());
+    p[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    p[10..12].copy_from_slice(&0x0060u16.to_le_bytes());
+    p[12] = 0xFF;
+    p[13..15].copy_from_slice(&0x03CFu16.to_le_bytes());
+    p
+}
+
+/// Level and pitch of 8 kHz samples.
+fn analyse(name: String, samples: &[i16]) -> Recording {
+    const RATE: u64 = 8000;
+    let n = samples.len().max(1) as i64;
+    let mean = samples.iter().map(|&s| s as i64).sum::<i64>() / n;
+    let mut peak = 0i64;
+    let mut squares = 0u64;
+    let mut crossings = 0u64;
+    let mut below = false;
+    for &s in samples {
+        let v = s as i64 - mean;
+        peak = peak.max(v.abs());
+        squares += (v * v) as u64;
+        // Upward crossings, with a little hysteresis against noise.
+        if v > 64 {
+            if below {
+                crossings += 1;
+            }
+            below = false;
+        } else if v < -64 {
+            below = true;
+        }
+    }
+    let rms = isqrt(squares / n as u64);
+    let pitch = if peak > 300 { crossings * RATE / n as u64 } else { 0 };
+    Recording { name, tenths: (samples.len() as u64 * 10 / RATE) as u32, samples: samples.len(),
+        peak: (peak * 100 / 32767) as u32, rms: (rms * 100 / 32767) as u32, pitch: pitch as u32 }
+}
+
+fn isqrt(v: u64) -> u64 {
+    let mut x = v;
+    let mut y = x.div_ceil(2);
+    if v < 2 {
+        return v;
+    }
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    x
 }
 
 fn addr(b: &[u8]) -> [u8; 6] {

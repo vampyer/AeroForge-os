@@ -1,10 +1,13 @@
 //! L2CAP over an ACL connection: the signalling channel, connection-oriented
-//! channels in basic mode, and what runs on them (SDP to read a HID report
-//! descriptor, then the HID control and interrupt channels).
+//! channels in basic mode, and what runs on them: SDP to find out what the
+//! device is (a gamepad's HID report descriptor, or a headset's hands-free
+//! RFCOMM channel), then the HID control and interrupt channels, or RFCOMM
+//! carrying the hands-free AT commands. We also answer SDP queries, since a
+//! headset that reconnects looks up our audio gateway first.
 
 use alloc::vec::Vec;
 
-use super::{hid, sdp, Host, BONDS, GAMEPADS};
+use super::{hfp, hid, rfcomm, sdp, Host, BONDS, GAMEPADS};
 
 const SIGNALLING_CID: u16 = 0x0001;
 const FIRST_DYNAMIC_CID: u16 = 0x0040;
@@ -28,6 +31,8 @@ const HID_DATA_INPUT: u8 = 0xA1;
 
 pub struct Channel {
     psm: u16,
+    /// We opened it (else the device did).
+    ours: bool,
     local: u16,
     remote: u16,
     /// Our Configure Request was accepted.
@@ -54,16 +59,30 @@ pub struct Conn {
     ready: bool,
     /// Channel requests that arrived before encryption: (psm, remote CID, id).
     held: Vec<(u16, u16, u8)>,
+    /// The service the running SDP query looks for.
+    sdp_uuid: u16,
+    /// A headset: its hands-free RFCOMM channel and whether it only has the
+    /// older Headset profile.
+    pub audio: Option<(u8, bool)>,
+    /// RFCOMM session (on the channel with this local CID) and the
+    /// hands-free commands running on it.
+    rfcomm: Option<(u16, rfcomm::Session)>,
+    ag: Option<hfp::Ag>,
+    pub audio_ready: bool,
+    /// A reconnected headset that has not opened RFCOMM by then gets it
+    /// opened by us.
+    pub rfcomm_deadline: Option<u64>,
 }
 
 impl Conn {
     pub fn new(handle: u16, address: [u8; 6], outgoing: bool) -> Self {
         // A known device keeps the descriptor read when it was paired.
-        let layout = BONDS.lock().iter().find(|b| b.address == address && !b.descriptor.is_empty())
-            .map(|b| hid::parse(&b.descriptor)).unwrap_or_default();
+        let (layout, audio) = BONDS.lock().iter().find(|b| b.address == address)
+            .map(|b| (if b.descriptor.is_empty() { hid::Layout::default() } else { hid::parse(&b.descriptor) }, b.audio))
+            .unwrap_or_default();
         Conn { handle, address, outgoing, encrypted: false, layout, channels: Vec::new(), rx: Vec::new(),
             next_cid: FIRST_DYNAMIC_CID, next_id: 1, sdp_transaction: 0, sdp_lists: Vec::new(), ready: false,
-            held: Vec::new() }
+            held: Vec::new(), sdp_uuid: 0, audio, rfcomm: None, ag: None, audio_ready: false, rfcomm_deadline: None }
     }
 
     fn channel(&mut self, local: u16) -> Option<&mut Channel> {
@@ -132,7 +151,7 @@ impl Host {
         let c = &mut self.conns[conn];
         let local = c.next_cid;
         c.next_cid += 1;
-        c.channels.push(Channel { psm, local, remote: 0, configured_out: false, configured_in: false, open: false });
+        c.channels.push(Channel { psm, ours: true, local, remote: 0, configured_out: false, configured_in: false, open: false });
         let mut d = psm.to_le_bytes().to_vec();
         d.extend_from_slice(&local.to_le_bytes());
         self.send_signal(conn, CONNECTION_REQUEST, None, &d);
@@ -175,9 +194,10 @@ impl Host {
         let le16 = |o: usize| d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
         match code {
             CONNECTION_REQUEST if d.len() >= 4 => {
-                // The device opening its HID channels after a reconnect.
+                // The device opening its HID channels (or RFCOMM) after a
+                // reconnect, or querying our SDP records.
                 let (psm, remote) = (le16(0), le16(2));
-                if matches!(psm, PSM_HID_CONTROL | PSM_HID_INTERRUPT) && !self.conns[conn].encrypted {
+                if matches!(psm, PSM_HID_CONTROL | PSM_HID_INTERRUPT | rfcomm::PSM) && !self.conns[conn].encrypted {
                     // Not encrypted yet: answer "pending, authentication
                     // pending" and finish once encryption is on.
                     self.conns[conn].held.push((psm, remote, id));
@@ -236,14 +256,14 @@ impl Host {
             }
             DISCONNECTION_REQUEST if d.len() >= 4 => {
                 let (local, remote) = (le16(0), le16(2));
-                self.conns[conn].channels.retain(|ch| ch.local != local);
+                self.channel_closed(conn, local);
                 let mut r = local.to_le_bytes().to_vec();
                 r.extend_from_slice(&remote.to_le_bytes());
                 self.send_signal(conn, DISCONNECTION_RESPONSE, Some(id), &r);
             }
             DISCONNECTION_RESPONSE if d.len() >= 4 => {
                 let local = le16(2);
-                self.conns[conn].channels.retain(|ch| ch.local != local);
+                self.channel_closed(conn, local);
             }
             ECHO_REQUEST => self.send_signal(conn, ECHO_RESPONSE, Some(id), d),
             INFORMATION_REQUEST if d.len() >= 2 => {
@@ -263,9 +283,22 @@ impl Host {
         }
     }
 
-    /// Accepts (HID channels) or refuses an incoming channel request.
+    fn channel_closed(&mut self, conn: usize, local: u16) {
+        let c = &mut self.conns[conn];
+        c.channels.retain(|ch| ch.local != local);
+        if c.rfcomm.as_ref().is_some_and(|r| r.0 == local) {
+            c.rfcomm = None;
+            c.ag = None;
+            if c.audio_ready {
+                c.audio_ready = false;
+                self.audio_lost(conn);
+            }
+        }
+    }
+
+    /// Accepts (HID, SDP, RFCOMM) or refuses an incoming channel request.
     fn accept_channel(&mut self, conn: usize, psm: u16, remote: u16, id: u8) {
-        if !matches!(psm, PSM_HID_CONTROL | PSM_HID_INTERRUPT) {
+        if !matches!(psm, PSM_HID_CONTROL | PSM_HID_INTERRUPT | sdp::PSM | rfcomm::PSM) {
             self.connection_response(conn, id, 0, remote, 2, 0); // PSM not supported
             return;
         }
@@ -273,7 +306,7 @@ impl Host {
         let local = c.next_cid;
         c.next_cid += 1;
         c.channels.retain(|ch| ch.psm != psm);
-        c.channels.push(Channel { psm, local, remote, configured_out: false, configured_in: false, open: false });
+        c.channels.push(Channel { psm, ours: false, local, remote, configured_out: false, configured_in: false, open: false });
         self.connection_response(conn, id, local, remote, 0, 0);
         self.send_configure(conn, remote);
     }
@@ -300,14 +333,20 @@ impl Host {
             return;
         }
         ch.open = true;
-        let psm = ch.psm;
+        let (psm, ours) = (ch.psm, ch.ours);
         match psm {
-            sdp::PSM => {
+            sdp::PSM if ours => self.sdp_query(conn, local, sdp::HID_SERVICE),
+            rfcomm::PSM => {
                 let c = &mut self.conns[conn];
-                c.sdp_transaction = 1;
-                c.sdp_lists.clear();
-                let req = sdp::request(1, sdp::HID_SERVICE, sdp::HID_DESCRIPTOR_LIST, &[]);
-                self.send_frame(conn, local_remote(&self.conns[conn], local), &req);
+                let headset = c.audio.is_some_and(|a| a.1);
+                let session = match c.audio {
+                    Some((channel, _)) if ours => rfcomm::Session::connect(channel),
+                    _ => rfcomm::Session::accept(),
+                };
+                c.rfcomm = Some((local, session));
+                c.ag = Some(hfp::Ag::new(headset));
+                c.rfcomm_deadline = None;
+                self.rfcomm_pump(conn);
             }
             PSM_HID_CONTROL => {
                 if self.conns[conn].outgoing {
@@ -325,19 +364,98 @@ impl Host {
         }
     }
 
-    /// After pairing: read the HID report descriptor over SDP first.
+    /// After pairing: find out over SDP what the device is (unless that is
+    /// known from before), then open its HID channels or RFCOMM.
     pub(super) fn start_sdp(&mut self, conn: usize) {
-        if !self.conns[conn].layout.is_empty() {
+        let c = &self.conns[conn];
+        if !c.layout.is_empty() {
             self.connect_channel(conn, PSM_HID_CONTROL);
+        } else if c.audio.is_some() {
+            self.open_rfcomm(conn);
         } else {
             self.connect_channel(conn, sdp::PSM);
         }
     }
 
+    pub(super) fn open_rfcomm(&mut self, conn: usize) {
+        let c = &mut self.conns[conn];
+        if c.rfcomm.is_none() && !c.channels.iter().any(|ch| ch.psm == rfcomm::PSM) {
+            c.rfcomm_deadline = None;
+            self.connect_channel(conn, rfcomm::PSM);
+        }
+    }
+
+    /// Asks the device for its records of service `uuid`: the HID
+    /// descriptor list for HID, the protocol list (RFCOMM channel) otherwise.
+    fn sdp_query(&mut self, conn: usize, local: u16, uuid: u16) {
+        let c = &mut self.conns[conn];
+        c.sdp_uuid = uuid;
+        c.sdp_transaction = c.sdp_transaction.wrapping_add(1);
+        c.sdp_lists.clear();
+        let req = sdp::request(c.sdp_transaction, uuid, sdp_attribute(uuid), &[]);
+        let remote = local_remote(c, local);
+        self.send_frame(conn, remote, &req);
+    }
+
+    /// Sends what the RFCOMM session queued and handles what it reported.
+    fn rfcomm_pump(&mut self, conn: usize) {
+        loop {
+            let c = &mut self.conns[conn];
+            let Some((local, s)) = c.rfcomm.as_mut() else { return };
+            let local = *local;
+            let out = core::mem::take(&mut s.out);
+            let events = core::mem::take(&mut s.events);
+            if out.is_empty() && events.is_empty() {
+                return;
+            }
+            let remote = local_remote(c, local);
+            for f in out {
+                self.send_frame(conn, remote, &f);
+            }
+            for e in events {
+                let c = &mut self.conns[conn];
+                match e {
+                    rfcomm::Event::Open => {}
+                    rfcomm::Event::Data(d) => {
+                        let (Some(ag), Some((_, s))) = (c.ag.as_mut(), c.rfcomm.as_mut()) else { continue };
+                        for r in ag.feed(&d) {
+                            s.send(&r);
+                        }
+                    }
+                    rfcomm::Event::Closed(why) => {
+                        let address = c.address;
+                        self.close_channel(conn, local);
+                        self.channel_closed(conn, local);
+                        self.pair_failed(&address, why.into());
+                        return;
+                    }
+                }
+            }
+            let c = &mut self.conns[conn];
+            let open = c.rfcomm.as_ref().is_some_and(|r| r.1.is_open());
+            if open && c.ag.as_ref().is_some_and(|a| a.ready) && !c.audio_ready {
+                c.audio_ready = true;
+                self.audio_ready(conn);
+            }
+        }
+    }
+
     fn on_channel_data(&mut self, conn: usize, local: u16, data: &[u8]) {
         let Some(psm) = self.conns[conn].channel(local).filter(|ch| ch.open).map(|ch| ch.psm) else { return };
+        let ours = self.conns[conn].channel(local).is_some_and(|ch| ch.ours);
         match psm {
-            sdp::PSM => self.on_sdp(conn, local, data),
+            sdp::PSM if ours => self.on_sdp(conn, local, data),
+            sdp::PSM => {
+                let reply = sdp::serve(data);
+                let remote = local_remote(&self.conns[conn], local);
+                self.send_frame(conn, remote, &reply);
+            }
+            rfcomm::PSM => {
+                if let Some((_, s)) = self.conns[conn].rfcomm.as_mut() {
+                    s.receive(data);
+                }
+                self.rfcomm_pump(conn);
+            }
             PSM_HID_INTERRUPT | PSM_HID_CONTROL if data.first() == Some(&HID_DATA_INPUT) => {
                 let c = &mut self.conns[conn];
                 let mut pads = GAMEPADS.lock();
@@ -359,24 +477,48 @@ impl Host {
         match result {
             Ok(cont) if !cont.is_empty() => {
                 c.sdp_transaction = c.sdp_transaction.wrapping_add(1);
-                let req = sdp::request(c.sdp_transaction, sdp::HID_SERVICE, sdp::HID_DESCRIPTOR_LIST, &cont);
+                let req = sdp::request(c.sdp_transaction, c.sdp_uuid, sdp_attribute(c.sdp_uuid), &cont);
                 let remote = local_remote(c, local);
                 self.send_frame(conn, remote, &req);
             }
-            Ok(_) => {
+            Ok(_) if c.sdp_uuid == sdp::HID_SERVICE => {
                 let descriptor = sdp::report_descriptor(&c.sdp_lists);
                 let address = c.address;
-                self.close_channel(conn, local);
                 match descriptor {
                     Some(d) if !hid::parse(&d).is_empty() => {
+                        self.close_channel(conn, local);
                         self.conns[conn].layout = hid::parse(&d);
                         if let Some(b) = BONDS.lock().iter_mut().find(|b| b.address == address) {
                             b.descriptor = d;
                         }
                         self.connect_channel(conn, PSM_HID_CONTROL);
                     }
-                    Some(_) => self.pair_failed(&address, "it has no gamepad controls (not a gamepad?)".into()),
-                    None => self.pair_failed(&address, "it does not offer the HID service (not a gamepad?)".into()),
+                    Some(_) => {
+                        self.close_channel(conn, local);
+                        self.pair_failed(&address, "it has no gamepad controls (not a gamepad?)".into());
+                    }
+                    // Not a HID device: perhaps a headset.
+                    None => self.sdp_query(conn, local, sdp::HANDSFREE),
+                }
+            }
+            Ok(_) => {
+                let channel = sdp::rfcomm_channel(&c.sdp_lists);
+                let (address, uuid) = (c.address, c.sdp_uuid);
+                match channel {
+                    Some(ch) => {
+                        self.close_channel(conn, local);
+                        let audio = Some((ch, uuid == sdp::HEADSET));
+                        self.conns[conn].audio = audio;
+                        if let Some(b) = BONDS.lock().iter_mut().find(|b| b.address == address) {
+                            b.audio = audio;
+                        }
+                        self.open_rfcomm(conn);
+                    }
+                    None if uuid == sdp::HANDSFREE => self.sdp_query(conn, local, sdp::HEADSET),
+                    None => {
+                        self.close_channel(conn, local);
+                        self.pair_failed(&address, "it is neither a gamepad nor a headset (no HID or hands-free service)".into());
+                    }
                 }
             }
             Err(e) => {
@@ -386,6 +528,10 @@ impl Host {
             }
         }
     }
+}
+
+fn sdp_attribute(uuid: u16) -> u16 {
+    if uuid == sdp::HID_SERVICE { sdp::HID_DESCRIPTOR_LIST } else { sdp::PROTOCOL_DESCRIPTORS }
 }
 
 fn local_remote(c: &Conn, local: u16) -> u16 {
