@@ -69,8 +69,7 @@ triggers (X, Y, Z, Rx, Ry, Rz, gas, brake), the d-pad (hat switch) and up to 32 
 standard gamepad works without a per-model driver; `gamepad` shows what each pad is pressing.
 A paired pad reconnects by itself when switched on (the adapter keeps page scan on and accepts
 only paired devices). Pairings live in memory until AeroForge gets a writable disk, so pads have
-to be paired again after a restart. Programs cannot read the gamepad yet, and Bluetooth LE
-gamepads (HID over GATT) come next. The simulated adapter also plays a classic gamepad that
+to be paired again after a restart. Programs cannot read the gamepad yet. The simulated adapter also plays a classic gamepad that
 pairs, sends input, switches off and on and reconnects, which the boot test drives through the
 shell.
 
@@ -108,6 +107,20 @@ the output when something plays and stops it after half a second of silence, and
 `run melody` plays a C major arpeggio, and the boot test checks its four notes in QEMU's WAV
 output.
 
+Since 0.13 Bluetooth LE gamepads work too (`kernel/src/bt/le.rs`). `bt pair <address>` on a pad
+the scan saw over LE connects over LE, pairs with the Security Manager Protocol (LE legacy
+pairing, "Just Works": the confirm and short-term key functions run on a small AES-128 in
+`crypto.rs`, checked against the specification's test values), encrypts the link and receives
+the pad's long-term key. HID over GATT then finds the HID service, reads the report map (with
+long reads) and each report characteristic's Report Reference, and turns on the input reports'
+notifications, which feed the same report parser as classic pads. A paired LE pad reconnects
+when it advertises: the adapter waits for any paired LE device through its accept list and
+encrypts with the stored key. Adapters with separate LE data buffers (like the MT7921) get their
+own flow control. Pads that insist on LE Secure Connections or a passkey are refused for now
+with a message saying so. The simulated adapter's LE pad checks the pairing values with its own
+AES, guards its HID attributes behind encryption, and switches off and on, which the boot test
+drives like the classic one.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -126,7 +139,7 @@ output.
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -167,7 +180,8 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
   src/bt/                 Bluetooth host: HCI bring-up, scanning, pairing (mod.rs),
                           L2CAP (l2cap.rs), SDP client and server (sdp.rs), HID
                           gamepads (hid.rs), RFCOMM (rfcomm.rs), hands-free audio
-                          gateway (hfp.rs)
+                          gateway (hfp.rs), LE pairing and HID over GATT (le.rs,
+                          crypto.rs)
   src/sound.rs            sound cards (HD Audio): outputs, mixer, test tones
   src/modules.rs          boot modules: user programs and firmware
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
@@ -193,7 +207,7 @@ tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/dis
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 tools/make-usb-disk.sh    builds the USB stick image (MBR + FAT32) from tools/usb-files/
 tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
-tools/fakebt/             simulated USB Bluetooth adapter, gamepad and headset for QEMU (usbredir, C)
+tools/fakebt/             simulated USB Bluetooth adapter, gamepads and headset for QEMU (usbredir, C)
 tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)
 tools/wav-tone.py         measures the test tone in QEMU's recorded sound output (boot test)
 ```
