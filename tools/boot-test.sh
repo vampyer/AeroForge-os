@@ -89,7 +89,9 @@ build/fakepad build/xpad.sock --xinput 2>"$FAKEPAD_LOG" &
 XPAD_PID=$!
 build/fakepad build/hidpad.sock --hid 2>>"$FAKEPAD_LOG" &
 HIDPAD_PID=$!
-python3 tools/echo-server.py >build/echo-server.log 2>&1 &
+: >build/echo-server.log
+# Appending: the host client below writes to the same log.
+python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
