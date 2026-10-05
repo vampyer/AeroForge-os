@@ -229,8 +229,8 @@ fn exception(frame: &InterruptFrame) {
     }
     if frame.vector == 14 {
         panic!(
-            "CPU exception #{} {} (error {:#x})\n  faulting address {:#x}\n  rip {:#x}  rsp {:#x}",
-            frame.vector, name, frame.error_code, crate::arch::read_cr2(), frame.rip, frame.rsp
+            "CPU exception #{} {} (error {:#x})\n  faulting address {:#x}\n  rip {:#x}  rsp {:#x}  rflags {:#x}",
+            frame.vector, name, frame.error_code, crate::arch::read_cr2(), frame.rip, frame.rsp, frame.rflags
         );
     }
     panic!(
