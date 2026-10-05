@@ -375,6 +375,7 @@ fn wake_socket_waiters() {
     for t in &waiters {
         sched::wake_waiter(t);
     }
+    crate::wait::notify();
 }
 
 fn close_dropped(st: &mut Stack) {
@@ -539,6 +540,24 @@ impl UserSocket {
             connected: AtomicBool::new(false),
             backlog: IrqMutex::new(Vec::new()),
             listening: AtomicBool::new(false),
+        }
+    }
+
+    /// Would `recv` (or `accept`, when listening) return without waiting?
+    /// Also true once a TCP connection is closed or reset.
+    pub fn readable(&self) -> bool {
+        let mut guard = STACK.lock();
+        let Some(st) = guard.as_mut() else { return false };
+        if self.listening.load(Ordering::SeqCst) {
+            return self.backlog.lock().iter().any(|&h| {
+                matches!(st.sockets.get::<tcp::Socket>(h).state(), tcp::State::Established | tcp::State::CloseWait)
+            });
+        }
+        if self.tcp {
+            let s = st.sockets.get::<tcp::Socket>(self.handle);
+            s.can_recv() || (self.connected.load(Ordering::Relaxed) && !s.may_recv())
+        } else {
+            st.sockets.get::<udp::Socket>(self.handle).can_recv()
         }
     }
 

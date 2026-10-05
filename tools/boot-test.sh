@@ -51,7 +51,9 @@
 # then show its sockets closed and gone. It also reads the network info,
 # looks names up through the test DNS server in echo-server.py, and runs a
 # TCP server that a client on this host reaches through QEMU's port
-# forwarding (host 5580 to guest 7070).
+# forwarding (host 5580 to guest 7070). 'waittest' waits on several handles
+# at once: events set by another thread, a port, a UDP socket that the
+# echo server answers, and a child process that it kills.
 # 'spreadtest' leaves its busy threads at one, three, one and three per CPU:
 # periodic balancing must even them out although no CPU goes idle.
 # 'wakeups' counts timer interrupts per CPU over a second: cpu0, which only
@@ -257,6 +259,9 @@ for _ in $(seq "$TIMEOUT"); do
         # Its sockets must be closed and removed once it has exited.
         sleep 3; type_keys $'ifconfig\n'; STAGE=netsockets
     elif [ $STAGE = netsockets ] && grep -q "program socket(s) open" "$LOG"; then
+        # One wait on events, a port, a socket and a child process.
+        sleep 1; type_keys $'run waittest\n'; STAGE=wait
+    elif [ $STAGE = wait ] && grep -q "\[waittest\] .*\(: OK\|FAILED\)" "$LOG"; then
         sleep 1; type_keys $'run spreadtest\n'; STAGE=spread
     elif [ $STAGE = spread ] && grep -q "\[spreadtest\] .*\(: OK\|FAILED\)" "$LOG"; then
         # Tickless idle: timer interrupts per CPU over one second.
@@ -331,6 +336,8 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "network info, DNS lookups or the TCP server did not work" build/echo-server.log; }
         grep -q "host client: got .*: OK" build/echo-server.log || { fail "the host's client did not get nettest's server's answer" build/echo-server.log; }
         grep -q "^  0 program socket(s) open" "$LOG" || { fail "nettest's sockets were not closed after it exited"; }
+        grep -q "\[waittest\] events, ports, sockets and child processes in one wait: OK" "$LOG" \
+            || { fail "waiting on several handles at once failed (events, a port, a socket or a child process)"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }
         grep -q "^  cpu0: [0-5] timer interrupts" "$LOG" \
