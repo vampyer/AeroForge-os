@@ -10,7 +10,7 @@ use core::sync::atomic::Ordering;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, console, percpu, sched, security, vfs};
+use crate::{apic, console, percpu, sched, security, sound, vfs};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -28,6 +28,8 @@ pub const SYS_PORT_RECV: u64 = 12;
 pub const SYS_HANDLE_CLOSE: u64 = 13;
 pub const SYS_HANDLE_DUP: u64 = 14;
 pub const SYS_FILE_READ: u64 = 15;
+pub const SYS_AUDIO_WRITE: u64 = 16;
+pub const SYS_AUDIO_QUEUED: u64 = 17;
 
 const E_BADHANDLE: i64 = -1;
 const E_FAULT: i64 = -2;
@@ -205,6 +207,20 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             Ok(data.len() as u64)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
+        SYS_AUDIO_WRITE => {
+            // Interleaved 48 kHz 16-bit stereo frames; returns how many were
+            // queued (the rest did not fit: try again a little later).
+            let frames = a1.min(sound::RATE as u64 / 10);
+            let bytes = user_bytes(a0, frames * 4)?;
+            let samples: Vec<i16> = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+            sound::write(proc_.pid, &samples).map(|n| n as u64).map_err(|_| E_NOTFOUND)
+        }
+        SYS_AUDIO_QUEUED => {
+            if sound::selected().is_none() {
+                return Err(E_NOTFOUND);
+            }
+            Ok(sound::queued(proc_.pid) as u64)
+        }
         _ => Err(E_INVAL),
     }
 }

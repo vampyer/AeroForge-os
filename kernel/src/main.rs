@@ -285,6 +285,9 @@ extern "C" fn kmain() -> ! {
     if bt_adapters > 0 {
         sched::spawn_kernel("bt", bt::bt_thread, 0, Some(3 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
     }
+    if cards > 0 {
+        sched::spawn_kernel("mixer", sound::mixer_thread, 0, Some(1 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
+    }
     sched::spawn_kernel("shell", shell::run, 0, Some(0));
 
     // The boot thread is now cpu0's idle thread.
