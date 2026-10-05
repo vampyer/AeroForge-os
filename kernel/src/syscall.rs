@@ -108,9 +108,15 @@ extern "C" fn syscall_from_user(frame: &mut InterruptFrame) {
 /// Opens the `syscall` instruction to ring 3 on the calling CPU.
 pub fn init_cpu() {
     unsafe {
-        // Kernel CS = 0x08 (SS 0x10). sysret: SS = 0x10 + 8 = user data,
-        // CS = 0x10 + 16 = user code (both with RPL 3), the GDT's order.
-        arch::wrmsr(MSR_STAR, (0x10u64 << 48) | ((gdt::KERNEL_CODE as u64) << 32));
+        // Kernel CS = 0x08 (SS 0x10). sysret: SS = base + 8 = user data,
+        // CS = base + 16 = user code, the GDT's order. The base carries RPL 3
+        // (0x13): Intel CPUs (and QEMU) force RPL 3 on both selectors, but
+        // AMD CPUs load them as given. With RPL 0 there, the first interrupt
+        // in a program after a system call pushed SS 0x18 and its `iretq`
+        // raised #GP(0x18) on real Ryzen hardware.
+        const SYSRET_BASE: u64 = gdt::USER_DATA as u64 - 8; // 0x13
+        const _: () = assert!(gdt::USER_CODE == gdt::USER_DATA + 8);
+        arch::wrmsr(MSR_STAR, (SYSRET_BASE << 48) | ((gdt::KERNEL_CODE as u64) << 32));
         arch::wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
         arch::wrmsr(MSR_FMASK, FMASK);
         arch::wrmsr(arch::MSR_EFER, arch::rdmsr(arch::MSR_EFER) | EFER_SCE);
