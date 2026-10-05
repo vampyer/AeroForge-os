@@ -102,12 +102,12 @@ impl Shell {
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
             "ps" => {
-                kprintln!("  {:>4} {:>4} {:>4}  {:<9} {:>7}  name", "tid", "pid", "cpu", "state", "ticks");
+                kprintln!("  {:>4} {:>4} {:>4}  {:<9} {:<7} {:>7}  name", "tid", "pid", "cpu", "state", "prio", "ticks");
                 let threads = sched::THREADS.lock();
                 for t in threads.values() {
                     let handles = t.process.as_ref().map_or(0, |p| p.handles.lock().count());
-                    kprintln!("  {:>4} {:>4} {:>4}  {:<9} {:>7}  {}{}",
-                        t.tid, t.pid(), t.cpu(), t.state().name(), t.runtime_ticks.load(Ordering::Relaxed), t.name,
+                    kprintln!("  {:>4} {:>4} {:>4}  {:<9} {:<7} {:>7}  {}{}",
+                        t.tid, t.pid(), t.cpu(), t.state().name(), sched::priority_name(t.priority()), t.runtime_ticks.load(Ordering::Relaxed), t.name,
                         if t.process.is_some() { alloc::format!("  ({} handles)", handles) } else { String::new() });
                 }
                 kprintln!("  {} process(es)", process::PROCESSES.lock().len());

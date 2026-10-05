@@ -171,6 +171,28 @@ pub mod thread {
     pub fn id() -> u64 {
         unsafe { syscall(sys::THREAD_ID, 0, 0, 0, 0) as u64 }
     }
+
+    /// How urgently a thread wants the CPU. A CPU always runs its
+    /// highest-priority ready thread, so a `High` thread (a game's main
+    /// loop, audio) runs ahead of `Normal` ones and `Low` threads
+    /// (background work) only get CPUs nobody else wants.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Priority {
+        Low = 0,
+        Normal = 1,
+        High = 2,
+    }
+
+    /// Sets the calling thread's priority.
+    pub fn set_priority(p: Priority) -> Result<(), i64> {
+        set_priority_of(0, p)
+    }
+
+    /// Sets the priority of thread `tid` of this program.
+    pub fn set_priority_of(tid: u64, p: Priority) -> Result<(), i64> {
+        let r = unsafe { syscall(sys::THREAD_PRIORITY, tid, p as u64, 0, 0) };
+        if r < 0 { Err(r) } else { Ok(()) }
+    }
 }
 
 pub mod process {
