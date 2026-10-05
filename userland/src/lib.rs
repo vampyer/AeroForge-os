@@ -3,6 +3,11 @@
 
 #![no_std]
 
+extern crate alloc;
+
+mod rt;
+pub use rt::{futex, mem, process, sync, thread};
+
 use core::arch::asm;
 use core::fmt::{self, Write};
 
@@ -29,6 +34,15 @@ pub mod sys {
     pub const FILE_WRITE: u64 = 19;
     pub const FILE_DELETE: u64 = 20;
     pub const DIR_CREATE: u64 = 21;
+    pub const MEM_MAP: u64 = 22;
+    pub const MEM_UNMAP: u64 = 23;
+    pub const THREAD_CREATE: u64 = 24;
+    pub const THREAD_EXIT: u64 = 25;
+    pub const THREAD_JOIN: u64 = 26;
+    pub const FUTEX_WAIT: u64 = 27;
+    pub const FUTEX_WAKE: u64 = 28;
+    pub const PROCESS_WAIT: u64 = 29;
+    pub const THREAD_ID: u64 = 30;
 }
 
 pub mod rights {
@@ -46,6 +60,7 @@ pub const E_RIGHTS: i64 = -4;
 pub const E_FULL: i64 = -5;
 pub const E_INVAL: i64 = -6;
 pub const E_EXISTS: i64 = -7;
+pub const E_AGAIN: i64 = -8;
 
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -59,6 +74,7 @@ fn check(r: i64) -> Result<u64, i64> {
     if r < 0 { Err(r) } else { Ok(r as u64) }
 }
 
+/// Ends the whole program, every thread of it.
 pub fn exit(code: i64) -> ! {
     unsafe { syscall(sys::EXIT, code as u64, 0, 0, 0) };
     loop {}
@@ -427,3 +443,9 @@ bcmp:
 /// programs abort on panic and never unwind.
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
+
+/// Also referenced (by the prebuilt `alloc`), never reached: nothing unwinds.
+#[no_mangle]
+pub extern "C" fn _Unwind_Resume() -> ! {
+    exit(-1)
+}

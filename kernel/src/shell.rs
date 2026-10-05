@@ -422,6 +422,7 @@ impl Shell {
                     used / 1024, slab / 1024, large / 1024);
                 kprintln!("  HHDM {:#x}, kernel PML4 {:#x}, active CR3 {:#x}",
                     memory::hhdm_offset(), memory::kernel_pml4(), arch::read_cr3());
+                kprintln!("  {} TLB shootdowns since boot", crate::tlb::count());
             }
             "cpu" => {
                 let mut buf = [0u8; 48];

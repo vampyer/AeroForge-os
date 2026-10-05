@@ -14,7 +14,7 @@ QEMU_FLAGS    ?= -M q35 -cpu max -m 512M -smp 4 -no-reboot -no-shutdown
 BUILD  := build
 KERNEL := kernel/target/x86_64-unknown-none/release/aerokernel
 USERBIN := userland/target/x86_64-unknown-linux-gnu/release
-PROGRAMS := aerosmss echod client crasher sectest nxtest rotest melody padtest savetest fputest
+PROGRAMS := aerosmss echod client crasher sectest nxtest rotest melody padtest savetest fputest threadtest
 FIRMWARE := mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin mediatek/BT_RAM_CODE_MT7961_1a_2_hdr.bin \
             mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin
 ISO    := $(BUILD)/aeroforge.iso

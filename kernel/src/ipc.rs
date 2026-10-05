@@ -61,16 +61,23 @@ impl Port {
         Ok(())
     }
 
-    /// Blocks until a message arrives.
-    pub fn recv(&self) -> Message {
+    /// Blocks until a message arrives. None if the caller's process is being
+    /// killed (the system call return path then ends the thread).
+    pub fn recv(&self) -> Option<Message> {
         arch::without_interrupts(|| loop {
             {
                 let mut g = self.inner.lock();
                 if let Some(m) = g.queue.pop_front() {
-                    return m;
+                    return Some(m);
                 }
                 let me = sched::mark_current_blocked();
                 g.waiters.push_back(me);
+            }
+            if sched::killed() {
+                sched::unblock_current();
+                let me = sched::current();
+                self.inner.lock().waiters.retain(|t| !Arc::ptr_eq(t, &me));
+                return None;
             }
             sched::schedule();
         })

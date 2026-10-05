@@ -61,6 +61,14 @@ pub struct Thread {
     pub runtime_ticks: AtomicU64,
     /// Saved floating point and vector registers; user threads only.
     fpu: Option<FpuArea>,
+    /// Threads waiting in SYS_THREAD_JOIN for this one to exit.
+    join: IrqMutex<JoinState>,
+}
+
+#[derive(Default)]
+struct JoinState {
+    exited: bool,
+    waiters: Vec<Arc<Thread>>,
 }
 
 // saved_rsp is only touched by the owning CPU inside `schedule`.
@@ -182,6 +190,7 @@ pub fn init_cpu() {
         wake_at: AtomicU64::new(0),
         runtime_ticks: AtomicU64::new(0),
         fpu: None,
+        join: IrqMutex::new(JoinState::default()),
     });
     let mut rq = cpu.rq.lock();
     rq.idle = Some(idle.clone());
@@ -208,6 +217,7 @@ fn new_thread(name: String, process: Option<Arc<Process>>, cpu: usize) -> Thread
         wake_at: AtomicU64::new(0),
         runtime_ticks: AtomicU64::new(0),
         fpu,
+        join: IrqMutex::new(JoinState::default()),
     }
 }
 
@@ -238,8 +248,9 @@ pub fn spawn_kernel(name: &str, entry: fn(u64), arg: u64, cpu: Option<usize>) ->
     enqueue_new(t)
 }
 
-/// Creates a ring-3 thread that starts at `entry` with stack `user_rsp`.
-pub fn spawn_user(process: Arc<Process>, name: &str, entry: u64, user_rsp: u64) -> Arc<Thread> {
+/// Creates a ring-3 thread that starts at `entry` with stack `user_rsp` and
+/// `arg` in rdi (the first argument).
+pub fn spawn_user(process: Arc<Process>, name: &str, entry: u64, user_rsp: u64, arg: u64) -> Arc<Thread> {
     process.threads.fetch_add(1, Ordering::SeqCst);
     let t = new_thread(String::from(name), Some(process), pick_cpu());
     let frame_addr = t.kstack_top() - core::mem::size_of::<InterruptFrame>() as u64;
@@ -250,6 +261,7 @@ pub fn spawn_user(process: Arc<Process>, name: &str, entry: u64, user_rsp: u64) 
         frame.cs = gdt::USER_CODE as u64;
         frame.rflags = 0x202; // IF set
         frame.rsp = user_rsp;
+        frame.rdi = arg;
         frame.ss = gdt::USER_DATA as u64;
         // First switch "returns" through the interrupt exit path into ring 3.
         *t.saved_rsp.get() = seed_switch_frame(frame_addr - 56, isr_exit as *const () as u64, 0, 0);
@@ -384,6 +396,13 @@ pub fn exit_current() -> ! {
     arch::disable_interrupts();
     let cur = current();
     THREADS.lock().remove(&cur.tid);
+    {
+        let mut j = cur.join.lock();
+        j.exited = true;
+        for t in j.waiters.drain(..) {
+            wake(&t);
+        }
+    }
     if let Some(p) = cur.process.as_ref() {
         if p.threads.fetch_sub(1, Ordering::SeqCst) == 1 {
             crate::process::on_exit(p);
@@ -393,6 +412,63 @@ pub fn exit_current() -> ! {
     drop(cur);
     schedule();
     unreachable!("dead thread was rescheduled");
+}
+
+/// Waits until thread `tid` has exited. Returns false if no such thread is
+/// running (it may have exited already). Blocking helpers like this one give
+/// up when the caller's process is killed and let the system call return
+/// path end the thread, so nothing they hold is leaked.
+pub fn join(tid: u64) -> bool {
+    let Some(t) = THREADS.lock().get(&tid).cloned() else { return false };
+    arch::without_interrupts(|| loop {
+        {
+            let mut j = t.join.lock();
+            if j.exited {
+                return true;
+            }
+            j.waiters.push(mark_current_blocked());
+        }
+        if killed() {
+            unblock_current();
+            return false;
+        }
+        schedule();
+    })
+}
+
+/// Is the current thread's process being torn down? Then the thread must
+/// not block (or go back to ring 3) any more, only exit.
+pub fn killed() -> bool {
+    current().process.as_ref().is_some_and(|p| p.exiting.load(Ordering::SeqCst))
+}
+
+/// Undoes `mark_current_blocked` for a thread that changed its mind before
+/// calling `schedule` (and may meanwhile have been woken onto the ready queue).
+pub fn unblock_current() {
+    let cpu = percpu::this();
+    let mut rq = cpu.rq.lock();
+    let cur = rq.current.clone().unwrap();
+    if cur.state() == State::Ready {
+        rq.ready.retain(|t| !Arc::ptr_eq(t, &cur));
+    }
+    cur.set_state(State::Running);
+}
+
+/// Gets every thread of process `pid` moving towards its exit: blocked
+/// threads are woken (their wait loops see `killed()`), sleepers wake at
+/// the next tick, and threads in ring 3 die at their next interrupt.
+/// The caller has already set the process's `exiting` flag.
+pub fn kill_threads_of(pid: u64) {
+    let victims: Vec<Arc<Thread>> = THREADS.lock().values().filter(|t| t.pid() == pid).cloned().collect();
+    for t in victims {
+        t.wake_at.store(0, Ordering::Relaxed);
+        wake(&t);
+        if t.cpu != percpu::this().index {
+            if let Some(cpu) = percpu::get(t.cpu) {
+                crate::apic::send_ipi(cpu.lapic_id, crate::interrupts::VECTOR_RESCHEDULE);
+            }
+        }
+    }
 }
 
 /// Idle loop for a CPU once its boot code is done.

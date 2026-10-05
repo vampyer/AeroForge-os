@@ -8,12 +8,11 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
 
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, arch, console, gamepad, gdt, percpu, sched, security, sound, vfs};
+use crate::{apic, arch, console, futex, gamepad, gdt, percpu, sched, security, sound, vfs};
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -140,6 +139,18 @@ pub const SYS_GAMEPAD_READ: u64 = 18;
 pub const SYS_FILE_WRITE: u64 = 19;
 pub const SYS_FILE_DELETE: u64 = 20;
 pub const SYS_DIR_CREATE: u64 = 21;
+pub const SYS_MEM_MAP: u64 = 22;
+pub const SYS_MEM_UNMAP: u64 = 23;
+pub const SYS_THREAD_CREATE: u64 = 24;
+pub const SYS_THREAD_EXIT: u64 = 25;
+pub const SYS_THREAD_JOIN: u64 = 26;
+pub const SYS_FUTEX_WAIT: u64 = 27;
+pub const SYS_FUTEX_WAKE: u64 = 28;
+pub const SYS_PROCESS_WAIT: u64 = 29;
+pub const SYS_THREAD_ID: u64 = 30;
+
+/// User addresses end here (the lower half of the address space).
+const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Largest file one SYS_FILE_WRITE can save.
 const MAX_FILE_WRITE: u64 = 8 * 1024 * 1024;
@@ -151,6 +162,7 @@ const E_RIGHTS: i64 = -4;
 const E_FULL: i64 = -5;
 const E_INVAL: i64 = -6;
 const E_EXISTS: i64 = -7;
+const E_AGAIN: i64 = -8;
 
 const NO_HANDLE: u64 = u64::MAX;
 
@@ -219,6 +231,11 @@ pub fn dispatch(frame: &mut InterruptFrame) {
         Ok(v) => v,
         Err(e) => e as u64,
     };
+    // Its process is exiting (another thread called exit, or faulted): the
+    // thread ends here, with nothing of the call still held.
+    if sched::killed() {
+        sched::exit_current();
+    }
 }
 
 fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
@@ -228,9 +245,60 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
 
     match num {
         SYS_EXIT => {
-            proc_.exit_code.store(a0 as i64, Ordering::SeqCst);
+            // The whole process: its other threads stop too.
+            process::kill(&proc_, a0 as i64);
+            Ok(0)
+        }
+        SYS_THREAD_EXIT => {
             drop(proc_);
             sched::exit_current();
+        }
+        SYS_THREAD_ID => Ok(sched::current().tid),
+        SYS_THREAD_CREATE => {
+            // entry, stack top (16-byte aligned), argument for the entry function.
+            if a0 >= USER_END || a1 >= USER_END || a1 % 16 != 0 {
+                return Err(E_INVAL);
+            }
+            if proc_.exiting.load(core::sync::atomic::Ordering::SeqCst) {
+                return Err(E_INVAL);
+            }
+            let name = alloc::format!("{}/thread", proc_.name);
+            // Stack as after a call: a return address slot below the top.
+            Ok(sched::spawn_user(proc_, &name, a0, a1 - 8, a2).tid)
+        }
+        SYS_THREAD_JOIN => {
+            match sched::THREADS.lock().get(&a0) {
+                Some(t) if t.pid() != proc_.pid => return Err(E_INVAL),
+                _ => {}
+            }
+            drop(proc_);
+            sched::join(a0);
+            Ok(0)
+        }
+        SYS_MEM_MAP => process::map_memory(&proc_, a0).map_err(|e| if e == "bad length" { E_INVAL } else { E_FULL }),
+        SYS_MEM_UNMAP => process::unmap_memory(&proc_, a0).map(|_| 0).map_err(|_| E_INVAL),
+        SYS_FUTEX_WAIT => {
+            let pid = proc_.pid;
+            drop(proc_);
+            futex::wait(pid, a0, a1 as u32).map(|_| 0).map_err(|e| match e {
+                futex::WaitError::Again => E_AGAIN,
+                futex::WaitError::Fault => E_FAULT,
+            })
+        }
+        SYS_FUTEX_WAKE => {
+            if a0 % 4 != 0 || a0 >= USER_END {
+                return Err(E_INVAL);
+            }
+            Ok(futex::wake(proc_.pid, a0, a1))
+        }
+        SYS_PROCESS_WAIT => {
+            // pid, where to store the exit code (an i64).
+            check_writable(a1, 8)?;
+            let me = proc_.pid;
+            drop(proc_);
+            let code = process::wait(me, a0).map_err(|_| E_NOTFOUND)?;
+            to_user(a1, &code.to_le_bytes())?;
+            Ok(0)
         }
         SYS_WRITE => {
             let bytes = user_bytes(a0, a1.min(4096))?;
@@ -304,7 +372,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             // Check both buffers before blocking, so a bad pointer can't lose a message.
             check_writable(a1, a2)?;
             check_writable(a3, core::mem::size_of::<RecvInfo>() as u64)?;
-            let msg = port.recv();
+            let msg = port.recv().ok_or(E_INVAL)?;
             let n = msg.data.len().min(a2 as usize);
             to_user(a1, &msg.data[..n])?;
             let handle = match msg.handle {

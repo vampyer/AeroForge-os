@@ -15,6 +15,7 @@ pub const VECTOR_TIMER: u8 = 32;
 pub const VECTOR_KEYBOARD: u8 = 33;
 pub const VECTOR_SYSCALL: u8 = 0x80;
 pub const VECTOR_RESCHEDULE: u8 = 0xF0;
+pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF1;
 
 global_asm!(include_str!(concat!(env!("OUT_DIR"), "/isr_stubs.s")));
 
@@ -174,8 +175,13 @@ extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
             apic::eoi();
             sched::schedule();
         }
+        VECTOR_TLB_SHOOTDOWN => crate::tlb::on_ipi(),
         apic::SPURIOUS_VECTOR => {}
         _ => apic::eoi(),
+    }
+    // A thread whose process is exiting does not go back to ring 3.
+    if frame.cs & 3 == 3 && sched::killed() {
+        sched::exit_current();
     }
 }
 
@@ -207,8 +213,9 @@ fn exception(frame: &InterruptFrame) {
                 alloc::string::String::new()
             }
         ));
+        // The whole process goes, not just the thread that faulted.
         if let Some(p) = t.process.as_ref() {
-            p.exit_code.store(-(frame.vector as i64) - 1000, Ordering::SeqCst);
+            crate::process::kill(p, -(frame.vector as i64) - 1000);
         }
         drop(t);
         sched::exit_current();
