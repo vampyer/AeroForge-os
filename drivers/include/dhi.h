@@ -134,6 +134,16 @@ int32_t aero_xhci_poll(int32_t ctrl, dhi_input_event *out, int32_t max);
 /* Describes device `index` (0..devices-1) of a controller. 0 = ok. */
 int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device *out);
 
+/* USB mass storage (bulk-only transport, SCSI) found during init. Fills
+ * `out` for the controller's disk `index` (0, 1, ...) and returns a disk id
+ * for aero_xhci_read, or -1 when there is no such disk. */
+int32_t aero_xhci_disk(int32_t ctrl, int32_t index, dhi_block_info *out);
+
+/* Reads `count` blocks starting at `lba` into the DMA buffer at `buf_phys`.
+ * count * block_size must not exceed max_transfer. 0 = ok. Safe to call
+ * while another CPU runs aero_xhci_poll. */
+int32_t aero_xhci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
 /* ---- Intel Ethernet driver, e1000/e1000e family (drivers/e1000) ---- */
 
 typedef struct dhi_net_info {

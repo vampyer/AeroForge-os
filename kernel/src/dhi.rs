@@ -114,6 +114,8 @@ extern "C" {
     pub fn aero_xhci_init(ops: *const DhiOps, mmio_phys: u64, devices: *mut i32) -> i32;
     pub fn aero_xhci_poll(ctrl: i32, out: *mut InputEvent, max: i32) -> i32;
     pub fn aero_xhci_device(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
+    pub fn aero_xhci_disk(ctrl: i32, index: i32, out: *mut BlockInfo) -> i32;
+    pub fn aero_xhci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
     pub fn aero_e1000_supports(device_id: u16) -> i32;
     pub fn aero_e1000_init(ops: *const DhiOps, mmio_phys: u64, info: *mut NetInfo) -> i32;
     pub fn aero_e1000_send(nic: i32, frame: *const u8, len: u32) -> i32;

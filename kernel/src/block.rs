@@ -27,6 +27,7 @@ pub static DEVICES: IrqMutex<Vec<Arc<dyn BlockDevice>>> = IrqMutex::new(Vec::new
 enum Backend {
     Nvme(i32),
     Ahci(i32),
+    Usb(i32),
 }
 
 /// A whole disk served by one of the C++ storage drivers.
@@ -64,6 +65,7 @@ impl BlockDevice for DriverDisk {
                 match self.backend {
                     Backend::Nvme(c) => dhi::aero_nvme_read(c, lba, blocks, bounce.phys),
                     Backend::Ahci(d) => dhi::aero_ahci_read(d, lba, blocks, bounce.phys),
+                    Backend::Usb(d) => dhi::aero_xhci_read(d, lba, blocks, bounce.phys),
                 }
             };
             if rc != 0 {
@@ -78,6 +80,7 @@ impl BlockDevice for DriverDisk {
         let bus = match self.backend {
             Backend::Nvme(_) => "NVMe",
             Backend::Ahci(_) => "SATA",
+            Backend::Usb(_) => "USB",
         };
         format!("{} sectors x {} B = {} MiB, {} \"{}\" serial {}",
             self.block_count, self.block_size, self.block_count * self.block_size as u64 / (1024 * 1024),
@@ -139,6 +142,25 @@ pub fn probe_ahci() -> usize {
         for (i, info) in infos.iter().take(n as usize).enumerate() {
             let id = first + i as i32;
             if add_disk(format!("sata{}", id), Backend::Ahci(id), info) {
+                found += 1;
+            }
+        }
+    }
+    found
+}
+
+/// Registers the USB sticks and drives the xHCI driver found (call after usb::probe).
+pub fn probe_usb() -> usize {
+    let mut found = 0;
+    let ids: Vec<i32> = crate::usb::CONTROLLERS.lock().iter().map(|c| c.id).collect();
+    for ctrl in ids {
+        for index in 0.. {
+            let mut info = BlockInfo::zeroed();
+            let disk = unsafe { dhi::aero_xhci_disk(ctrl, index, &mut info) };
+            if disk < 0 {
+                break;
+            }
+            if add_disk(format!("usb{}", found), Backend::Usb(disk), &info) {
                 found += 1;
             }
         }

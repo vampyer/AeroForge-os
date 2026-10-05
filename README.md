@@ -6,7 +6,7 @@ A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Every CI run uploads the built ISO as a workflow artifact (Actions tab, "boot test" run, Artifacts).
 
-## What works today (milestone 0.6)
+## What works today (milestone 0.7)
 
 Boots on UEFI through Limine, brings up every CPU, and starts **aerosmss**, the first user
 process. aerosmss starts an `echod` service and three clients; the clients run in ring 3 on
@@ -37,6 +37,14 @@ on the I225 it turns off Energy Efficient Ethernet, Intel's workaround for link 
 early B1/B2 steppings. QEMU emulates the igb family, which tests the shared code; the I225/I226
 specifics (device reset, 2.5 Gb/s, EEE) need real hardware.
 
+Since 0.7 USB sticks and USB drives work: the xHCI driver speaks the bulk-only mass storage
+protocol with SCSI commands (INQUIRY, TEST UNIT READY, READ CAPACITY, READ(10)/READ(16)),
+recovers from stalls, and the disks join the block layer as `usb0`, `usb1`, ... with their
+FAT32 volumes mounted at `/usb0p1` and so on. It works on USB 3 ports and behind hubs (tested
+in QEMU at 5 Gb/s and at full speed behind two nested hubs). Disk reads and the keyboard/mouse
+polling share the controller safely across CPUs. UAS (the faster protocol some USB 3 SSDs
+prefer) comes later; those drives also offer bulk-only, so they work now.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -49,13 +57,13 @@ specifics (device reset, 2.5 Gb/s, EEE) need real hardware.
 | Processes | ELF64 loader, ring 3, syscall gate (`int 0x80`), exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
-| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) |
+| C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads up to 8 KiB per command), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ DMA EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and checks every CPU, both mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -69,7 +77,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. Load balancing between CPU run queues (threads are pinned to the CPU they start on), plus priorities and the game/real-time classes.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; AHCI interrupts, NCQ and writes; USB mass storage, xHCI MSI-X interrupts and hotplug; virtio-net, network interrupts, and sockets for user programs.
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X), one queue pair per CPU and writes; AHCI interrupts, NCQ and writes; USB Attached SCSI (UAS), xHCI MSI-X interrupts and hotplug; virtio-net, network interrupts, and sockets for user programs.
 6. Filesystems move to user-space servers behind IPC, as the design says; FAT32 writes, exFAT and NTFS (read-only on real drives at first).
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and TLB shootdowns so permission changes reach every CPU at once.
 
@@ -110,6 +118,7 @@ drivers/igc/              Intel Ethernet driver, igb/igc: I210/I211, I225/I226 (
 tools/boot-test.sh        headless QEMU boot test
 tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/disk-files/
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
+tools/make-usb-disk.sh    builds the USB stick image (MBR + FAT32) from tools/usb-files/
 ```
 
 ## Building and running
