@@ -127,6 +127,35 @@ pub struct BtmtkResult {
     pub error: [u8; 48],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HdaOutput {
+    pub codec: u8,
+    pub pin: u8,
+    pub dac: u8,
+    pub kind: u8,
+    pub location: u8,
+    pub color: u8,
+    pub fixed: u8,
+    pub plugged: u8,
+}
+
+pub const HDA_SPEAKER: u8 = 1;
+pub const HDA_HEADPHONES: u8 = 2;
+pub const HDA_SPDIF: u8 = 3;
+pub const HDA_HDMI: u8 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HdaInfo {
+    pub codec_ids: [u32; 4],
+    pub codec_count: u8,
+    pub in_streams: u8,
+    pub out_streams: u8,
+    pub output_count: u8,
+    pub outputs: [HdaOutput; 8],
+}
+
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
@@ -146,6 +175,11 @@ extern "C" {
     pub fn aero_btmtk_is_mediatek(vendor: u16, product: u16) -> i32;
     pub fn aero_btmtk_chip(ops: *const DhiOps, bt: i32, out: *mut BtmtkChip) -> i32;
     pub fn aero_btmtk_setup(ops: *const DhiOps, bt: i32, firmware: *const u8, size: u32, out: *mut BtmtkResult) -> i32;
+    pub fn aero_hda_init(ops: *const DhiOps, bar0: u64, out: *mut HdaInfo) -> i32;
+    pub fn aero_hda_start(ctrl: i32, output: i32) -> i32;
+    pub fn aero_hda_write(ctrl: i32, frames: *const i16, count: u32) -> i32;
+    pub fn aero_hda_pending(ctrl: i32) -> i32;
+    pub fn aero_hda_stop(ctrl: i32);
     pub fn aero_e1000_supports(device_id: u16) -> i32;
     pub fn aero_e1000_init(ops: *const DhiOps, mmio_phys: u64, info: *mut NetInfo) -> i32;
     pub fn aero_e1000_send(nic: i32, frame: *const u8, len: u32) -> i32;

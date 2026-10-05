@@ -5,7 +5,7 @@ use alloc::string::String;
 use core::sync::atomic::Ordering;
 
 use crate::console::{self, CYAN, YELLOW};
-use crate::{acpi, apic, arch, block, bt, dhi, interrupts, ipc, kprint, kprintln, memory, modules, net, pci, percpu, process, sched, smp, usb, vfs};
+use crate::{acpi, apic, arch, block, bt, dhi, interrupts, ipc, kprint, kprintln, memory, modules, net, pci, percpu, process, sched, smp, sound, usb, vfs};
 
 /// Kernel thread entry.
 pub fn run(_: u64) {
@@ -79,6 +79,7 @@ impl Shell {
                 kprintln!("  bt pair <address>  pair a Bluetooth gamepad or headset (put it in pairing mode first)");
                 kprintln!("  gamepad     Bluetooth gamepads and what they are pressing");
                 kprintln!("  mic [record [s]]  Bluetooth headset microphones; record and show level and pitch");
+                kprintln!("  sound [test [hz] [s] | use <c>.<o>]  audio outputs; play a test tone; pick the output");
                 kprintln!("  disks       disks and partitions");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
@@ -263,6 +264,46 @@ impl Shell {
                         bt::hat_name(g.pad.hat), axes);
                 }
             }
+            "sound" => match arg.split_once(' ').unwrap_or((arg, "")) {
+                ("", _) => {
+                    let cards = sound::CARDS.lock();
+                    if cards.is_empty() {
+                        kprintln!("  no audio controllers");
+                    }
+                    let selected = sound::selected();
+                    for (ci, c) in cards.iter().enumerate() {
+                        kprintln!("  {}: {} audio {:04x}:{:04x} at {}", c.name, sound::card_name(c.pci_id.0), c.pci_id.0, c.pci_id.1, c.location);
+                        for &id in &c.info.codec_ids[..c.info.codec_count as usize] {
+                            kprintln!("    codec: {}", sound::codec_name(id));
+                        }
+                        for (i, o) in c.outputs().iter().enumerate() {
+                            let plugged = match o.plugged { 1 => ", plugged in", 0 => ", nothing plugged in", _ => "" };
+                            let note = if o.kind == dhi::HDA_HDMI { " (sound needs the display driver, not done yet)" } else { "" };
+                            kprintln!("   {} {}.{}  {}{}{}", if selected == Some((ci, i)) { "*" } else { " " }, ci, i,
+                                sound::output_name(o), plugged, note);
+                        }
+                    }
+                }
+                ("test", rest) => {
+                    let mut it = rest.split_whitespace();
+                    let hz = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
+                    let secs = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).clamp(1, 10);
+                    kprintln!("  playing {} Hz for {} s...", hz, secs);
+                    match sound::tone(hz, secs * 1000) {
+                        Ok(what) => kprintln!("  played {}", what),
+                        Err(e) => console::print_colored(YELLOW, format_args!("  sound: {}\n", e)),
+                    }
+                }
+                ("use", which) => {
+                    let parsed = which.trim().split_once('.').and_then(|(c, o)| Some((c.parse::<usize>().ok()?, o.parse::<usize>().ok()?)));
+                    match parsed.map(|(c, o)| sound::select(c, o)) {
+                        Some(Ok(())) => kprintln!("  sound now goes to {}", which.trim()),
+                        Some(Err(e)) => console::print_colored(YELLOW, format_args!("  sound: {}\n", e)),
+                        None => console::print_colored(YELLOW, format_args!("  usage: sound use <card>.<output>, e.g. sound use 0.1\n")),
+                    }
+                }
+                _ => console::print_colored(YELLOW, format_args!("  usage: sound [test [hz] [seconds] | use <card>.<output>]\n")),
+            },
             "mic" => match arg.split_once(' ').unwrap_or((arg, "")) {
                 ("", _) => {
                     let list = bt::HEADSETS.lock();

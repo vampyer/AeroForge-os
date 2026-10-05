@@ -11,7 +11,8 @@
 # after it "turns off and on" and report again; then 'bt pair' and 'mic record'
 # for the simulated headset: it must pair over the hands-free profile, and a
 # recording must hear its 440 Hz tone, before and after it reconnects on its
-# own. Intended for CI (design doc, Phase 0).
+# own; and 'sound test' must play a 440 Hz tone on the emulated HD Audio card,
+# measured in the WAV file QEMU records. Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,7 +31,7 @@ build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hd
 FAKEBT_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qemu-monitor.sock
+rm -f "$LOG" build/qemu-monitor.sock build/sound.wav
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -42,6 +43,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive file=build/usb.img,if=none,id=stick,format=raw -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
     -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
     -nic user,model=igb -nic user,model=e1000e \
+    -device ich9-intel-hda,id=hda -device hda-output,bus=hda.0,audiodev=snd -audiodev wav,id=snd,path=build/sound.wav \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
     -monitor unix:build/qemu-monitor.sock,server,nowait &
 QEMU_PID=$!
@@ -51,7 +53,7 @@ trap 'kill $QEMU_PID $FAKEBT_PID 2>/dev/null || true' EXIT
 fail() {
     echo "FAIL: $1"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|WARN' | tail -8 | tr '\n' '|') | fakebt: $(grep -a 'FAIL\|voice\|reconnect' "$FAKEBT_LOG" | tail -6 | tr '\n' '|')"
+        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|WARN' | tail -8 | tr -d '\r' | tr '\n' ';') | fakebt: $(grep -a 'FAIL\|voice\|reconnect' "$FAKEBT_LOG" | tail -6 | tr -d '\r' | tr '\n' ';')"
     fi
     shift
     for f in "$@"; do cat "$f"; done
@@ -75,13 +77,15 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; type_keys $'mic record 2\n'; STAGE=5
     elif [ $STAGE = 5 ] && [ "$(grep -c 'headset 00:DE:AD:BE:EF:01 .* connected (' "$LOG")" -ge 2 ]; then
         sleep 1; type_keys $'mic record 1\n'; STAGE=6
+    elif [ $STAGE = 6 ] && [ "$(grep -c 'pitch about\|mic: ' "$LOG")" -ge 2 ]; then
+        sleep 1; type_keys $'sound test 440 1\n'; STAGE=7
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 6 ] && [ "$(grep -c 'pitch about\|mic: ' "$LOG")" -ge 2 ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = 7 ] && grep -q "  played \|sound: " "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -113,8 +117,13 @@ for _ in $(seq "$TIMEOUT"); do
         [ "$(grep -c '"BT Headset": [0-9.]* s, [0-9]* samples at 8 kHz, peak 4[0-9]%, RMS 3[0-9]%, pitch about 4[34][0-9] Hz' "$LOG")" -ge 2 ] \
             || { fail "the headset microphone's 440 Hz tone was not recorded before and after its reconnect" "$FAKEBT_LOG"; }
         grep -q "headset reconnect OK" "$FAKEBT_LOG" || { fail "headset could not reconnect to the audio gateway" "$FAKEBT_LOG"; }
+        grep -q "snd0: Intel 8086:293e .*codecs: QEMU .*outputs: Line out" "$LOG" || { fail "HD Audio controller or its output not found"; }
+        grep -q "  played 48000 frames on snd0 Line out" "$LOG" || { fail "sound test did not play"; }
+        TONE=$(python3 tools/wav-tone.py build/sound.wav)
+        echo "sound card output: $TONE"
+        echo "$TONE" | grep -qE "^tone 1\.0[0-9] s, 4[34][0-9] Hz, peak (7[5-9]|8[0-4])[0-9]{2}$" || { fail "the 440 Hz test tone was not heard on the sound card ($TONE)"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
