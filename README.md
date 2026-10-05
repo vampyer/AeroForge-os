@@ -163,8 +163,19 @@ refuses writes past its end. The shell's `diskwrite <disk> <lba> <blocks>` comma
 test pattern, flushes it and reads it back. It only writes the unused gap between the
 partition tables and the first partition. The boot test writes 80 blocks to the NVMe, SATA
 and USB disks, enough to take several commands on each driver, and checks that the disk
-images hold the pattern after QEMU exits (`tools/check-disk-write.py`). FAT32 is still
-mounted read-only; saving files comes next.
+images hold the pattern after QEMU exits (`tools/check-disk-write.py`).
+
+Since 0.19 files can be saved. FAT32 volumes are writable: files can be created, overwritten
+and deleted, and directories created and removed, with long names (and Windows-style `NAME~1.EXT`
+aliases), the FSInfo free count kept right, and times from the PC's real-time clock. Updates go
+data first, then the FAT, then the directory entry, and end with a cache flush. Programs get
+`file_write` (create or replace a whole file, up to 8 MiB), `file_delete` and `dir_create`;
+`/system` is off limits to them until files have owners and permissions. The shell has
+`write <path> <text>` (quote a path with spaces), `mkdir` and `rm`. The `savetest` program saves
+twelve slots with long names in `/saves` (enough to grow the folder), reads them back, overwrites
+one and deletes ten. The boot test also saves and deletes files on the SATA and USB disks, then
+checks every volume with `fsck.fat` and reads the files back with mtools after QEMU exits
+(`tools/check-fat-files.py`).
 
 | Area | Status |
 |---|---|
@@ -180,17 +191,17 @@ mounted read-only; saving files comes next.
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
 | C++ drivers | Behind `drivers/include/dhi.h` (ABI v2: logging, port I/O, DMA buffers, MMIO mapping, delays): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, polling, Identify, reads and writes up to 8 KiB per command, flush), an **AHCI** (SATA) driver (one command slot per port, polling, IDENTIFY DEVICE, LBA48 READ/WRITE DMA EXT, FLUSH CACHE EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI reads, writes and cache sync, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) and an **HD Audio** driver (CORB/RIRB, codec widget graph, output routing, one 48 kHz stereo output stream) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), polled by the `net` kernel thread; DHCP client; ICMP echo |
-| Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
+| Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
-| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads) (Rust, `no_std`) |
+| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files) (Rust, `no_std`) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks (checked in the images afterwards), the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
 `exit`, `write`, `yield`, `getpid`, `sleep_ms`, `cpu_id`, `uptime_ms`, `spawn`, `port_create`,
 `port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`, `file_read`,
-`audio_write`, `audio_queued`.
+`audio_write`, `audio_queued`, `gamepad_read`, `file_write`, `file_delete`, `dir_create`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1
@@ -200,7 +211,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 3. Futexes and event objects, and `wait()` for child processes.
 4. An ACPICA port (the current table walker never touches AML), HPET/TSC-deadline timers, and x2APIC mode.
 5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; NVMe interrupts (MSI-X) and one queue pair per CPU; AHCI interrupts and NCQ; USB Attached SCSI (UAS), xHCI MSI-X interrupts and hotplug; virtio-net, network interrupts, and sockets for user programs.
-6. Filesystems move to user-space servers behind IPC, as the design says; FAT32 writes, exFAT and NTFS (read-only on real drives at first).
+6. Filesystems move to user-space servers behind IPC, as the design says; exFAT and NTFS (read-only on real drives at first).
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and TLB shootdowns so permission changes reach every CPU at once.
 
 ## Layout
@@ -256,6 +267,7 @@ tools/fakebt/             simulated USB Bluetooth adapter, gamepads and headset 
 tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)
 tools/wav-tone.py         measures the test tone in QEMU's recorded sound output (boot test)
 tools/check-disk-write.py checks the diskwrite test pattern in a disk image (boot test)
+tools/check-fat-files.py  fsck.fat on every test volume and the saved files read back with mtools (boot test)
 ```
 
 ## Building and running

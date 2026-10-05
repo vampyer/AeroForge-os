@@ -51,3 +51,25 @@ impl<T> Drop for IrqGuard<'_, T> {
         }
     }
 }
+
+/// A lock for long work, such as a file system update that takes many disk
+/// commands. Interrupts stay on while it is held, and a thread waiting for
+/// it sleeps a tick at a time instead of spinning.
+pub struct SleepMutex<T> {
+    inner: spin::Mutex<T>,
+}
+
+impl<T> SleepMutex<T> {
+    pub const fn new(v: T) -> Self {
+        Self { inner: spin::Mutex::new(v) }
+    }
+
+    pub fn lock(&self) -> spin::MutexGuard<'_, T> {
+        loop {
+            if let Some(g) = self.inner.try_lock() {
+                return g;
+            }
+            crate::sched::sleep_ticks(1);
+        }
+    }
+}

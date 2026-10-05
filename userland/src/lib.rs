@@ -26,6 +26,9 @@ pub mod sys {
     pub const AUDIO_WRITE: u64 = 16;
     pub const AUDIO_QUEUED: u64 = 17;
     pub const GAMEPAD_READ: u64 = 18;
+    pub const FILE_WRITE: u64 = 19;
+    pub const FILE_DELETE: u64 = 20;
+    pub const DIR_CREATE: u64 = 21;
 }
 
 pub mod rights {
@@ -34,6 +37,15 @@ pub mod rights {
 }
 
 pub const NO_HANDLE: u64 = u64::MAX;
+
+/// Error codes the system calls return.
+pub const E_BADHANDLE: i64 = -1;
+pub const E_FAULT: i64 = -2;
+pub const E_NOTFOUND: i64 = -3;
+pub const E_RIGHTS: i64 = -4;
+pub const E_FULL: i64 = -5;
+pub const E_INVAL: i64 = -6;
+pub const E_EXISTS: i64 = -7;
 
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -86,6 +98,24 @@ pub fn read_file(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
         syscall(sys::FILE_READ, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
     })
     .map(|n| n as usize)
+}
+
+/// Creates a file, or replaces everything it held, with `data` (at most 8 MiB).
+pub fn write_file(path: &str, data: &[u8]) -> Result<usize, i64> {
+    check(unsafe {
+        syscall(sys::FILE_WRITE, path.as_ptr() as u64, path.len() as u64, data.as_ptr() as u64, data.len() as u64)
+    })
+    .map(|n| n as usize)
+}
+
+/// Deletes a file or an empty directory.
+pub fn delete_file(path: &str) -> Result<(), i64> {
+    check(unsafe { syscall(sys::FILE_DELETE, path.as_ptr() as u64, path.len() as u64, 0, 0) }).map(|_| ())
+}
+
+/// Creates a directory.
+pub fn create_dir(path: &str) -> Result<(), i64> {
+    check(unsafe { syscall(sys::DIR_CREATE, path.as_ptr() as u64, path.len() as u64, 0, 0) }).map(|_| ())
 }
 
 /// Sound: 48 kHz, 16-bit, stereo. Each program gets its own stream; the
