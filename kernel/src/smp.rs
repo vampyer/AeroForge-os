@@ -37,6 +37,8 @@ extern "C" fn ap_entry(info: &MpInfo) -> ! {
     crate::security::init_cpu(false);
     percpu::init_this_cpu(index, info.lapic_id);
     interrupts::load();
+    crate::syscall::init_cpu();
+    crate::fpu::init_cpu();
     sched::init_cpu();
     apic::start_timer(interrupts::VECTOR_TIMER);
     console::print_colored(

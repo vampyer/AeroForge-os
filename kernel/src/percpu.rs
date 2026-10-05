@@ -18,6 +18,8 @@ pub const MAX_CPUS: usize = 64;
 #[repr(C)]
 pub struct PerCpu {
     self_ptr: u64, // gs:[0]
+    kernel_rsp: u64, // gs:[8]: kernel stack top for `syscall` entry (same as TSS rsp0)
+    user_rsp: u64,   // gs:[16]: user stack pointer, saved by `syscall` entry
     pub index: usize,
     pub lapic_id: u32,
     pub tables: CpuTables,
@@ -32,6 +34,8 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 pub fn init_this_cpu(index: usize, lapic_id: u32) -> &'static PerCpu {
     let cpu = Box::leak(Box::new(PerCpu {
         self_ptr: 0,
+        kernel_rsp: 0,
+        user_rsp: 0,
         index,
         lapic_id,
         tables: CpuTables::new(),
@@ -65,8 +69,12 @@ pub fn count() -> usize {
     COUNT.load(Ordering::SeqCst)
 }
 
-/// Sets the kernel stack the CPU switches to on entry from ring 3.
+/// Sets the kernel stack the CPU switches to on entry from ring 3
+/// (interrupts through the TSS, `syscall` through gs:[8]).
 pub fn set_kernel_stack(top: u64) {
     let cpu = this() as *const PerCpu as *mut PerCpu;
-    unsafe { core::ptr::addr_of_mut!((*cpu).tables.tss.rsp).write_unaligned([top, 0, 0]) };
+    unsafe {
+        core::ptr::addr_of_mut!((*cpu).tables.tss.rsp).write_unaligned([top, 0, 0]);
+        core::ptr::addr_of_mut!((*cpu).kernel_rsp).write_volatile(top);
+    }
 }

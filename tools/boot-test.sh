@@ -34,7 +34,9 @@
 # the saved files back. Last, an NTFS drive (a second SATA disk, from
 # tools/ntfs-test.part.xz) must mount read-only and its folders, a
 # 300-entry folder, fragmented and sparse files read back exactly, while
-# compressed files and writes are refused.
+# compressed files and writes are refused. Last of all, five copies of
+# 'fputest' must keep their x87, SSE, AVX and MXCSR registers while they are
+# switched against each other, and compute a known floating point result.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -198,8 +200,11 @@ for _ in $(seq "$TIMEOUT"); do
         if [ $NTFS_STEP -lt ${#NTFS_CMDS[@]} ]; then
             sleep 1; type_keys "${NTFS_CMDS[$NTFS_STEP]}"$'\n'
         else
-            STAGE=done
+            # Floating point and vector registers, five programs at once.
+            sleep 1; type_keys $'run fputest\n'; STAGE=fpu
         fi
+    elif [ $STAGE = fpu ] && grep -q "\[fputest\] .*\(: OK\|FAILED\)" "$LOG"; then
+        STAGE=done
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
@@ -243,6 +248,10 @@ for _ in $(seq "$TIMEOUT"); do
         TONE=$(python3 tools/wav-tone.py build/sound.wav)
         echo "sound card output:"; echo "$TONE"
         echo "$TONE" | grep -qE "^tone 1\.0[0-9] s, 4[34][0-9] Hz, peak (7[5-9]|8[0-4])[0-9]{2}$" || { fail "the 440 Hz test tone was not heard on the sound card ($TONE)"; }
+        grep -q "Fast system calls: syscall/sysret entry open to ring 3" "$LOG" || { fail "syscall/sysret not set up"; }
+        grep -q "Floating point for programs: x87, SSE, AVX (XSAVE" "$LOG" || { fail "floating point (XSAVE, AVX) not set up for programs"; }
+        grep -q "\[fputest\] 5 programs kept their x87, SSE, AVX and MXCSR state across 30 rounds of switching; sum of square roots of 1..100000 = 21082008.973918: OK" "$LOG" \
+            || { fail "programs lost floating point or vector registers, or computed a wrong result"; }
         grep -q "\[melody\] played 4 notes" "$LOG" || { fail "the melody program could not play"; }
         [ "$(echo "$TONE" | grep -cE "^tone 0\.(29|30|31) s, (52[0-9]|66[0-9]|78[0-9]|10[45][0-9]) Hz")" = 4 ] \
             || { fail "the melody program's four notes were not heard on the sound card ($TONE)"; }
@@ -301,7 +310,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

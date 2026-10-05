@@ -1,7 +1,10 @@
-//! The system call gate: `int 0x80` from ring 3.
+//! System calls from ring 3: the `syscall` instruction (the fast path
+//! programs use), or the older `int 0x80` gate, which still works.
 //!
 //! Convention: rax = number, arguments in rdi, rsi, rdx, r10, r8; result in
-//! rax. Negative results are errors. Keep in sync with userland/src/lib.rs.
+//! rax. Negative results are errors. `syscall` also overwrites rcx and r11
+//! (the CPU keeps the return address and flags there). Keep in sync with
+//! userland/src/lib.rs.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -10,7 +13,110 @@ use core::sync::atomic::Ordering;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, console, gamepad, percpu, sched, security, sound, vfs};
+use crate::{apic, arch, console, gamepad, gdt, percpu, sched, security, sound, vfs};
+
+const MSR_STAR: u32 = 0xC000_0081;
+const MSR_LSTAR: u32 = 0xC000_0082;
+const MSR_FMASK: u32 = 0xC000_0084;
+const EFER_SCE: u64 = 1 << 0;
+/// Flags `syscall` clears on entry: TF, IF, DF, NT and AC. IF off matches
+/// the `int 0x80` interrupt gate; AC off keeps SMAP in force.
+const FMASK: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
+
+// `syscall` entry. The CPU has put the user's rip in rcx and rflags in r11
+// and switched to kernel CS/SS, but not to a kernel stack, so this swaps in
+// the per-CPU data (gs:[8] kernel stack top, gs:[16] scratch), builds the
+// same frame `int 0x80` would on this thread's kernel stack and runs the
+// same dispatcher. A thread that blocks inside a call sleeps on this frame
+// like any other. The way out is `sysret`, which needs no stack.
+core::arch::global_asm!(
+    r#"
+.section .text
+.global syscall_entry
+syscall_entry:
+    swapgs
+    mov gs:[16], rsp
+    mov rsp, gs:[8]
+    push {user_ss}
+    push qword ptr gs:[16]
+    push r11
+    push {user_cs}
+    push rcx
+    push 0
+    push 0x80
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    call syscall_from_user
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    // rip, cs, rflags, rsp, ss left on the stack.
+    mov rcx, [rsp]
+    mov r11, [rsp + 16]
+    mov rsp, [rsp + 24]
+    swapgs
+    sysretq
+"#,
+    user_ss = const gdt::USER_DATA as u64,
+    user_cs = const gdt::USER_CODE as u64,
+);
+
+extern "C" {
+    fn syscall_entry();
+}
+
+#[no_mangle]
+extern "C" fn syscall_from_user(frame: &mut InterruptFrame) {
+    security::on_kernel_entry();
+    dispatch(frame);
+    // `sysret` would fault in ring 0 on a non-canonical return address (one
+    // past the top of user space), on the user's stack. Programs cannot map
+    // that page, but if one ever gets there it dies instead of the kernel.
+    if frame.rip >= 0x0000_8000_0000_0000 {
+        crate::kprintln!("[kernel] pid {}: system call returned to a bad address {:#x}, killed",
+            sched::current().pid(), frame.rip);
+        sched::exit_current();
+    }
+}
+
+/// Opens the `syscall` instruction to ring 3 on the calling CPU.
+pub fn init_cpu() {
+    unsafe {
+        // Kernel CS = 0x08 (SS 0x10). sysret: SS = 0x10 + 8 = user data,
+        // CS = 0x10 + 16 = user code (both with RPL 3), the GDT's order.
+        arch::wrmsr(MSR_STAR, (0x10u64 << 48) | ((gdt::KERNEL_CODE as u64) << 32));
+        arch::wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+        arch::wrmsr(MSR_FMASK, FMASK);
+        arch::wrmsr(arch::MSR_EFER, arch::rdmsr(arch::MSR_EFER) | EFER_SCE);
+    }
+}
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;

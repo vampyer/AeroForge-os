@@ -50,8 +50,8 @@ pub const E_EXISTS: i64 = -7;
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let r: u64;
-    asm!("int 0x80", inlateout("rax") n => r, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
-         options(nostack));
+    asm!("syscall", inlateout("rax") n => r, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
+         lateout("rcx") _, lateout("r11") _, options(nostack));
     r as i64
 }
 
@@ -371,3 +371,59 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("[pid {}] panic: {}", getpid(), info);
     exit(-1)
 }
+
+// Programs are built for the x86_64 Linux target to get hardware floating
+// point (SSE) on stable Rust, so nothing supplies the C memory functions
+// compiler-generated code calls. These are the usual `rep` string versions.
+core::arch::global_asm!(
+    r#"
+.section .text.aero_mem,"ax",@progbits
+.global memcpy
+memcpy:
+    mov rax, rdi
+    mov rcx, rdx
+    rep movsb
+    ret
+.global memmove
+memmove:
+    mov rax, rdi
+    mov rcx, rdx
+    cmp rdi, rsi
+    jbe 1f
+    lea rsi, [rsi + rdx - 1]
+    lea rdi, [rdi + rdx - 1]
+    std
+    rep movsb
+    cld
+    ret
+1:  rep movsb
+    ret
+.global memset
+memset:
+    mov r8, rdi
+    mov eax, esi
+    mov rcx, rdx
+    rep stosb
+    mov rax, r8
+    ret
+.global memcmp
+.global bcmp
+memcmp:
+bcmp:
+    xor eax, eax
+    test rdx, rdx
+    jz 2f
+    mov rcx, rdx
+    repe cmpsb
+    je 2f
+    movzx eax, byte ptr [rdi - 1]
+    movzx ecx, byte ptr [rsi - 1]
+    sub eax, ecx
+2:  ret
+"#
+);
+
+/// The prebuilt `core` for the Linux target refers to this even though
+/// programs abort on panic and never unwind.
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}

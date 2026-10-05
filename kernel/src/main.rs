@@ -16,6 +16,7 @@ mod elf;
 mod exfat;
 mod fat;
 mod fb;
+mod fpu;
 mod gamepad;
 mod gdt;
 mod kstack;
@@ -151,6 +152,12 @@ extern "C" fn kmain() -> ! {
 
     interrupts::init();
     kok!("IDT loaded: 256 vectors, syscall gate int 0x80 open to ring 3");
+    syscall::init_cpu();
+    kok!("Fast system calls: syscall/sysret entry open to ring 3");
+    let f = fpu::init_cpu();
+    kok!("Floating point for programs: x87, SSE{}{} ({}, {}-byte save area per thread)",
+        if f.avx { ", AVX" } else { "" }, if f.avx512 { ", AVX-512" } else { "" },
+        if f.xsave { "XSAVE" } else { "FXSAVE" }, f.area_bytes);
     unsafe { core::arch::asm!("int3") };
     if interrupts::BREAKPOINTS.load(Ordering::Relaxed) == 1 {
         kok!("Exception path verified (breakpoint handled, execution resumed)");
