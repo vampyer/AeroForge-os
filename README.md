@@ -342,6 +342,19 @@ a job from the shell, checking its deadlines every 100 ms. With gamepads and a h
 four CPUs together now take about 30 timer interrupts in an idle second instead of about 120. Still
 waking every tick: the network thread when a card has no interrupts (the older e1000 family).
 
+Since 0.33 programs can use the network. `aero::net::Socket::udp()` and `Socket::tcp()` give a
+socket handle (system call 34); `connect` sets a UDP socket's peer or makes a TCP connection with a
+timeout (35), `send` queues data (36) and `recv` waits for it, with a timeout (37); closing the
+handle closes the socket. Every socket, the kernel's DHCP and ping ones included, lives in the one
+smoltcp stack: a system call locks it to queue data or take what arrived and wakes the network
+thread to send, and a call that has to wait sleeps until the network thread's next poll brings
+something. TCP data goes through 64 KiB buffers each way; a closed TCP connection gets two seconds
+to say goodbye before it is reset. Errors are `E_NOTFOUND` (no network card or no DHCP address
+yet), the new `E_CLOSED` (refused or reset) and `E_TIMEDOUT`. `ifconfig` shows how many program
+sockets are open. The new `nettest` program checks, against `tools/echo-server.py` on the host
+running QEMU, a UDP echo (4 ms), a 50 ms receive timeout, 64 KiB echoed over TCP followed by the
+server closing (23 ms), and a refused connection to a port nobody listens on.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -355,12 +368,12 @@ waking every tick: the network thread when a card has no interrupts (the older e
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
 | C++ drivers | Behind `drivers/include/dhi.h` (ABI v3: logging, port I/O, DMA buffers, MMIO mapping, delays, waiting for an interrupt): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, MSI-X completion interrupts, Identify, reads and writes up to 8 KiB per command, flush), an **AHCI** (SATA) driver (one command slot per port, MSI completion interrupts, IDENTIFY DEVICE, LBA48 READ/WRITE DMA EXT, FLUSH CACHE EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI reads, writes and cache sync, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) and an **HD Audio** driver (CORB/RIRB, codec widget graph, output routing, one 48 kHz stereo output stream) |
-| Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), run by the `net` kernel thread (woken by MSI-X on igb/igc, polled on e1000); DHCP client; ICMP echo |
+| Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), run by the `net` kernel thread (woken by MSI-X on igb/igc, polled on e1000); DHCP client; ICMP echo; UDP and TCP sockets for programs |
 | Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and **exFAT**, read-only **NTFS**, all with case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
-| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files), `fputest` (floating point and vector registers), `threadtest` (threads, heap, locks), `balancetest` (threads moving between CPUs), `priotest` (thread priorities), `timertest` (precise sleeps and timeouts), `spreadtest` (balancing between busy CPUs) (Rust, `no_std` with `alloc`, hardware floating point) |
+| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files), `fputest` (floating point and vector registers), `threadtest` (threads, heap, locks), `balancetest` (threads moving between CPUs), `priotest` (thread priorities), `timertest` (precise sleeps and timeouts), `spreadtest` (balancing between busy CPUs), `nettest` (UDP and TCP sockets) (Rust, `no_std` with `alloc`, hardware floating point) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `irq`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, an NTFS drive's folders and fragmented and sparse files, five programs keeping their floating point and vector registers apart, threads sharing a lock and a heap and ending with their program, interrupts from the USB, NVMe and SATA controllers and the igb card, the security audit and self-test, the config read and the whole IPC demo |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, UDP and TCP sockets from a program against an echo server on the host, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, an NTFS drive's folders and fragmented and sparse files, five programs keeping their floating point and vector registers apart, threads sharing a lock and a heap and ending with their program, interrupts from the USB, NVMe and SATA controllers and the igb card, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -368,7 +381,8 @@ waking every tick: the network thread when a card has no interrupts (the older e
 `port_publish`, `port_lookup`, `port_send`, `port_recv`, `handle_close`, `handle_dup`, `file_read`,
 `audio_write`, `audio_queued`, `gamepad_read`, `file_write`, `file_delete`, `dir_create`, `mem_map`,
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
-`thread_id`.
+`thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
+`socket_recv`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1
@@ -377,7 +391,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 2. A real-time class with deadlines and protection against a high-priority thread starving the rest; balancing that keeps cache and NUMA locality in mind (preferring a CPU that shares the thread's L3 cache, which on Ryzen means the same CCX).
 3. Event objects, and handles to threads and processes (killing a program from another one).
 4. An ACPICA port (the current table walker never touches AML), TSC-deadline timer mode, deeper CPU sleep states (MWAIT C-states from the ACPI tables), and x2APIC mode.
-5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, e1000 interrupts, and sockets for user programs.
+5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, e1000 interrupts, DNS lookups, listening TCP sockets and IPv6.
 6. Filesystems move to user-space servers behind IPC, as the design says; NTFS writes and compressed NTFS files.
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and targeted TLB shootdowns (only the CPUs running the program, one page at a time).
 

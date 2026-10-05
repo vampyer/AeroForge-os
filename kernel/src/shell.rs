@@ -209,6 +209,7 @@ impl Shell {
                 kprintln!("  {} packet(s) received, {} sent, {} receive error(s)",
                     net::RX_PACKETS.load(Ordering::Relaxed), net::TX_PACKETS.load(Ordering::Relaxed),
                     net::RX_ERRORS.load(Ordering::Relaxed));
+                kprintln!("  {} program socket(s) open", net::PROGRAM_SOCKETS.load(Ordering::Relaxed));
             }
             "ping" => match arg.parse::<core::net::Ipv4Addr>() {
                 Ok(ip) => {

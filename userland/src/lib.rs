@@ -46,6 +46,10 @@ pub mod sys {
     pub const THREAD_PRIORITY: u64 = 31;
     pub const SLEEP_US: u64 = 32;
     pub const CLOCK_US: u64 = 33;
+    pub const SOCKET_OPEN: u64 = 34;
+    pub const SOCKET_CONNECT: u64 = 35;
+    pub const SOCKET_SEND: u64 = 36;
+    pub const SOCKET_RECV: u64 = 37;
 }
 
 pub mod rights {
@@ -65,6 +69,8 @@ pub const E_INVAL: i64 = -6;
 pub const E_EXISTS: i64 = -7;
 pub const E_AGAIN: i64 = -8;
 pub const E_TIMEDOUT: i64 = -9;
+/// A connection was refused or reset.
+pub const E_CLOSED: i64 = -10;
 
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -280,6 +286,84 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         unsafe { syscall(sys::HANDLE_CLOSE, self.0, 0, 0, 0) };
+    }
+}
+
+/// UDP and TCP sockets over the network card the kernel brought up.
+/// Errors: `E_NOTFOUND` (no network or no DHCP address yet), `E_CLOSED`
+/// (refused or reset), `E_TIMEDOUT`.
+pub mod net {
+    use super::*;
+
+    /// An IPv4 address and port.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Endpoint {
+        pub addr: [u8; 4],
+        pub port: u16,
+    }
+
+    impl Endpoint {
+        pub const fn new(addr: [u8; 4], port: u16) -> Self {
+            Self { addr, port }
+        }
+    }
+
+    impl core::fmt::Display for Endpoint {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let [a, b, c, d] = self.addr;
+            write!(f, "{}.{}.{}.{}:{}", a, b, c, d, self.port)
+        }
+    }
+
+    pub struct Socket(Handle);
+
+    fn open(kind: u64) -> Result<Socket, i64> {
+        check(unsafe { syscall(sys::SOCKET_OPEN, kind, 0, 0, 0) }).map(|h| Socket(Handle(h)))
+    }
+
+    impl Socket {
+        /// A UDP socket on a fresh local port. `connect` it before sending.
+        pub fn udp() -> Result<Socket, i64> {
+            open(1)
+        }
+
+        /// A TCP socket; `connect` it before sending or receiving.
+        pub fn tcp() -> Result<Socket, i64> {
+            open(2)
+        }
+
+        /// UDP: sets the peer (sends go there, only its datagrams are
+        /// received). TCP: connects, waiting up to `timeout_us` (0 = no
+        /// limit).
+        pub fn connect(&self, to: Endpoint, timeout_us: u64) -> Result<(), i64> {
+            let addr = u32::from_be_bytes(to.addr) as u64;
+            check(unsafe { syscall(sys::SOCKET_CONNECT, self.0 .0, addr, to.port as u64, timeout_us) }).map(|_| ())
+        }
+
+        /// Sends one UDP datagram, or queues TCP data; returns how much was
+        /// taken (TCP may take less than all of it).
+        pub fn send(&self, data: &[u8]) -> Result<usize, i64> {
+            check(unsafe { syscall(sys::SOCKET_SEND, self.0 .0, data.as_ptr() as u64, data.len() as u64, 0) })
+                .map(|n| n as usize)
+        }
+
+        /// TCP: sends everything.
+        pub fn send_all(&self, mut data: &[u8]) -> Result<(), i64> {
+            while !data.is_empty() {
+                let n = self.send(data)?;
+                data = &data[n..];
+            }
+            Ok(())
+        }
+
+        /// Waits up to `timeout_us` (0 = no limit) for data. UDP: one
+        /// datagram. TCP: what has arrived; 0 means the peer closed.
+        pub fn recv(&self, buf: &mut [u8], timeout_us: u64) -> Result<usize, i64> {
+            check(unsafe {
+                syscall(sys::SOCKET_RECV, self.0 .0, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_us)
+            })
+            .map(|n| n as usize)
+        }
     }
 }
 

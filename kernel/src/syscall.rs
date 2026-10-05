@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, arch, console, futex, gamepad, gdt, percpu, sched, security, sound, vfs};
+use crate::{apic, arch, console, futex, gamepad, gdt, net, percpu, sched, security, sound, vfs};
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -151,6 +151,10 @@ pub const SYS_THREAD_ID: u64 = 30;
 pub const SYS_THREAD_PRIORITY: u64 = 31;
 pub const SYS_SLEEP_US: u64 = 32;
 pub const SYS_CLOCK_US: u64 = 33;
+pub const SYS_SOCKET_OPEN: u64 = 34;
+pub const SYS_SOCKET_CONNECT: u64 = 35;
+pub const SYS_SOCKET_SEND: u64 = 36;
+pub const SYS_SOCKET_RECV: u64 = 37;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -167,6 +171,11 @@ const E_INVAL: i64 = -6;
 const E_EXISTS: i64 = -7;
 const E_AGAIN: i64 = -8;
 const E_TIMEDOUT: i64 = -9;
+/// The connection was refused or reset (or never made).
+const E_CLOSED: i64 = -10;
+
+/// Most one SYS_SOCKET_SEND or SYS_SOCKET_RECV moves.
+const MAX_SOCKET_IO: u64 = 64 * 1024;
 
 const NO_HANDLE: u64 = u64::MAX;
 
@@ -225,8 +234,31 @@ fn port_handle(proc_: &process::Process, h: u64, need: u32) -> Result<alloc::syn
     if handle.rights & need != need {
         return Err(E_RIGHTS);
     }
-    let Object::Port(p) = &handle.object;
-    Ok(p.clone())
+    match &handle.object {
+        Object::Port(p) => Ok(p.clone()),
+        _ => Err(E_BADHANDLE),
+    }
+}
+
+fn socket_handle(proc_: &process::Process, h: u64, need: u32) -> Result<alloc::sync::Arc<net::UserSocket>, i64> {
+    let table = proc_.handles.lock();
+    let handle = table.get(h).ok_or(E_BADHANDLE)?;
+    if handle.rights & need != need {
+        return Err(E_RIGHTS);
+    }
+    match &handle.object {
+        Object::Socket(s) => Ok(s.clone()),
+        _ => Err(E_BADHANDLE),
+    }
+}
+
+fn sock_error(e: net::SockError) -> i64 {
+    match e {
+        net::SockError::NoNetwork => E_NOTFOUND,
+        net::SockError::Closed => E_CLOSED,
+        net::SockError::TimedOut => E_TIMEDOUT,
+        net::SockError::Invalid | net::SockError::Killed => E_INVAL,
+    }
 }
 
 pub fn dispatch(frame: &mut InterruptFrame) {
@@ -456,6 +488,42 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             let path = user_str(a0, a1)?;
             writable_by_programs(&path)?;
             vfs::create_dir(&path).map_err(fs_error).map(|_| 0)
+        }
+        SYS_SOCKET_OPEN => {
+            // a0: 1 = UDP, 2 = TCP.
+            let tcp = match a0 {
+                1 => false,
+                2 => true,
+                _ => return Err(E_INVAL),
+            };
+            let sock = net::UserSocket::open(tcp).map_err(sock_error)?;
+            Ok(proc_.handles.lock().insert(Handle { object: Object::Socket(sock), rights: rights::ALL }))
+        }
+        SYS_SOCKET_CONNECT => {
+            // Handle, IPv4 address (a.b.c.d as a << 24 | ...), port, timeout in µs (0 = none).
+            let sock = socket_handle(&proc_, a0, rights::SEND)?;
+            drop(proc_);
+            let port = u16::try_from(a2).map_err(|_| E_INVAL)?;
+            let addr = core::net::Ipv4Addr::from(a1 as u32);
+            sock.connect(addr, port, a3).map(|_| 0).map_err(sock_error)
+        }
+        SYS_SOCKET_SEND => {
+            // Returns how many bytes were queued (TCP may take fewer than asked).
+            let sock = socket_handle(&proc_, a0, rights::SEND)?;
+            drop(proc_);
+            let data = user_bytes(a1, a2.min(MAX_SOCKET_IO))?;
+            sock.send(&data).map(|n| n as u64).map_err(sock_error)
+        }
+        SYS_SOCKET_RECV => {
+            // Handle, buffer, length, timeout in µs (0 = none). Returns the
+            // bytes received; 0 from TCP means the peer closed.
+            let sock = socket_handle(&proc_, a0, rights::RECV)?;
+            drop(proc_);
+            let len = a2.min(MAX_SOCKET_IO);
+            check_writable(a1, len)?;
+            let data = sock.recv(len as usize, a3).map_err(sock_error)?;
+            to_user(a1, &data)?;
+            Ok(data.len() as u64)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
         SYS_AUDIO_WRITE => {

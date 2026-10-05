@@ -45,6 +45,10 @@
 # times a high-priority thread against sixteen busy normal ones: it must run
 # ahead of them. 'timertest' checks that 2 ms sleeps take about 2 ms (not a
 # 10 ms tick), that 144 Hz frame pacing holds and that futex timeouts work.
+# 'nettest' uses UDP and TCP sockets against tools/echo-server.py on this
+# host (10.0.2.2 to the guest): a UDP echo, a receive timeout, 64 KiB echoed
+# over TCP with the end of data, and a refused connection; 'ifconfig' must
+# then show its sockets closed and gone.
 # 'spreadtest' leaves its busy threads at one, three, one and three per CPU:
 # periodic balancing must even them out although no CPU goes idle.
 # 'wakeups' counts timer interrupts per CPU over a second: cpu0, which only
@@ -80,6 +84,8 @@ build/fakepad build/xpad.sock --xinput 2>"$FAKEPAD_LOG" &
 XPAD_PID=$!
 build/fakepad build/hidpad.sock --hid 2>>"$FAKEPAD_LOG" &
 HIDPAD_PID=$!
+python3 tools/echo-server.py >build/echo-server.log 2>&1 &
+ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG" build/qemu-monitor.sock build/sound.wav
@@ -101,7 +107,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
     -monitor unix:build/qemu-monitor.sock,server,nowait &
 QEMU_PID=$!
-trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
 fail() {
@@ -239,6 +245,11 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; type_keys $'run timertest\n'; STAGE=timer
     elif [ $STAGE = timer ] && grep -q "\[timertest\] .*\(: OK\|FAILED\)" "$LOG"; then
         # Balancing between busy CPUs.
+        sleep 1; type_keys $'run nettest\n'; STAGE=net
+    elif [ $STAGE = net ] && grep -q "\[nettest\] .*\(: OK\|FAILED\)" "$LOG"; then
+        # Its sockets must be closed and removed once it has exited.
+        sleep 3; type_keys $'ifconfig\n'; STAGE=netsockets
+    elif [ $STAGE = netsockets ] && grep -q "program socket(s) open" "$LOG"; then
         sleep 1; type_keys $'run spreadtest\n'; STAGE=spread
     elif [ $STAGE = spread ] && grep -q "\[spreadtest\] .*\(: OK\|FAILED\)" "$LOG"; then
         # Tickless idle: timer interrupts per CPU over one second.
@@ -307,6 +318,9 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "a high-priority thread did not run ahead of busy normal ones, or bad priority requests were accepted"; }
         grep -q "\[timertest\] sleeps precise, 144 Hz pacing kept, futex timeouts work: OK" "$LOG" \
             || { fail "sleeps were not precise to well under a tick, frame pacing slipped, or futex timeouts failed"; }
+        grep -q "\[nettest\] UDP echo, receive timeout, 64 KiB TCP echo and a refused connection: OK" "$LOG" \
+            || { fail "UDP or TCP sockets did not work against the host's echo server" build/echo-server.log; }
+        grep -q "^  0 program socket(s) open" "$LOG" || { fail "nettest's sockets were not closed after it exited"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }
         grep -q "^  cpu0: [0-5] timer interrupts" "$LOG" \
