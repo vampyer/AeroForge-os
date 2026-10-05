@@ -40,7 +40,7 @@
 # Then 'threadtest' runs four threads under one futex lock, uses the heap,
 # waits for a child program's exit code and exits with three threads still
 # running, which 'ps' must no longer show. Last, 'irq' must show that the
-# USB controller has been raising MSI-X interrupts.
+# USB and NVMe controllers have been raising MSI-X interrupts.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -271,6 +271,8 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "threadtest's leftover threads were still there after it exited"; }
         grep -q "xhci0: MSI-X interrupts on, polling at once when events arrive" "$LOG" || { fail "USB controller interrupts (MSI-X) not set up"; }
         grep -q "vector 0x[0-9a-f]*  MSI-X -> cpu[0-9]* *[1-9][0-9]* interrupts  xhci0" "$LOG" || { fail "the USB controller raised no interrupts"; }
+        grep -q "nvme0: MSI-X completion interrupts on" "$LOG" || { fail "NVMe completion interrupts (MSI-X) not set up"; }
+        grep -q "vector 0x[0-9a-f]*  MSI-X -> cpu0 *[1-9][0-9]* interrupts  nvme0" "$LOG" || { fail "the NVMe controller raised no interrupts"; }
         grep -q "\[melody\] played 4 notes" "$LOG" || { fail "the melody program could not play"; }
         [ "$(echo "$TONE" | grep -cE "^tone 0\.(29|30|31) s, (52[0-9]|66[0-9]|78[0-9]|10[45][0-9]) Hz")" = 4 ] \
             || { fail "the melody program's four notes were not heard on the sound card ($TONE)"; }

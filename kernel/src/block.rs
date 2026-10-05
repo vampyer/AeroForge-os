@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::dhi::{self, BlockInfo, DmaBuf};
-use crate::sync::IrqMutex;
+use crate::sync::{IrqMutex, SleepMutex};
 use crate::{console, pci};
 
 pub trait BlockDevice: Send + Sync {
@@ -49,7 +49,9 @@ pub struct DriverDisk {
     max_transfer: u32,
     model: String,
     serial: String,
-    bounce: IrqMutex<DmaBuf>,
+    /// Also serialises commands: one at a time per disk. A sleeping lock,
+    /// because NVMe commands wait for their completion interrupt.
+    bounce: SleepMutex<DmaBuf>,
 }
 
 unsafe impl Send for DriverDisk {}
@@ -158,7 +160,7 @@ fn add_disk(name: String, backend: Backend, info: &BlockInfo) -> bool {
         max_transfer: info.max_transfer,
         model: String::from(dhi::c_field(&info.model)),
         serial: String::from(dhi::c_field(&info.serial)),
-        bounce: IrqMutex::new(bounce),
+        bounce: SleepMutex::new(bounce),
     }));
     true
 }
@@ -166,17 +168,28 @@ fn add_disk(name: String, backend: Backend, info: &BlockInfo) -> bool {
 /// Finds NVMe controllers on PCIe and brings each one up through the C++ driver.
 pub fn probe_nvme() -> usize {
     let mut found = 0;
+    let mut next_ctrl = 0; // the driver numbers controllers in init order
     for dev in pci::devices().iter().filter(|d| d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02) {
         let Some(bar0) = dev.bar(0) else { continue };
         dev.enable_mmio_and_dma();
+        // Completion interrupts go to the boot CPU. They are switched on before
+        // the driver creates its I/O queues: QEMU (and the spec's intent) only
+        // delivers on vectors that were enabled when the queue was created.
+        let name = format!("nvme{} ({:02x}:{:02x}.{})", next_ctrl, dev.bus, dev.dev, dev.func);
+        let irq = dhi::irq_source().and_then(|(src, handler)| crate::msi::attach(dev, &name, handler, 0).map(|kind| (src, kind)));
         let mut info = BlockInfo::zeroed();
-        let ctrl = unsafe { dhi::aero_nvme_init(&dhi::OPS, bar0, &mut info) };
+        let ctrl = unsafe { dhi::aero_nvme_init(&dhi::OPS, bar0, irq.map_or(dhi::NO_IRQ, |(src, _)| src), &mut info) };
         if ctrl < 0 {
             console::print_colored(console::YELLOW, format_args!("[WARN] NVMe at {:02x}:{:02x}.{}: init failed ({})\n", dev.bus, dev.dev, dev.func, ctrl));
             continue;
         }
+        next_ctrl += 1;
         if add_disk(format!("nvme{}", ctrl), Backend::Nvme(ctrl), &info) {
             found += 1;
+        }
+        match irq {
+            Some((_, kind)) => console::print_colored(console::DIM, format_args!("       nvme{}: {} completion interrupts on\n", ctrl, kind)),
+            None => console::print_colored(console::YELLOW, format_args!("[WARN] nvme{}: no MSI-X or MSI, I/O is polled\n", ctrl)),
         }
     }
     found
