@@ -21,6 +21,7 @@ mod ipc;
 mod limine;
 mod memory;
 mod modules;
+mod net;
 mod pci;
 mod percpu;
 mod pic;
@@ -197,6 +198,15 @@ extern "C" fn kmain() -> ! {
     if xhci > 0 {
         kok!("C++ xHCI driver attached through DHI v{}: {} controller(s), {} USB device(s)", dhi::ABI_VERSION, xhci, usb_devices);
     }
+    let nics = net::probe();
+    for n in net::NICS.lock().iter() {
+        console::print_colored(console::DIM, format_args!("       {}: Intel {:04x}:{:04x} at {}, MAC {}, link {}\n",
+            n.name, n.pci_id.0, n.pci_id.1, n.location, net::mac_string(&n.info.mac),
+            if n.info.link_up != 0 { alloc::format!("up at {} Mb/s", n.info.speed_mbps) } else { "down".into() }));
+    }
+    if nics > 0 {
+        kok!("C++ Intel Ethernet driver (e1000/e1000e) attached through DHI v{}: {} port(s)", dhi::ABI_VERSION, nics);
+    }
     let mounts = vfs::mount_all();
     for m in mounts {
         kok!("FAT32 volume \"{}\" on {} mounted at {} (read-only)", m.vol.label, m.vol.dev.name(), m.path);
@@ -237,6 +247,9 @@ extern "C" fn kmain() -> ! {
     }
     if xhci > 0 {
         sched::spawn_kernel("usbpoll", usb::poll_thread, 0, Some(1 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
+    }
+    if nics > 0 {
+        sched::spawn_kernel("net", net::net_thread, 0, Some(2 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
     }
     sched::spawn_kernel("shell", shell::run, 0, Some(0));
 

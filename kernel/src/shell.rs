@@ -5,7 +5,7 @@ use alloc::string::String;
 use core::sync::atomic::Ordering;
 
 use crate::console::{self, CYAN, YELLOW};
-use crate::{acpi, apic, arch, block, dhi, interrupts, ipc, kprint, kprintln, memory, modules, pci, percpu, process, sched, smp, usb, vfs};
+use crate::{acpi, apic, arch, block, dhi, interrupts, ipc, kprint, kprintln, memory, modules, net, pci, percpu, process, sched, smp, usb, vfs};
 
 /// Kernel thread entry.
 pub fn run(_: u64) {
@@ -72,6 +72,8 @@ impl Shell {
                 kprintln!("  lspci       PCIe devices");
                 kprintln!("  lsusb       USB controllers and devices");
                 kprintln!("  mouse       USB mouse pointer position and buttons");
+                kprintln!("  ifconfig    network cards, link and address");
+                kprintln!("  ping <ip>   send 4 ICMP echo requests");
                 kprintln!("  disks       disks and partitions");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
@@ -84,7 +86,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.5, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.6, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
@@ -151,6 +153,35 @@ impl Shell {
                     if b & 1 != 0 { 'L' } else { '-' }, if b & 4 != 0 { 'M' } else { '-' }, if b & 2 != 0 { 'R' } else { '-' },
                     usb::MOUSE_EVENTS.load(Relaxed), usb::KEY_EVENTS.load(Relaxed));
             }
+            "ifconfig" => {
+                let nics = net::NICS.lock();
+                if nics.is_empty() {
+                    kprintln!("  no network cards");
+                }
+                for n in nics.iter() {
+                    let link = match net::link(n.id) {
+                        Some(speed) => alloc::format!("up, {} Mb/s", speed),
+                        None => String::from("down"),
+                    };
+                    kprintln!("  {}  Intel {:04x}:{:04x} at {}, MAC {}, link {}",
+                        n.name, n.pci_id.0, n.pci_id.1, n.location, net::mac_string(&n.info.mac), link);
+                }
+                drop(nics);
+                if let Some(l) = *net::LEASE.lock() {
+                    kprintln!("  eth0  inet {}, gateway {}, DNS {}", l.address, net::opt(l.router), net::opt(l.dns));
+                }
+                kprintln!("  {} packet(s) received, {} sent, {} receive error(s)",
+                    net::RX_PACKETS.load(Ordering::Relaxed), net::TX_PACKETS.load(Ordering::Relaxed),
+                    net::RX_ERRORS.load(Ordering::Relaxed));
+            }
+            "ping" => match arg.parse::<core::net::Ipv4Addr>() {
+                Ok(ip) => {
+                    if let Err(e) = net::ping(ip, 4) {
+                        console::print_colored(YELLOW, format_args!("  ping: {}\n", e));
+                    }
+                }
+                Err(_) => console::print_colored(YELLOW, format_args!("  usage: ping <a.b.c.d>\n")),
+            },
             "disks" => {
                 for d in block::DEVICES.lock().iter() {
                     match vfs::mount_point_of(d.name()) {

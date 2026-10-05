@@ -95,6 +95,15 @@ impl UsbDevice {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NetInfo {
+    pub mac: [u8; 6],
+    pub link_up: u8,
+    pub _pad: u8,
+    pub speed_mbps: u32,
+}
+
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
@@ -105,6 +114,11 @@ extern "C" {
     pub fn aero_xhci_init(ops: *const DhiOps, mmio_phys: u64, devices: *mut i32) -> i32;
     pub fn aero_xhci_poll(ctrl: i32, out: *mut InputEvent, max: i32) -> i32;
     pub fn aero_xhci_device(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
+    pub fn aero_e1000_supports(device_id: u16) -> i32;
+    pub fn aero_e1000_init(ops: *const DhiOps, mmio_phys: u64, info: *mut NetInfo) -> i32;
+    pub fn aero_e1000_send(nic: i32, frame: *const u8, len: u32) -> i32;
+    pub fn aero_e1000_recv(nic: i32, frame: *mut u8, max: u32) -> i32;
+    pub fn aero_e1000_link(nic: i32, speed_mbps: *mut u32) -> i32;
 }
 
 extern "C" fn dhi_log(msg: *const c_char) {
