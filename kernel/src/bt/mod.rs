@@ -557,7 +557,17 @@ impl Host {
             let len = 4 + u16::from_le_bytes([self.acl[2], self.acl[3]]) as usize;
             self.acl_in.push_back(self.acl.drain(..len).collect());
         }
-        while self.sco.len() >= 3 && self.sco.len() >= 3 + self.sco[2] as usize {
+        // A lost isochronous packet breaks the packet boundaries: skip ahead
+        // to the next header that names the voice link.
+        loop {
+            if let Some((handle, _, _)) = self.voice {
+                let skip = self.sco.windows(2).position(|w| u16::from_le_bytes([w[0], w[1]]) & 0x0FFF == handle)
+                    .unwrap_or(self.sco.len().saturating_sub(1));
+                self.sco.drain(..skip);
+            }
+            if self.sco.len() < 3 || self.sco.len() < 3 + self.sco[2] as usize {
+                break;
+            }
             let len = 3 + self.sco[2] as usize;
             self.sco_in.push_back(self.sco.drain(..len).collect());
         }
