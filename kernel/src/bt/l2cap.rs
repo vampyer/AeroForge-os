@@ -468,7 +468,7 @@ impl Host {
             PSM_HID_INTERRUPT | PSM_HID_CONTROL if data.first() == Some(&HID_DATA_INPUT) => {
                 let c = &mut self.conns[conn];
                 let mut pads = GAMEPADS.lock();
-                if let Some(g) = pads.iter_mut().find(|g| g.address == c.address) {
+                if let Some(g) = pads.iter_mut().find(|g| g.usb.is_none() && g.address == c.address) {
                     if hid::decode(&c.layout, &data[1..], &mut g.pad) {
                         g.reports += 1;
                     }

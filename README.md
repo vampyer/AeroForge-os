@@ -121,6 +121,16 @@ with a message saying so. The simulated adapter's LE pad checks the pairing valu
 AES, guards its HID attributes behind encryption, and switches off and on, which the boot test
 drives like the classic one.
 
+Since 0.14 USB gamepads work as well, plugged in before start-up. The xHCI driver sets up Xbox
+360 style pads (interface class FF/5D/01, which most wired pads and 2.4 GHz dongles present),
+lights their player 1 LED and turns each input report into a small HID report; any other HID
+interface whose report descriptor has a joystick or gamepad collection is read as it is. Both
+reach the kernel with a report descriptor (`aero_xhci_pad`, `aero_xhci_pad_report`), so the
+same parser as for Bluetooth pads decodes them, and `gamepad` lists them next to the Bluetooth
+ones. The boot test attaches two simulated pads (`tools/fakepad`), an Xbox style one and a HID
+one behind a hub next to a volume-key interface that must be left alone. Xbox One (GIP) pads,
+the Xbox 360 wireless receiver's protocol, and plugging in after start-up come later.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

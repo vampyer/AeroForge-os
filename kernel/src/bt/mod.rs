@@ -8,7 +8,7 @@
 
 mod crypto;
 mod hfp;
-mod hid;
+pub mod hid;
 mod l2cap;
 mod le;
 mod rfcomm;
@@ -95,7 +95,7 @@ pub struct Recording {
     pub pitch: u32,
 }
 
-/// A paired gamepad and what it is pressing right now.
+/// A paired Bluetooth gamepad or a USB gamepad, and what it is pressing right now.
 pub struct Gamepad {
     pub adapter: usize,
     pub address: [u8; 6],
@@ -106,6 +106,9 @@ pub struct Gamepad {
     pub axes: u8,
     pub reports: u64,
     pub pad: hid::Pad,
+    /// For a USB gamepad, where it is plugged in ("USB 0 port 4"); `adapter`
+    /// and `address` then mean nothing.
+    pub usb: Option<String>,
 }
 
 struct ScanJob {
@@ -792,14 +795,14 @@ impl Host {
         let name = self.device_name(&address);
         {
             let mut pads = GAMEPADS.lock();
-            match pads.iter_mut().find(|p| p.address == address) {
+            match pads.iter_mut().find(|p| p.usb.is_none() && p.address == address) {
                 Some(p) => {
                     p.connected = true;
                     p.layout = layout.clone();
                     p.axes = axes;
                 }
                 None => pads.push(Gamepad { adapter: self.index, address, name: name.clone(), connected: true,
-                    layout: layout.clone(), axes, reports: 0, pad: hid::Pad::default() }),
+                    layout: layout.clone(), axes, reports: 0, pad: hid::Pad::default(), usb: None }),
             }
         }
         crate::kok!("{}: gamepad {} \"{}\" connected ({})", self.name, addr_string(&address), name, layout);
@@ -1100,7 +1103,7 @@ impl Host {
                     }
                     let c = self.conns.remove(i);
                     let mut pads = GAMEPADS.lock();
-                    if let Some(g) = pads.iter_mut().find(|g| g.address == c.address && g.connected) {
+                    if let Some(g) = pads.iter_mut().find(|g| g.usb.is_none() && g.address == c.address && g.connected) {
                         g.connected = false;
                         g.pad = hid::Pad::default();
                         let name = g.name.clone();

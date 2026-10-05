@@ -88,6 +88,11 @@ constexpr int kScoTrbs = 16;          // isochronous voice transfers in flight, 
 constexpr int kScoBuf = 64;           // one isochronous packet (largest SCO alternate setting: 63)
 constexpr int kScoQueue = 256;        // received voice packets waiting for the kernel
 constexpr int kScoAlts = 8;
+constexpr int kPadTrbs = 8;           // gamepad interrupt-IN transfers in flight
+constexpr int kPadBuf = 64;           // one gamepad report (HID full-speed interrupt packets are at most 64 bytes)
+constexpr int kPadDesc = 1024;        // largest HID report descriptor kept
+constexpr int kPadQueue = 64;         // gamepad reports waiting for the kernel
+constexpr int kPadCandidates = 4;     // non-boot HID interfaces checked for a gamepad
 
 // ---- small helpers ----
 
@@ -182,6 +187,24 @@ private:
 };
 
 enum class HidKind : uint8_t { None, Keyboard, Mouse };
+enum class PadKind : uint8_t { None, Hid, XInput };
+
+// The report the driver turns each Xbox 360 (XInput) input report into, so
+// the kernel decodes every USB gamepad with its HID parser: hat (4 bits, 8 =
+// centred), 11 buttons (A B X Y LB RB Back Start LS RS Guide), the sticks as
+// X Y Rx Ry (down positive, as in HID) and the triggers as Z and Rz.
+constexpr uint8_t kXInputReportDesc[] = {
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01,                    // Generic Desktop, Gamepad, Application
+    0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,  // hat, null state
+    0x75, 0x04, 0x95, 0x01, 0x81, 0x01,                    // padding
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x0B, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0B, 0x81, 0x02,
+    0x75, 0x05, 0x95, 0x01, 0x81, 0x01,                    // padding
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34,
+    0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+    0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0xC0,
+};
+constexpr int kXInputReport = 13;
 
 struct Device {
     dhi_usb_device info{};
@@ -236,6 +259,16 @@ struct Device {
     dhi_dma sco_bufs{};                    // kScoTrbs IN packets, then kScoTrbs OUT packets
     uint32_t sco_in_queued = 0, sco_in_done = 0, sco_out_queued = 0, sco_out_done = 0;
     uint32_t sco_in_busy = 0;              // bit per IN buffer with a transfer queued
+
+    // Gamepad: an Xbox 360 style interface (class FF/5D/01, which most 2.4 GHz
+    // dongles and wired pads use) or a HID interface whose report descriptor
+    // describes a joystick or gamepad.
+    PadKind pad = PadKind::None;
+    int8_t pad_index = -1;                 // index in the controller's gamepad list
+    uint8_t pad_iface = 0, pad_in_dci = 0, pad_out_dci = 0, pad_interval = 0, pad_out_interval = 0;
+    uint16_t pad_mps = 0, pad_out_mps = 0, pad_desc_len = 0;
+    Ring pad_ring{}, pad_out_ring{};
+    dhi_dma pad_bufs{};                    // kPadTrbs reports, an OUT packet, then the report descriptor
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -405,6 +438,35 @@ public:
         }
         unlock();
         return rc == 0 ? 0 : -1;
+    }
+
+    // Gamepad `index`: fills `out` and copies its HID report descriptor.
+    int32_t pad_info(int32_t index, dhi_usb_device* out, uint8_t* desc, uint32_t max) const {
+        for (int i = 0; i < count_; ++i) {
+            const Device& d = devices_[i];
+            if (d.pad == PadKind::None || d.pad_index != index) continue;
+            if (out) *out = d.info;
+            const uint32_t n = d.pad_desc_len < max ? d.pad_desc_len : max;
+            const auto* src = static_cast<const uint8_t*>(d.pad_bufs.virt) + (kPadTrbs + 1) * kPadBuf;
+            for (uint32_t k = 0; k < n; ++k) desc[k] = src[k];
+            return int32_t(n);
+        }
+        return -1;
+    }
+
+    int32_t pad_report(int32_t* pad, uint8_t* out, uint32_t max) {
+        if (base_ == nullptr || !try_lock()) return 0;
+        process_events();
+        int32_t n = 0;
+        if (pq_tail_ != pq_head_) {
+            const PadReport& r = pad_queue_[pq_tail_];
+            n = int32_t(r.len < max ? r.len : max);
+            *pad = r.pad;
+            for (int32_t i = 0; i < n; ++i) out[i] = r.data[i];
+            pq_tail_ = (pq_tail_ + 1) % kPadQueue;
+        }
+        unlock();
+        return n;
     }
 
     int32_t device_info(int32_t index, dhi_usb_device* out) const {
@@ -577,6 +639,7 @@ private:
         ++count_;
         if (d.hid != HidKind::None && !start_hid(d)) d.hid = HidKind::None;
         if (d.storage && !start_storage(d)) d.storage = false;
+        if ((d.pad != PadKind::None || candidates_ > 0) && !start_pad(d)) d.pad = PadKind::None;
         if (d.bt_iface_seen && d.evt_dci && d.in_dci && d.out_dci && bt_count_ < kMaxBt && start_bt(d))
             d.bt = int8_t(bt_count_++);
 
@@ -592,6 +655,8 @@ private:
             l.s(", mass storage (not usable)");
         }
         if (d.bt >= 0) l.s(", Bluetooth adapter");
+        if (d.pad == PadKind::XInput) l.s(", gamepad (Xbox 360 style)");
+        if (d.pad == PadKind::Hid) l.s(", HID gamepad");
         const bool hub = d.info.dev_class == 9 || d.info.iface_class == 9;
         if (hub) l.s(", hub");
         ops_->log(l.str());
@@ -806,10 +871,13 @@ private:
         command(d.in_ctx.phys, 0, trb_type(kTrbEvaluateContext) | (uint32_t(d.slot) << 24), nullptr);
     }
 
-    // Finds the first HID boot keyboard or mouse interface and its interrupt-IN endpoint.
+    // Finds the first HID boot keyboard or mouse interface and its interrupt-IN
+    // endpoint, mass storage, Bluetooth, and gamepad interfaces (XInput, or
+    // HID interfaces that start_pad checks for a gamepad report descriptor).
     void parse_config(Device& d, const uint8_t* b, int len) {
-        bool in_boot_hid = false, in_storage = false, in_bt = false;
-        int sco_alt = -1;
+        bool in_boot_hid = false, in_storage = false, in_bt = false, in_xinput = false;
+        int sco_alt = -1, in_candidate = -1;
+        candidates_ = 0;
         for (int off = 0; off + 2 <= len && b[off] >= 2; off += b[off]) {
             const uint8_t type = b[off + 1];
             if (type == 4 && off + 9 <= len) {  // interface
@@ -823,6 +891,20 @@ private:
                 if (in_boot_hid) {
                     hid_iface_ = b[off + 2];
                     hid_kind_ = b[off + 7] == 1 ? HidKind::Keyboard : HidKind::Mouse;
+                }
+                // Gamepads: Xbox 360 style (control interface 0 only), or any other HID interface.
+                in_xinput = d.pad == PadKind::None && b[off + 3] == 0 && b[off + 5] == 0xFF && b[off + 6] == 0x5D &&
+                            b[off + 7] == 0x01;
+                if (in_xinput) {
+                    d.pad_iface = b[off + 2];
+                    d.pad_in_dci = d.pad_out_dci = 0;
+                }
+                in_candidate = -1;
+                if (b[off + 3] == 0 && b[off + 5] == 3 && !(b[off + 6] == 1 && (b[off + 7] == 1 || b[off + 7] == 2)) &&
+                    candidates_ < kPadCandidates) {
+                    in_candidate = candidates_;
+                    candidate_[in_candidate] = PadCandidate{};
+                    candidate_[in_candidate].iface = b[off + 2];
                 }
                 // Mass storage, SCSI transparent command set, bulk-only transport.
                 in_storage = !d.storage && b[off + 5] == 8 && b[off + 6] == 6 && b[off + 7] == 0x50;
@@ -840,6 +922,31 @@ private:
                     d.sco_iface = int8_t(b[off + 2]);
                     sco_alt = b[off + 3];
                 }
+            } else if (type == 0x21 && off + 9 <= len && in_candidate >= 0 && b[off + 6] == 0x22) {  // HID descriptor
+                candidate_[in_candidate].desc_len = uint16_t(b[off + 7] | b[off + 8] << 8);
+            } else if (type == 5 && off + 7 <= len && in_candidate >= 0) {  // HID endpoint
+                const uint8_t addr = b[off + 2], attr = b[off + 3];
+                PadCandidate& c = candidate_[in_candidate];
+                if ((addr & 0x80) && (attr & 3) == 3 && c.dci == 0) {
+                    c.dci = uint8_t((addr & 0xF) * 2 + 1);
+                    c.mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
+                    c.interval = b[off + 6];
+                    if (c.desc_len) ++candidates_;
+                    in_candidate = -1;
+                }
+            } else if (type == 5 && off + 7 <= len && in_xinput && (b[off + 3] & 3) == 3) {  // XInput endpoints
+                const uint8_t addr = b[off + 2];
+                const uint16_t mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
+                if (addr & 0x80) {
+                    d.pad_in_dci = uint8_t((addr & 0xF) * 2 + 1);
+                    d.pad_mps = mps;
+                    d.pad_interval = b[off + 6];
+                } else {
+                    d.pad_out_dci = uint8_t((addr & 0xF) * 2);
+                    d.pad_out_mps = mps;
+                    d.pad_out_interval = b[off + 6];
+                }
+                if (d.pad_in_dci) d.pad = PadKind::XInput;  // the OUT endpoint (player LEDs) is optional
             } else if (type == 5 && off + 7 <= len && sco_alt >= 0 && (b[off + 3] & 3) == 1) {  // isochronous
                 const uint8_t addr = b[off + 2];
                 const uint16_t mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
@@ -905,36 +1012,177 @@ private:
         control(d, 0x21, 0x0A, 0, iface, 0, 0);  // SET_IDLE(0): report only on change
 
         if (!d.intr.init(ops_) || ops_->dma_alloc(kReportTrbs * kReportSize, &d.reports) != 0) return false;
-
-        // Interval as 2^n * 125 us: full/low speed give frames (1 ms), high speed and up an exponent.
-        uint32_t interval = 0;
-        if (d.info.speed >= 3) {
-            interval = hid_interval_ ? hid_interval_ - 1u : 0u;
-        } else {
-            uint32_t micro = uint32_t(hid_interval_ ? hid_interval_ : 1) * 8;
-            while ((2u << interval) <= micro) ++interval;
-        }
-
-        for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(d.in_ctx.virt)[i] = 0;
-        volatile uint32_t* control_ctx = ctx(d.in_ctx, 0);
-        control_ctx[1] = 1u | (1u << d.dci);  // slot + the new endpoint
-        volatile uint32_t* sl = ctx(d.in_ctx, 1);
-        const volatile uint32_t* out_slot = ctx(d.out_ctx, 0);
-        for (int i = 0; i < 4; ++i) sl[i] = out_slot[i];
-        sl[0] = (sl[0] & ~(0x1Fu << 27)) | (uint32_t(d.dci) << 27);
-        sl[3] = 0;
-        volatile uint32_t* ep = ctx(d.in_ctx, 1 + d.dci);
-        ep[0] = interval << 16;
-        ep[1] = (uint32_t(hid_mps_) << 16) | (7u << 3) | (3u << 1);  // interrupt IN, 3 retries
-        ep[2] = uint32_t(d.intr.phys()) | 1;
-        ep[3] = uint32_t(d.intr.phys() >> 32);
-        ep[4] = (uint32_t(hid_mps_) << 16) | hid_mps_;  // max ESIT payload, average TRB length
-        if (command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr) != kCcSuccess)
-            return false;
+        const IntrEp ep{d.dci, hid_mps_, hid_interval_, &d.intr};
+        if (!add_interrupt_endpoints(d, &ep, 1)) return false;
 
         report_len_[d.slot] = uint8_t(hid_mps_ < kReportSize ? hid_mps_ : kReportSize);
         for (int i = 0; i < kReportTrbs; ++i) queue_report(d);
         return true;
+    }
+
+    // Interval as 2^n * 125 us: full/low speed give frames (1 ms), high speed and up an exponent.
+    static uint32_t interval_exponent(const Device& d, uint8_t b_interval) {
+        if (d.info.speed >= 3) return b_interval ? b_interval - 1u : 0u;
+        const uint32_t micro = uint32_t(b_interval ? b_interval : 1) * 8;
+        uint32_t interval = 0;
+        while ((2u << interval) <= micro) ++interval;
+        return interval;
+    }
+
+    struct IntrEp {
+        uint8_t dci;           // odd = IN, even = OUT
+        uint16_t mps;
+        uint8_t interval;      // bInterval from the endpoint descriptor
+        const Ring* ring;
+    };
+
+    // Adds interrupt endpoints to the device's running configuration.
+    bool add_interrupt_endpoints(Device& d, const IntrEp* eps, int n) {
+        for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(d.in_ctx.virt)[i] = 0;
+        volatile uint32_t* control_ctx = ctx(d.in_ctx, 0);
+        volatile uint32_t* sl = ctx(d.in_ctx, 1);
+        const volatile uint32_t* out_slot = ctx(d.out_ctx, 0);
+        for (int i = 0; i < 4; ++i) sl[i] = out_slot[i];
+        uint32_t entries = (out_slot[0] >> 27) & 0x1F;
+        control_ctx[1] = 1u;  // slot
+        for (int i = 0; i < n; ++i) {
+            const IntrEp& e = eps[i];
+            control_ctx[1] |= 1u << e.dci;
+            if (e.dci > entries) entries = e.dci;
+            volatile uint32_t* ep = ctx(d.in_ctx, 1 + e.dci);
+            ep[0] = interval_exponent(d, e.interval) << 16;
+            ep[1] = (uint32_t(e.mps) << 16) | ((e.dci & 1 ? 7u : 3u) << 3) | (3u << 1);  // interrupt IN/OUT, 3 retries
+            ep[2] = uint32_t(e.ring->phys()) | 1;
+            ep[3] = uint32_t(e.ring->phys() >> 32);
+            ep[4] = (uint32_t(e.mps) << 16) | e.mps;  // max ESIT payload, average TRB length
+        }
+        sl[0] = (sl[0] & ~(0x1Fu << 27)) | (entries << 27);
+        sl[3] = 0;
+        return command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr) == kCcSuccess;
+    }
+
+    // ------------------------------------------------------------- gamepads
+
+    // True if a HID report descriptor has a Joystick or Gamepad application collection.
+    static bool describes_gamepad(const uint8_t* desc, int len) {
+        uint32_t page = 0, usage = 0;
+        for (int i = 0; i < len;) {
+            const uint8_t b = desc[i];
+            if (b == 0xFE) {  // long item
+                i += 3 + (i + 1 < len ? desc[i + 1] : 0);
+                continue;
+            }
+            const int size = (b & 3) == 3 ? 4 : (b & 3);
+            if (i + 1 + size > len) break;
+            uint32_t v = 0;
+            for (int k = size - 1; k >= 0; --k) v = v << 8 | desc[i + 1 + k];
+            if ((b & 0xFC) == 0x04) page = v;                                   // usage page
+            else if ((b & 0xFC) == 0x08) usage = size == 4 ? v : page << 16 | v;  // usage
+            else if ((b & 0xFC) == 0xA0) {                                       // collection
+                if (v == 1 && (usage == 0x10004 || usage == 0x10005)) return true;
+                usage = 0;
+            } else if ((b & 0x0C) == 0) usage = 0;                               // other main items
+            i += 1 + size;
+        }
+        return false;
+    }
+
+    // Starts the device's gamepad interface: the XInput one parse_config
+    // found, or the first HID interface whose report descriptor is a gamepad's.
+    bool start_pad(Device& d) {
+        if (ops_->dma_alloc((kPadTrbs + 1) * kPadBuf + kPadDesc, &d.pad_bufs) != 0) return false;
+        auto* desc = static_cast<uint8_t*>(d.pad_bufs.virt) + (kPadTrbs + 1) * kPadBuf;
+        const uint64_t desc_phys = d.pad_bufs.phys + (kPadTrbs + 1) * kPadBuf;
+        if (d.pad == PadKind::XInput) {
+            for (uint32_t i = 0; i < sizeof(kXInputReportDesc); ++i) desc[i] = kXInputReportDesc[i];
+            d.pad_desc_len = sizeof(kXInputReportDesc);
+        } else {
+            for (int i = 0; i < candidates_ && d.pad == PadKind::None; ++i) {
+                const PadCandidate& c = candidate_[i];
+                const uint16_t want = c.desc_len < kPadDesc ? c.desc_len : uint16_t(kPadDesc);
+                const int n = control(d, 0x81, 6, 0x2200, c.iface, want, desc_phys);  // GET_DESCRIPTOR(report)
+                if (n <= 0 || !describes_gamepad(desc, n)) continue;
+                d.pad = PadKind::Hid;
+                d.pad_iface = c.iface;
+                d.pad_in_dci = c.dci;
+                d.pad_mps = c.mps;
+                d.pad_interval = c.interval;
+                d.pad_desc_len = uint16_t(n);
+            }
+            if (d.pad == PadKind::None) {
+                ops_->dma_free(&d.pad_bufs);
+                return false;
+            }
+            control(d, 0x21, 0x0A, 0, d.pad_iface, 0, 0);  // SET_IDLE(0): report only on change
+        }
+        if (!d.pad_ring.init(ops_) || (d.pad_out_dci && !d.pad_out_ring.init(ops_))) return false;
+        const IntrEp eps[2] = {{d.pad_in_dci, d.pad_mps, d.pad_interval, &d.pad_ring},
+                               {d.pad_out_dci, d.pad_out_mps, d.pad_out_interval, &d.pad_out_ring}};
+        if (!add_interrupt_endpoints(d, eps, d.pad_out_dci ? 2 : 1)) return false;
+        for (uint32_t i = 0; i < kPadTrbs; ++i) queue_pad(d, i);
+        if (d.pad == PadKind::XInput && d.pad_out_dci) {
+            // Light the player 1 quarter of the ring, as Windows does; some
+            // pads keep blinking until they get an LED command.
+            auto* out = static_cast<uint8_t*>(d.pad_bufs.virt) + kPadTrbs * kPadBuf;
+            out[0] = 0x01;
+            out[1] = 0x03;
+            out[2] = 0x06;
+            const uint64_t phys = d.pad_bufs.phys + kPadTrbs * kPadBuf;
+            d.pad_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), 3, trb_type(kTrbNormal) | kTrbIoc);
+            ring_doorbell(d.slot, d.pad_out_dci);
+        }
+        d.pad_index = int8_t(pad_count_++);
+        return true;
+    }
+
+    void queue_pad(Device& d, uint32_t slot) {
+        const uint64_t phys = d.pad_bufs.phys + uint64_t(slot) * kPadBuf;
+        d.pad_ring.push(uint32_t(phys), uint32_t(phys >> 32), d.pad_mps < kPadBuf ? d.pad_mps : kPadBuf,
+                        trb_type(kTrbNormal) | kTrbIoc | kTrbIsp);
+        ring_doorbell(d.slot, d.pad_in_dci);
+    }
+
+    void pad_received(Device& d, uint32_t slot, uint32_t code, uint32_t left) {
+        if (code != kCcSuccess && code != kCcShortPacket) return;
+        const uint32_t size = d.pad_mps < kPadBuf ? d.pad_mps : kPadBuf;
+        uint32_t len = left < size ? size - left : 0;
+        const auto* src = static_cast<const uint8_t*>(d.pad_bufs.virt) + slot * kPadBuf;
+        uint8_t r[kPadBuf];
+        if (d.pad == PadKind::XInput) {
+            // Input report: 00 14, buttons (2 bytes), LT, RT, LX LY RX RY (signed 16-bit, up positive).
+            // Other message types (LED and rumble status) are skipped.
+            if (len < 14 || src[0] != 0x00 || src[1] < 14) return;
+            static constexpr uint8_t kHat[16] = {8, 0, 4, 8, 6, 7, 5, 6, 2, 1, 3, 2, 8, 0, 4, 8};
+            const uint8_t b0 = src[2], b1 = src[3];
+            const uint16_t buttons = uint16_t(
+                (b1 >> 4 & 0xF) |                  // A B X Y
+                (b1 & 3) << 4 |                    // LB RB
+                (b0 >> 5 & 1) << 6 |               // Back
+                (b0 >> 4 & 1) << 7 |               // Start
+                (b0 >> 6 & 3) << 8 |               // left and right stick clicks
+                (b1 >> 2 & 1) << 10);              // Guide
+            r[0] = kHat[b0 & 0xF];
+            r[1] = uint8_t(buttons);
+            r[2] = uint8_t(buttons >> 8);
+            for (int a = 0; a < 4; ++a) {
+                int32_t v = int16_t(src[6 + 2 * a] | src[7 + 2 * a] << 8);
+                if (a & 1) v = v == -32768 ? 32767 : -v;  // Y axes: HID has down positive
+                r[3 + 2 * a] = uint8_t(v);
+                r[4 + 2 * a] = uint8_t(v >> 8);
+            }
+            r[11] = src[4];
+            r[12] = src[5];
+            src = r;
+            len = kXInputReport;
+        }
+        if (len == 0) return;
+        const int next = (pq_head_ + 1) % kPadQueue;
+        if (next == pq_tail_) return;  // full: drop
+        PadReport& q = pad_queue_[pq_head_];
+        q.pad = uint8_t(d.pad_index);
+        q.len = uint8_t(len);
+        for (uint32_t i = 0; i < len; ++i) q.data[i] = src[i];
+        pq_head_ = next;
     }
 
     // ------------------------------------------------------------ Bluetooth
@@ -1418,6 +1666,14 @@ private:
         } else if ((d->storage || d->bt >= 0) && (ep == d->in_dci || ep == d->out_dci)) {
             d->bulk_code = code;
             d->bulk_done = true;
+        } else if (d->pad != PadKind::None && ep == d->pad_in_dci) {
+            const uint64_t buf = d->pad_ring.buffer_of(ptr);
+            if (buf < d->pad_bufs.phys || buf >= d->pad_bufs.phys + kPadTrbs * kPadBuf) return;
+            const uint32_t slot = uint32_t((buf - d->pad_bufs.phys) / kPadBuf);
+            pad_received(*d, slot, code, d2 & 0xFFFFFF);
+            queue_pad(*d, slot);
+        } else if (d->pad != PadKind::None && ep == d->pad_out_dci) {
+            // The player LED command went out.
         } else if (ep == d->dci) {
             if (code == kCcSuccess || code == kCcShortPacket) {
                 const int index = d->intr.index_of(ptr) % kReportTrbs;
@@ -1541,6 +1797,20 @@ private:
     uint8_t config_value_ = 0, hid_iface_ = 0, hid_iface_of_device_ = 0, hid_interval_ = 0;
     HidKind hid_kind_ = HidKind::None;
     uint16_t hid_mps_ = 8;
+    struct PadCandidate {
+        uint8_t iface = 0, dci = 0, interval = 0;
+        uint16_t mps = 0, desc_len = 0;
+    };
+    PadCandidate candidate_[kPadCandidates]{};
+    int candidates_ = 0;
+
+    struct PadReport {
+        uint8_t pad = 0, len = 0;
+        uint8_t data[kPadBuf] = {};
+    };
+    PadReport pad_queue_[kPadQueue]{};
+    int pq_head_ = 0, pq_tail_ = 0;
+    int pad_count_ = 0;
 
     bool caps_ = false;
     bool busy_ = false;  // event ring owner: a disk read, a Bluetooth call or the poll thread
@@ -1639,4 +1909,14 @@ extern "C" int32_t aero_xhci_read(int32_t disk, uint64_t lba, uint32_t count, ui
 extern "C" int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device* out) {
     if (ctrl < 0 || ctrl >= g_count || out == nullptr) return -1;
     return g_controllers[ctrl].device_info(index, out);
+}
+
+extern "C" int32_t aero_xhci_pad(int32_t ctrl, int32_t index, dhi_usb_device* out, void* desc, uint32_t max) {
+    if (ctrl < 0 || ctrl >= g_count || out == nullptr || (max > 0 && desc == nullptr)) return -1;
+    return g_controllers[ctrl].pad_info(index, out, static_cast<uint8_t*>(desc), max);
+}
+
+extern "C" int32_t aero_xhci_pad_report(int32_t ctrl, int32_t* pad, void* data, uint32_t max) {
+    if (ctrl < 0 || ctrl >= g_count || pad == nullptr || data == nullptr) return 0;
+    return g_controllers[ctrl].pad_report(pad, static_cast<uint8_t*>(data), max);
 }
