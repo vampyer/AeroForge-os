@@ -3,7 +3,8 @@
 # user-mode IPC demo completes (aerosmss starts echod and three clients, each
 # client finishes its round trips), and both the NVMe (GPT) and SATA (MBR)
 # test disks get mounted, and a USB keyboard and mouse get set up behind a USB hub, and the
-# Intel Ethernet card gets an address over DHCP and pings the gateway. Intended for CI (design doc, Phase 0).
+# Intel igb card gets an address over DHCP and pings the gateway (a second,
+# e1000e card must come up with a link). Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,7 +26,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive file=build/sata.img,if=none,id=sata,format=raw -device ide-hd,drive=sata,bus=ide.1,serial=AEROSATA1 \
     -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
     -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
-    -nic user,model=e1000e \
+    -nic user,model=igb -nic user,model=e1000e \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none &
 QEMU_PID=$!
 trap 'kill $QEMU_PID 2>/dev/null || true' EXIT
@@ -49,11 +50,12 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "attacks blocked, system call checks OK" "$LOG" || { echo "FAIL: sectest: a bad pointer got through a system call"; exit 1; }
         grep -q "nxtest (pid [0-9]*) killed: .*execute in a no-execute page" "$LOG" || { echo "FAIL: code on the stack was not stopped by NX"; exit 1; }
         grep -q "rotest (pid [0-9]*) killed: .*write to a read-only page" "$LOG" || { echo "FAIL: write to code was not stopped"; exit 1; }
-        grep -q "Intel Ethernet driver (e1000/e1000e) attached" "$LOG" || { echo "FAIL: Intel Ethernet card not set up"; exit 1; }
+        grep -q "eth0: Intel 8086:10c9 (igb/igc driver) .*link up" "$LOG" || { echo "FAIL: Intel igb card not set up"; exit 1; }
+        grep -q "eth1: Intel 8086:10d3 (e1000 driver) .*link up" "$LOG" || { echo "FAIL: Intel e1000e card not set up"; exit 1; }
         grep -q "DHCP: eth0 got 10.0.2.15/24, gateway 10.0.2.2" "$LOG" || { echo "FAIL: no DHCP lease"; exit 1; }
         grep -q "ping 10.0.2.2: reply from 10.0.2.2" "$LOG" || { echo "FAIL: no ping reply from the gateway"; exit 1; }
         grep -q "read /system/session.cfg" "$LOG" || { echo "FAIL: aerosmss did not read its config from disk"; exit 1; }
-        echo "PASS: booted, mounted the NVMe and SATA disks, set up the USB keyboard and mouse behind a hub, got an address over DHCP and pinged the gateway, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

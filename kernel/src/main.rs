@@ -200,12 +200,12 @@ extern "C" fn kmain() -> ! {
     }
     let nics = net::probe();
     for n in net::NICS.lock().iter() {
-        console::print_colored(console::DIM, format_args!("       {}: Intel {:04x}:{:04x} at {}, MAC {}, link {}\n",
-            n.name, n.pci_id.0, n.pci_id.1, n.location, net::mac_string(&n.info.mac),
+        console::print_colored(console::DIM, format_args!("       {}: Intel {:04x}:{:04x} ({} driver) at {}, MAC {}, link {}\n",
+            n.name, n.pci_id.0, n.pci_id.1, n.driver_name, n.location, net::mac_string(&n.info.mac),
             if n.info.link_up != 0 { alloc::format!("up at {} Mb/s", n.info.speed_mbps) } else { "down".into() }));
     }
     if nics > 0 {
-        kok!("C++ Intel Ethernet driver (e1000/e1000e) attached through DHI v{}: {} port(s)", dhi::ABI_VERSION, nics);
+        kok!("C++ Intel Ethernet drivers (e1000/e1000e, igb/igc) attached through DHI v{}: {} port(s)", dhi::ABI_VERSION, nics);
     }
     let mounts = vfs::mount_all();
     for m in mounts {

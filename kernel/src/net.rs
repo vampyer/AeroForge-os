@@ -18,8 +18,58 @@ use crate::dhi::{self, NetInfo};
 use crate::sync::IrqMutex;
 use crate::{apic, console, pci, sched};
 
-pub struct Nic {
+/// Which C++ driver runs a card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Driver {
+    E1000,
+    Igc,
+}
+
+/// A card as the drivers know it: driver plus that driver's NIC id.
+#[derive(Clone, Copy)]
+pub struct Port {
+    pub driver: Driver,
     pub id: i32,
+}
+
+impl Port {
+    fn send(self, frame: &[u8]) -> bool {
+        let (p, n) = (frame.as_ptr(), frame.len() as u32);
+        let rc = unsafe {
+            match self.driver {
+                Driver::E1000 => dhi::aero_e1000_send(self.id, p, n),
+                Driver::Igc => dhi::aero_igc_send(self.id, p, n),
+            }
+        };
+        rc == 0
+    }
+
+    fn recv(self, buf: &mut [u8]) -> i32 {
+        let (p, n) = (buf.as_mut_ptr(), buf.len() as u32);
+        unsafe {
+            match self.driver {
+                Driver::E1000 => dhi::aero_e1000_recv(self.id, p, n),
+                Driver::Igc => dhi::aero_igc_recv(self.id, p, n),
+            }
+        }
+    }
+
+    /// Current link speed in Mb/s, read from the hardware; None if the link is down.
+    pub fn link(self) -> Option<u32> {
+        let mut speed = 0;
+        let up = unsafe {
+            match self.driver {
+                Driver::E1000 => dhi::aero_e1000_link(self.id, &mut speed),
+                Driver::Igc => dhi::aero_igc_link(self.id, &mut speed),
+            }
+        };
+        (up == 1).then_some(speed)
+    }
+}
+
+pub struct Nic {
+    pub port: Port,
+    pub driver_name: &'static str,
     pub name: String,
     pub location: String,
     pub pci_id: (u16, u16),
@@ -54,22 +104,31 @@ pub fn probe() -> usize {
     let mut found = 0;
     for dev in pci::devices().iter().filter(|d| d.class == 0x02 && d.subclass == 0x00 && d.vendor == 0x8086) {
         let at = alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.dev, dev.func);
-        if unsafe { dhi::aero_e1000_supports(dev.device) } == 0 {
+        let (driver, driver_name) = if unsafe { dhi::aero_e1000_supports(dev.device) } != 0 {
+            (Driver::E1000, "e1000")
+        } else if unsafe { dhi::aero_igc_supports(dev.device) } != 0 {
+            (Driver::Igc, "igb/igc")
+        } else {
             console::print_colored(console::YELLOW, format_args!(
-                "[WARN] Intel Ethernet 8086:{:04x} at {}: no driver yet (igb/igc come next)\n", dev.device, at));
+                "[WARN] Intel Ethernet 8086:{:04x} at {}: no driver for this model yet\n", dev.device, at));
             continue;
-        }
+        };
         let Some(bar0) = dev.bar(0) else { continue };
         dev.enable_mmio_and_dma();
         let mut info = NetInfo::default();
-        let id = unsafe { dhi::aero_e1000_init(&dhi::OPS, bar0, &mut info) };
+        let id = unsafe {
+            match driver {
+                Driver::E1000 => dhi::aero_e1000_init(&dhi::OPS, bar0, &mut info),
+                Driver::Igc => dhi::aero_igc_init(&dhi::OPS, bar0, dev.device, &mut info),
+            }
+        };
         if id < 0 {
             console::print_colored(console::YELLOW, format_args!("[WARN] Intel Ethernet at {}: init failed ({})\n", at, id));
             continue;
         }
         let mut nics = NICS.lock();
         let name = alloc::format!("eth{}", nics.len());
-        nics.push(Nic { id, name, location: at, pci_id: (dev.vendor, dev.device), info });
+        nics.push(Nic { port: Port { driver, id }, driver_name, name, location: at, pci_id: (dev.vendor, dev.device), info });
         found += 1;
     }
     found
@@ -86,12 +145,12 @@ fn now() -> Instant {
 // ------------------------------------------------------ smoltcp device glue
 
 struct Device {
-    nic: i32,
+    nic: Port,
     rx: [u8; 2048],
 }
 
 struct RxToken<'a>(&'a [u8]);
-struct TxToken(i32);
+struct TxToken(Port);
 
 impl phy::RxToken for RxToken<'_> {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -104,7 +163,7 @@ impl phy::TxToken for TxToken {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut frame = [0u8; 1514];
         let r = f(&mut frame[..len]);
-        if unsafe { dhi::aero_e1000_send(self.0, frame.as_ptr(), len as u32) } == 0 {
+        if self.0.send(&frame[..len]) {
             TX_PACKETS.fetch_add(1, Ordering::Relaxed);
         }
         r
@@ -117,7 +176,7 @@ impl phy::Device for Device {
 
     fn receive(&mut self, _: Instant) -> Option<(RxToken<'_>, TxToken)> {
         loop {
-            let n = unsafe { dhi::aero_e1000_recv(self.nic, self.rx.as_mut_ptr(), self.rx.len() as u32) };
+            let n = self.nic.recv(&mut self.rx);
             match n {
                 0 => return None,
                 n if n < 0 => {
@@ -147,7 +206,7 @@ const PING_IDENT: u16 = 0xAE40;
 
 /// Kernel thread: runs the TCP/IP stack on the first NIC, about every 10 ms.
 pub fn net_thread(_: u64) {
-    let Some((nic, mac)) = NICS.lock().first().map(|n| (n.id, n.info.mac)) else { return };
+    let Some((nic, mac)) = NICS.lock().first().map(|n| (n.port, n.info.mac)) else { return };
     let mut device = Device { nic, rx: [0; 2048] };
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(config, &mut device, now());
@@ -286,10 +345,4 @@ pub fn ping(target: Ipv4Addr, count: u16) -> Result<(), &'static str> {
         sched::sleep_ticks(5);
     }
     Ok(())
-}
-
-/// Current link state of a NIC, read from the hardware.
-pub fn link(nic: i32) -> Option<u32> {
-    let mut speed = 0;
-    (unsafe { dhi::aero_e1000_link(nic, &mut speed) } == 1).then_some(speed)
 }

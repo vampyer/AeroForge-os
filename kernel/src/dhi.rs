@@ -119,6 +119,11 @@ extern "C" {
     pub fn aero_e1000_send(nic: i32, frame: *const u8, len: u32) -> i32;
     pub fn aero_e1000_recv(nic: i32, frame: *mut u8, max: u32) -> i32;
     pub fn aero_e1000_link(nic: i32, speed_mbps: *mut u32) -> i32;
+    pub fn aero_igc_supports(device_id: u16) -> i32;
+    pub fn aero_igc_init(ops: *const DhiOps, mmio_phys: u64, device_id: u16, info: *mut NetInfo) -> i32;
+    pub fn aero_igc_send(nic: i32, frame: *const u8, len: u32) -> i32;
+    pub fn aero_igc_recv(nic: i32, frame: *mut u8, max: u32) -> i32;
+    pub fn aero_igc_link(nic: i32, speed_mbps: *mut u32) -> i32;
 }
 
 extern "C" fn dhi_log(msg: *const c_char) {
