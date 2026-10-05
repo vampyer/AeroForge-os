@@ -19,6 +19,8 @@ constexpr uint32_t kRegAcq  = 0x30;
 constexpr uint8_t kOpCreateIoSq = 0x01;
 constexpr uint8_t kOpCreateIoCq = 0x05;
 constexpr uint8_t kOpIdentify   = 0x06;
+constexpr uint8_t kOpFlush      = 0x00;
+constexpr uint8_t kOpWrite      = 0x01;
 constexpr uint8_t kOpRead       = 0x02;
 
 constexpr uint32_t kQueueDepth = 64;
@@ -94,11 +96,23 @@ public:
         return 0;
     }
 
-    int32_t read(uint64_t lba, uint32_t count, uint64_t buf) {
+    int32_t read(uint64_t lba, uint32_t count, uint64_t buf) { return io(kOpRead, lba, count, buf); }
+    int32_t write(uint64_t lba, uint32_t count, uint64_t buf) { return io(kOpWrite, lba, count, buf); }
+
+    // Commit the controller's volatile write cache to media.
+    int32_t flush() {
+        Command c{};
+        c.cdw0 = kOpFlush;
+        c.nsid = nsid_;
+        return submit(io_, c, nullptr);
+    }
+
+private:
+    int32_t io(uint8_t opcode, uint64_t lba, uint32_t count, uint64_t buf) {
         if (count == 0 || uint64_t(count) * block_size_ > max_transfer_) return -1;
         if (lba + count > block_count_) return -2;
         Command c{};
-        c.cdw0 = kOpRead;
+        c.cdw0 = opcode;
         c.nsid = nsid_;
         c.prp1 = buf;
         const uint64_t bytes = uint64_t(count) * block_size_;
@@ -260,4 +274,14 @@ extern "C" int32_t aero_nvme_init(const dhi_ops* ops, uint64_t bar0_phys, dhi_bl
 extern "C" int32_t aero_nvme_read(int32_t ctrl, uint64_t lba, uint32_t count, uint64_t buf_phys) {
     if (ctrl < 0 || ctrl >= g_count) return -1;
     return g_controllers[ctrl].read(lba, count, buf_phys);
+}
+
+extern "C" int32_t aero_nvme_write(int32_t ctrl, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+    if (ctrl < 0 || ctrl >= g_count) return -1;
+    return g_controllers[ctrl].write(lba, count, buf_phys);
+}
+
+extern "C" int32_t aero_nvme_flush(int32_t ctrl) {
+    if (ctrl < 0 || ctrl >= g_count) return -1;
+    return g_controllers[ctrl].flush();
 }

@@ -451,18 +451,23 @@ public:
     }
 
     int32_t read(int32_t dev, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+        return transfer(dev, false, lba, count, buf_phys);
+    }
+
+    int32_t write(int32_t dev, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+        return transfer(dev, true, lba, count, buf_phys);
+    }
+
+    // SYNCHRONIZE CACHE(10) over the whole disk.
+    int32_t flush(int32_t dev) {
         if (dev < 0 || dev >= count_ || !devices_[dev].disk_ok) return -1;
         Device& d = devices_[dev];
-        if (count == 0 || lba + count > d.disk.block_count || uint64_t(count) * d.disk.block_size > d.disk.max_transfer)
-            return -1;
+        const uint8_t cdb[10] = {0x35};
         lock();
-        int rc = -1;
-        for (int attempt = 0; attempt < 2 && rc != 0; ++attempt) {
-            rc = read_blocks(d, lba, count, buf_phys);
-            if (rc == 1) request_sense(d);  // clears the error so the retry can work
-        }
+        int rc = scsi(d, cdb, 10, false, 0, 0);
+        if (rc == 1) request_sense(d);  // some sticks don't support it; treat that as done
         unlock();
-        return rc == 0 ? 0 : -1;
+        return rc < 0 ? -1 : 0;
     }
 
     // Gamepad `index`: fills `out` and copies its HID report descriptor.
@@ -1584,23 +1589,38 @@ private:
         return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
     }
 
-    // READ(10), or READ(16) past 2^32 blocks. 0 = ok, 1 = check condition, -1 = transport error.
-    int read_blocks(Device& d, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+    int32_t transfer(int32_t dev, bool write, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+        if (dev < 0 || dev >= count_ || !devices_[dev].disk_ok) return -1;
+        Device& d = devices_[dev];
+        if (count == 0 || lba + count > d.disk.block_count || uint64_t(count) * d.disk.block_size > d.disk.max_transfer)
+            return -1;
+        lock();
+        int rc = -1;
+        for (int attempt = 0; attempt < 2 && rc != 0; ++attempt) {
+            rc = rw_blocks(d, write, lba, count, buf_phys);
+            if (rc == 1) request_sense(d);  // clears the error so the retry can work
+        }
+        unlock();
+        return rc == 0 ? 0 : -1;
+    }
+
+    // READ/WRITE(10), or (16) past 2^32 blocks. 0 = ok, 1 = check condition, -1 = transport error.
+    int rw_blocks(Device& d, bool write, uint64_t lba, uint32_t count, uint64_t buf_phys) {
         uint8_t cdb[16] = {};
         int len;
         if (lba + count > 0xFFFFFFFFull) {
-            cdb[0] = 0x88;
+            cdb[0] = write ? 0x8A : 0x88;
             for (int i = 0; i < 8; ++i) cdb[2 + i] = uint8_t(lba >> (56 - 8 * i));
             for (int i = 0; i < 4; ++i) cdb[10 + i] = uint8_t(count >> (24 - 8 * i));
             len = 16;
         } else {
-            cdb[0] = 0x28;
+            cdb[0] = write ? 0x2A : 0x28;
             for (int i = 0; i < 4; ++i) cdb[2 + i] = uint8_t(lba >> (24 - 8 * i));
             cdb[7] = uint8_t(count >> 8);
             cdb[8] = uint8_t(count);
             len = 10;
         }
-        return scsi(d, cdb, len, true, buf_phys, count * d.disk.block_size);
+        return scsi(d, cdb, len, !write, buf_phys, count * d.disk.block_size);
     }
 
     void request_sense(Device& d) {
@@ -2032,6 +2052,16 @@ extern "C" int32_t aero_xhci_disk(int32_t ctrl, int32_t index, dhi_block_info* o
 extern "C" int32_t aero_xhci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys) {
     if (disk < 0 || disk / kMaxDevices >= g_count) return -1;
     return g_controllers[disk / kMaxDevices].read(disk % kMaxDevices, lba, count, buf_phys);
+}
+
+extern "C" int32_t aero_xhci_write(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+    if (disk < 0 || disk / kMaxDevices >= g_count) return -1;
+    return g_controllers[disk / kMaxDevices].write(disk % kMaxDevices, lba, count, buf_phys);
+}
+
+extern "C" int32_t aero_xhci_flush(int32_t disk) {
+    if (disk < 0 || disk / kMaxDevices >= g_count) return -1;
+    return g_controllers[disk / kMaxDevices].flush(disk % kMaxDevices);
 }
 
 extern "C" int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device* out) {

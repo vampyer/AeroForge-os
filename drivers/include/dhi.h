@@ -84,6 +84,14 @@ int32_t aero_nvme_init(const dhi_ops *ops, uint64_t bar0_phys, dhi_block_info *o
  * count * block_size must not exceed max_transfer. 0 = ok. */
 int32_t aero_nvme_read(int32_t ctrl, uint64_t lba, uint32_t count, uint64_t buf_phys);
 
+/* Writes `count` blocks starting at `lba` from the DMA buffer at `buf_phys`,
+ * same limits as the read. The data may sit in the drive's cache until
+ * aero_nvme_flush. 0 = ok. */
+int32_t aero_nvme_write(int32_t ctrl, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
+/* Commits the drive's write cache to media. 0 = ok. */
+int32_t aero_nvme_flush(int32_t ctrl);
+
 /* ---- AHCI (SATA) driver (drivers/ahci) ---- */
 
 /* Brings up the AHCI controller whose ABAR (BAR5) is at `abar_phys` and
@@ -97,6 +105,14 @@ int32_t aero_ahci_init(const dhi_ops *ops, uint64_t abar_phys, dhi_block_info *o
 /* Reads `count` sectors starting at `lba` into the DMA buffer at `buf_phys`.
  * count * block_size must not exceed max_transfer. 0 = ok. */
 int32_t aero_ahci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
+/* Writes `count` blocks starting at `lba` from the DMA buffer at `buf_phys`,
+ * same limits as the read. The data may sit in the drive's cache until
+ * aero_ahci_flush. 0 = ok. */
+int32_t aero_ahci_write(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
+/* Commits the drive's write cache to media. 0 = ok. */
+int32_t aero_ahci_flush(int32_t disk);
 
 /* ---- xHCI (USB 3) driver (drivers/xhci) ---- */
 
@@ -152,6 +168,14 @@ int32_t aero_xhci_disk(int32_t ctrl, int32_t index, dhi_block_info *out);
  * count * block_size must not exceed max_transfer. 0 = ok. Safe to call
  * while another CPU runs aero_xhci_poll. */
 int32_t aero_xhci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
+/* Writes `count` blocks starting at `lba` from the DMA buffer at `buf_phys`,
+ * same limits as the read. The data may sit in the drive's cache until
+ * aero_xhci_flush. 0 = ok. */
+int32_t aero_xhci_write(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys);
+
+/* Commits the drive's write cache to media. 0 = ok. */
+int32_t aero_xhci_flush(int32_t disk);
 
 /* Bluetooth adapters (USB class E0/01/01) found during init. Fills `out` for
  * the controller's adapter `index` (0, 1, ...) and returns an adapter id, or
