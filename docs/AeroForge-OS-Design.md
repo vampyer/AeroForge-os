@@ -134,7 +134,7 @@ Goal: games and emulators get the hardware.
 | USB | xHCI (C++), HID class for controllers (XInput-compatible mapping, DualShock/DualSense via HID) |
 | Bluetooth | USB Bluetooth controllers (HCI over USB, firmware loading for Realtek/Intel/MediaTek chips); BLE HID for gamepads (Xbox, DualShock/DualSense, 8BitDo), Classic HID; HFP/HSP for headset mics, A2DP for audio out. Host stack in user space (Rust), ideally a port or adaptation of an existing stack (e.g. BlueZ's protocol logic or Android's Fluoride/Gabeldorsche) rather than written from scratch |
 | Audio | Intel HDA first, USB Audio Class 2 next |
-| Network | virtio-net, Intel e1000e/igc, Realtek r8169 (most common on desktop boards), Wi-Fi much later (port Linux iwlwifi via shim) |
+| Network | virtio-net, then Intel **igc** (I225/I226 2.5 GbE, the development machine's wired NIC) and e1000e (older Intel, and QEMU's e1000e for testing), then Realtek r8169; Wi-Fi: **MediaTek mt7921/mt7922** first (the development machine's card, ported from Linux mt76 via the shim), Intel iwlwifi later |
 | Power | ACPI S3/S0ix later; CPU P-states via CPPC/HWP |
 
 ---
@@ -427,7 +427,7 @@ Licence note: Linux DRM drivers are GPL-2.0 (many core files are dual MIT/GPL, a
 |---|---|
 | Audio | HDA codec driver (C++), USB Audio, Bluetooth audio (HFP/HSP mics, A2DP out); AudioSvc mixer with low-latency mode (≤ 5 ms buffers) for emulators; WASAPI-compatible behaviour exposed to Wine |
 | Input | xHCI + HID, Bluetooth HID (gamepads paired once in Settings, reconnect automatically); controller database (SDL's `gamecontrollerdb`) built into InputSvc so every controller maps consistently in RetroBat/ES-DE, emulators and Wine |
-| Network | virtio-net → Intel/Realtek wired → Wi-Fi via ported Linux drivers (iwlwifi, mt76) through AeroKPI |
+| Network | virtio-net → Intel igc/e1000e → Realtek r8169 → MediaTek Wi-Fi (mt76: mt7921/mt7922) → Intel Wi-Fi (iwlwifi), the Wi-Fi drivers ported from Linux through AeroKPI |
 | Storage | NVMe/AHCI native C++ |
 
 ---
@@ -461,14 +461,14 @@ Each phase ends with a demo that proves it. Durations assume a small dedicated t
 - ACPI via ACPICA, x2APIC, HPET/TSC, SMP bring-up.
 - Scheduler (per-CPU queues, priorities), threads, processes, user mode (ring 3), syscall gate.
 - Object manager, handles/capabilities, IPC ports, futexes, events.
-- Driver Host Interface + first C++ drivers: **NVMe** first (the development machine boots from NVMe), then **AHCI** for its SATA drive (small, and it reuses NVMe's block layer), then **xHCI** for USB 3 keyboard/mouse (Ryzen boards have no PS/2), then virtio-net.
+- Driver Host Interface + first C++ drivers: **NVMe** first (the development machine boots from NVMe), then **AHCI** for its SATA drive (small, and it reuses NVMe's block layer), then **xHCI** for USB 3 keyboard/mouse (Ryzen boards have no PS/2), then virtio-net, then **Intel Ethernet** (igc for I225/I226, e1000e; tested on QEMU's e1000e/igb) for the development machine's wired port.
 - **Demo:** multi-core kernel running user-mode processes that talk over IPC, reading files from a disk image.
 
 ### Phase 2: Userland and POSIX personality (≈ 6 to 9 months)
 - VFS, root filesystem (start with a port or a simple FS; CoW FS later), FAT32/exFAT.
 - Port relibc or musl, then a shell, coreutils (uutils, in Rust), LLVM/Clang self-hosted.
 - Partial Linux-syscall ABI for bootstrapping static binaries.
-- Network stack (smoltcp in Rust to start), TLS (rustls), DNS.
+- Network stack (smoltcp in Rust to start), TLS (rustls), DNS, DHCP, over virtio-net and the Intel wired driver.
 - **Demo:** AeroForge compiles a C++ program on itself and downloads a file over HTTPS.
 
 ### Phase 3: Graphics, input, audio in a VM (≈ 6 to 9 months)
@@ -477,6 +477,7 @@ Each phase ends with a demo that proves it. Durations assume a small dedicated t
 - Glass compositor v1 (Vulkan, window buffers, input routing, blur).
 - USB HID input, controllers; HDA audio, AudioSvc.
 - Bluetooth: HCI over USB, pairing, HID gamepads first (emulators need them), then HFP/HSP mic and A2DP audio. QEMU can pass a real USB Bluetooth dongle through for testing.
+- Wi-Fi: MediaTek mt7921/mt7922 (the development machine's card) by porting Linux's mt76 driver through AeroKPI, with WPA2/WPA3 in user space. These MediaTek cards usually carry the Bluetooth radio too (on USB, Linux btmtk), so Wi-Fi and Bluetooth share firmware loading work.
 - **Port DOSBox-X here** (SDL3 only), the earliest flagship app.
 - **Demo:** Vulkan triangle and DOSBox-X playing a DOS game in QEMU with sound and a CRT shader.
 
@@ -521,7 +522,7 @@ Each phase ends with a demo that proves it. Durations assume a small dedicated t
 - **Demo:** sandboxed Chromium passing Web Platform Tests subsets, YouTube with hardware video decode (VA-API-equivalent via Mesa).
 
 ### Phase 10: Polish, hardware breadth, 1.0 (ongoing)
-- Wi-Fi, more Bluetooth chipsets and profiles, sleep/resume, laptops' power management.
+- More Wi-Fi chipsets (Intel iwlwifi, Realtek), more Bluetooth chipsets and profiles, sleep/resume, laptops' power management.
 - Installer, disk encryption, Secure Boot with own keys, recovery environment.
 - Accessibility (screen reader, high contrast, keyboard navigation), localisation.
 - Security audit of the kernel syscall surface and the sandbox; fuzzing (syzkaller-style) in CI.
