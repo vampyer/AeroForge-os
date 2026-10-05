@@ -6,7 +6,7 @@ A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Every CI run uploads the built ISO as a workflow artifact (Actions tab, "boot test" run, Artifacts).
 
-## What works today (milestone 0.8)
+## What works today (milestone 0.9)
 
 Boots on UEFI through Limine, brings up every CPU, and starts **aerosmss**, the first user
 process. aerosmss starts an `echod` service and three clients; the clients run in ring 3 on
@@ -58,8 +58,21 @@ is loaded from `/boot/firmware/mediatek/`; MediaTek's licence allows redistribut
 with MediaTek devices and is shipped next to it. Adapters that need no firmware (most generic
 dongles) work directly. QEMU has no Bluetooth device, so `tools/fakebt` simulates an MT7921
 adapter over usbredir: it checks every downloaded firmware byte against the file and answers
-scans with a classic gamepad, an LE gamepad and a headset. Pairing and gamepad input come next,
-then the microphone. Realtek and Intel adapters need their own firmware loaders (later).
+scans with a classic gamepad, an LE gamepad and a headset. Realtek and Intel adapters need
+their own firmware loaders (later).
+
+Since 0.9 classic Bluetooth gamepads work. `bt pair <address>` (with the pad in pairing mode)
+connects, pairs with Secure Simple Pairing ("Just Works", or PIN 0000 for older pads), turns on
+encryption, reads the pad's HID report descriptor over SDP and opens the HID control and
+interrupt channels over L2CAP. A small HID report-descriptor parser finds the sticks and
+triggers (X, Y, Z, Rx, Ry, Rz, gas, brake), the d-pad (hat switch) and up to 32 buttons, so any
+standard gamepad works without a per-model driver; `gamepad` shows what each pad is pressing.
+A paired pad reconnects by itself when switched on (the adapter keeps page scan on and accepts
+only paired devices). Pairings live in memory until AeroForge gets a writable disk, so pads have
+to be paired again after a restart. Programs cannot read the gamepad yet, and Bluetooth LE
+gamepads (HID over GATT) and the microphone come next. The simulated adapter also plays a
+classic gamepad that pairs, sends input, switches off and on and reconnects, which the boot
+test drives through the shell.
 
 | Area | Status |
 |---|---|
@@ -78,8 +91,8 @@ then the microphone. Realtek and Intel adapters need their own firmware loaders 
 | Storage | Block device layer, GPT and MBR partitions, read-only **FAT32** with long file names and case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read` system call |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test) (Rust, `no_std`) |
-| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
-| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download and a Bluetooth scan against the simulated adapter, the security audit and self-test, the config read and the whole IPC demo |
+| Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `disks`, `ls`, `cat`, `wc`, `mem`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
+| Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, gamepad pairing, input and reconnection against the simulated adapter, the security audit and self-test, the config read and the whole IPC demo |
 
 ### System calls (`int 0x80`, number in `rax`, args in `rdi rsi rdx r10`)
 
@@ -116,7 +129,8 @@ kernel/                   AeroKernel (Rust, no_std, stable toolchain)
   src/{acpi,smp}.rs       firmware tables, application processors
   src/pci.rs              PCIe enumeration
   src/{block,fat,vfs}.rs  block devices and partitions, FAT32, the mount at /
-  src/bt.rs               Bluetooth host: adapter bring-up over HCI, scanning
+  src/bt/                 Bluetooth host: HCI bring-up, scanning, pairing (mod.rs),
+                          L2CAP (l2cap.rs), SDP (sdp.rs), HID gamepads (hid.rs)
   src/modules.rs          boot modules: user programs and firmware
   src/sync.rs             IrqMutex (interrupt-safe spinlock)
   src/dhi.rs              Rust side of the Driver Host Interface
@@ -139,7 +153,8 @@ tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/dis
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 tools/make-usb-disk.sh    builds the USB stick image (MBR + FAT32) from tools/usb-files/
 tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
-tools/fakebt/             simulated USB Bluetooth adapter for QEMU (usbredir, C)
+tools/fakebt/             simulated USB Bluetooth adapter and gamepad for QEMU (usbredir, C)
+tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)
 ```
 
 ## Building and running

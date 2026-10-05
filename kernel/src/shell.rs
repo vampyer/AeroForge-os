@@ -76,6 +76,8 @@ impl Shell {
                 kprintln!("  ping <ip>   send 4 ICMP echo requests");
                 kprintln!("  bt          Bluetooth adapters");
                 kprintln!("  bt scan [s] look for Bluetooth devices for s seconds (default 5)");
+                kprintln!("  bt pair <address>  pair a Bluetooth gamepad (put it in pairing mode first)");
+                kprintln!("  gamepad     Bluetooth gamepads and what they are pressing");
                 kprintln!("  disks       disks and partitions");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
@@ -88,7 +90,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.8, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  AeroForge OS 0.9, AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }
@@ -203,6 +205,9 @@ impl Shell {
                             a.chip.as_ref().map_or(String::new(), |c| alloc::format!(" ({})", c)), state);
                     }
                     drop(list);
+                    for b in bt::BONDS.lock().iter() {
+                        kprintln!("  paired: {} \"{}\"", bt::addr_string(&b.address), b.name);
+                    }
                     let found = bt::FOUND.lock();
                     if !found.is_empty() {
                         kprintln!("  {} device(s) seen in the last scan, 'bt scan' to refresh", found.len());
@@ -222,8 +227,41 @@ impl Shell {
                         Err(e) => console::print_colored(YELLOW, format_args!("  bt: {}\n", e)),
                     }
                 }
-                _ => console::print_colored(YELLOW, format_args!("  usage: bt [scan [seconds]]\n")),
+                ("pair", a) => match bt::parse_addr(a.trim()) {
+                    Some(address) => {
+                        kprintln!("  pairing with {}...", bt::addr_string(&address));
+                        match bt::pair(address) {
+                            Ok(what) => kprintln!("  {}", what),
+                            Err(e) => console::print_colored(YELLOW, format_args!("  bt pair: {}\n", e)),
+                        }
+                    }
+                    None => console::print_colored(YELLOW, format_args!("  usage: bt pair 11:22:33:44:55:66\n")),
+                },
+                _ => console::print_colored(YELLOW, format_args!("  usage: bt [scan [seconds] | pair <address>]\n")),
             },
+            "gamepad" => {
+                let pads = bt::GAMEPADS.lock();
+                if pads.is_empty() {
+                    kprintln!("  no gamepads; pair one with 'bt pair <address>' (see 'bt scan')");
+                }
+                for g in pads.iter() {
+                    let adapter = bt::ADAPTERS.lock().get(g.adapter).map_or(String::from("?"), |a| a.name.clone());
+                    kprintln!("  {} \"{}\" on {}, {}, {}, {} report(s)", bt::addr_string(&g.address), g.name, adapter,
+                        if g.connected { "connected" } else { "not connected" }, g.layout, g.reports);
+                    let mut buttons = String::new();
+                    for n in 0..32 {
+                        if g.pad.buttons & (1 << n) != 0 {
+                            buttons.push_str(&alloc::format!(" {}", n + 1));
+                        }
+                    }
+                    let mut axes = String::new();
+                    for (i, name) in bt::AXIS_NAMES.iter().enumerate().filter(|(i, _)| g.axes & (1 << i) != 0) {
+                        axes.push_str(&alloc::format!(" {} {:+}", name, g.pad.axes[i]));
+                    }
+                    kprintln!("    buttons:{}, hat {}, axes:{}", if buttons.is_empty() { " none" } else { &buttons },
+                        bt::hat_name(g.pad.hat), axes);
+                }
+            }
             "disks" => {
                 for d in block::DEVICES.lock().iter() {
                     match vfs::mount_point_of(d.name()) {
