@@ -25,6 +25,8 @@ pub struct PerCpu {
     pub tables: CpuTables,
     pub rq: IrqMutex<RunQueue>,
     pub ticks: AtomicU64,
+    /// Timer interrupts taken (ticks plus sleeper wake-ups).
+    pub timer_irqs: AtomicU64,
 }
 
 static CPUS: [AtomicPtr<PerCpu>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
@@ -41,6 +43,7 @@ pub fn init_this_cpu(index: usize, lapic_id: u32) -> &'static PerCpu {
         tables: CpuTables::new(),
         rq: IrqMutex::new(RunQueue::new()),
         ticks: AtomicU64::new(0),
+        timer_irqs: AtomicU64::new(0),
     }));
     cpu.self_ptr = cpu as *mut PerCpu as u64;
     cpu.tables.load();

@@ -67,6 +67,7 @@ impl Shell {
                 kprintln!("  about       what AeroForge is");
                 kprintln!("  ps          processes and threads, per CPU");
                 kprintln!("  sched       per-CPU run queues and context switches");
+                kprintln!("  wakeups     timer interrupts per CPU over one second");
                 kprintln!("  run <prog>  start a user program ({})", program_list());
                 kprintln!("  ports       published IPC ports");
                 kprintln!("  lspci       PCIe devices");
@@ -121,9 +122,28 @@ impl Shell {
                     }
                 }
                 kprintln!(
-                    "  {} thread migrations between CPUs ({} by balancing busy CPUs)",
+                    "  {} thread migrations between CPUs ({} by balancing busy CPUs), {} idle CPUs woken for waiting threads",
                     sched::MIGRATIONS.load(Ordering::Relaxed),
-                    sched::BALANCE_PULLS.load(Ordering::Relaxed)
+                    sched::BALANCE_PULLS.load(Ordering::Relaxed),
+                    sched::IDLE_NUDGES.load(Ordering::Relaxed)
+                );
+            }
+            "wakeups" => {
+                // This shell sleeps meanwhile, so its CPU can go idle too.
+                let count = || -> alloc::vec::Vec<u64> {
+                    (0..percpu::count()).map(|i| percpu::get(i).map_or(0, |c| c.timer_irqs.load(Ordering::Relaxed))).collect()
+                };
+                let before = count();
+                sched::sleep_us(1_000_000);
+                let after = count();
+                let mut total = 0;
+                for (i, (a, b)) in after.iter().zip(before.iter()).enumerate() {
+                    kprintln!("  cpu{}: {} timer interrupts", i, a - b);
+                    total += a - b;
+                }
+                kprintln!(
+                    "  {} timer interrupts in 1 s on {} CPUs (a ticking CPU takes {})",
+                    total, after.len(), apic::TIMER_HZ
                 );
             }
             "run" => match process::spawn(arg, 0) {

@@ -47,6 +47,8 @@
 # 10 ms tick), that 144 Hz frame pacing holds and that futex timeouts work.
 # 'spreadtest' leaves its busy threads at one, three, one and three per CPU:
 # periodic balancing must even them out although no CPU goes idle.
+# 'wakeups' counts timer interrupts per CPU over a second: cpu0, which only
+# runs the (sleeping) shell, must be tickless, with no more than 5.
 # Last, 'irq'
 # must show that the
 # USB, NVMe and SATA (AHCI) controllers and the igb network card have been
@@ -237,6 +239,9 @@ for _ in $(seq "$TIMEOUT"); do
         # Balancing between busy CPUs.
         sleep 1; type_keys $'run spreadtest\n'; STAGE=spread
     elif [ $STAGE = spread ] && grep -q "\[spreadtest\] .*\(: OK\|FAILED\)" "$LOG"; then
+        # Tickless idle: timer interrupts per CPU over one second.
+        sleep 1; type_keys $'wakeups\n'; STAGE=wakeups
+    elif [ $STAGE = wakeups ] && grep -q "timer interrupts in 1 s on" "$LOG"; then
         # Device interrupts: the USB controller's MSI-X count, after all that input.
         sleep 1; type_keys $'irq\n'; STAGE=irq
     elif [ $STAGE = irq ] && grep -q "interrupts  xhci0\|no device interrupts" "$LOG"; then
@@ -302,6 +307,8 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "sleeps were not precise to well under a tick, frame pacing slipped, or futex timeouts failed"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }
+        grep -q "^  cpu0: [0-5] timer interrupts" "$LOG" \
+            || { fail "an idle CPU kept taking timer ticks (tickless idle not working)"; }
         grep -q "xhci0: MSI-X interrupts on, polling at once when events arrive" "$LOG" || { fail "USB controller interrupts (MSI-X) not set up"; }
         grep -q "vector 0x[0-9a-f]*  MSI-X -> cpu[0-9]* *[1-9][0-9]* interrupts  xhci0" "$LOG" || { fail "the USB controller raised no interrupts"; }
         grep -q "nvme0: MSI-X completion interrupts on" "$LOG" || { fail "NVMe completion interrupts (MSI-X) not set up"; }
@@ -368,7 +375,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

@@ -180,6 +180,7 @@ pub fn poll_thread(_: u64) {
 ", c.id)),
         }
     }
+    let with_irq = CONTROLLERS.lock().iter().all(|c| c.irq.is_some());
     loop {
         for (k, &id) in ids.iter().enumerate() {
             let n = unsafe { dhi::aero_xhci_poll(id, events.as_mut_ptr(), events.len() as i32) };
@@ -220,9 +221,10 @@ pub fn poll_thread(_: u64) {
                 drain_pads(id);
             }
         }
-        // An interrupt cuts the wait short; the tick bounds it (hub status
-        // and anything an interrupt might have missed).
-        IRQ.wait(1);
+        // An interrupt cuts the wait short. The timeout bounds it in case
+        // one was missed: a tick when polling, 100 ms with interrupts (so
+        // an idle CPU is not woken 100 times a second).
+        IRQ.wait(if with_irq { 10 } else { 1 });
     }
 }
 

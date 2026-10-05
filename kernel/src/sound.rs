@@ -228,6 +228,8 @@ struct Stream {
 
 static STREAMS: IrqMutex<Vec<Stream>> = IrqMutex::new(Vec::new());
 static CARD_PENDING: AtomicU32 = AtomicU32::new(0);
+/// Wakes the mixer when it sleeps with nothing to play.
+static MIXER_WAKE: sched::Event = sched::Event::new();
 
 /// Queues interleaved 48 kHz stereo frames for `owner` (a process id, or
 /// KERNEL); returns how many frames fit. Never blocks.
@@ -247,6 +249,8 @@ pub fn write(owner: u64, interleaved: &[i16]) -> Result<usize, String> {
     let n = (STREAM_FRAMES - s.frames.len()).min(interleaved.len() / 2);
     s.frames.extend(interleaved[..2 * n].chunks_exact(2).map(|f| (f[0], f[1])));
     s.last_write = sched::ticks();
+    drop(streams);
+    MIXER_WAKE.signal();
     Ok(n)
 }
 
@@ -321,7 +325,16 @@ pub fn mixer_thread(_: u64) {
         }
         // Forget players that have gone quiet.
         let now = sched::ticks();
-        STREAMS.lock().retain(|s| !s.frames.is_empty() || now - s.last_write < 2 * apic::TIMER_HZ);
-        sched::sleep_ticks(1);
+        let quiet = {
+            let mut streams = STREAMS.lock();
+            streams.retain(|s| !s.frames.is_empty() || now - s.last_write < 2 * apic::TIMER_HZ);
+            streams.is_empty()
+        };
+        if running.is_none() && quiet {
+            // Nothing to play: sleep until a player writes, not every tick.
+            MIXER_WAKE.wait(apic::TIMER_HZ);
+        } else {
+            sched::sleep_ticks(1);
+        }
     }
 }
