@@ -317,6 +317,16 @@ take 2 ms (about 2.15 ms in QEMU, where the old timer gave 10 ms), that a loop s
 144 Hz frame deadline keeps pace (72 frames in 500.1 ms against 499.97), and that futex waits time
 out on time but still end at once when woken.
 
+Since 0.31 busy CPUs balance too. Until now a CPU only took threads from others when it was about
+to go idle, so four CPUs running one, three, one and three busy threads stayed that way, and the
+threads on the crowded CPUs got a third as much time as the others. Now every fourth tick (40 ms)
+each CPU also checks the others, and pulls one waiting user thread from the busiest if that CPU
+has at least two more threads than itself (counting the running one); moving one thread then
+never turns the busiest CPU into the lighter one, so nothing bounces back and forth. `sched` shows
+how many moves balancing made. The new `spreadtest` program creates exactly that one, three, one,
+three spread and checks, 40 times over 400 ms, that the threads are evenly placed; with the
+balancing switched off it found them uneven in all 40 looks.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -325,7 +335,7 @@ out on time but still end at once when woken.
 | CPU tables | Per-CPU GDT and TSS (`rsp0` updated on every switch), double-fault IST stack, per-CPU data through GS with `swapgs` on ring transitions |
 | Interrupts | 256-vector IDT generated at build time, exceptions from ring 3 kill only the faulting process |
 | Interrupt controllers | Local APIC (per-CPU periodic timer, calibrated against the PIT) and I/O APIC with MADT overrides; the 8259 PIC is masked; MSI-X and MSI for PCIe devices (the USB, NVMe and SATA controllers and igb/igc network cards so far) |
-| Scheduler | Preemptive round robin with one run queue per CPU, four priority levels (low, normal, high for programs; kernel threads above them) with preemption on wakeup, work stealing (idle CPUs take waiting user threads from busy ones), idle thread per CPU, one-shot timer with microsecond sleeps and futex timeouts, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
+| Scheduler | Preemptive round robin with one run queue per CPU, four priority levels (low, normal, high for programs; kernel threads above them) with preemption on wakeup, work stealing (idle CPUs take waiting user threads from busy ones) and periodic balancing between busy CPUs, idle thread per CPU, one-shot timer with microsecond sleeps and futex timeouts, block/wake, reschedule IPIs for cross-core wakeups (sub-millisecond IPC round trips) |
 | Processes | ELF64 loader, ring 3, threads (on any CPU), memory mapping with TLB shootdowns, futexes, `exit` that ends every thread, waiting for child exit codes, `syscall`/`sysret` entry (the `int 0x80` gate still works), x87/SSE/AVX/AVX-512 registers saved per thread with XSAVE, exit and cleanup of address space and kernel stack |
 | Objects and IPC | Handles with rights (capabilities), IPC ports with 256-byte messages, handle transfer in messages, a name service (`publish` / `lookup`, lookups only grant send rights) |
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
@@ -333,7 +343,7 @@ out on time but still end at once when woken.
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), run by the `net` kernel thread (woken by MSI-X on igb/igc, polled on e1000); DHCP client; ICMP echo |
 | Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and **exFAT**, read-only **NTFS**, all with case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
-| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files), `fputest` (floating point and vector registers), `threadtest` (threads, heap, locks), `balancetest` (threads moving between CPUs), `priotest` (thread priorities), `timertest` (precise sleeps and timeouts) (Rust, `no_std` with `alloc`, hardware floating point) |
+| Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files), `fputest` (floating point and vector registers), `threadtest` (threads, heap, locks), `balancetest` (threads moving between CPUs), `priotest` (thread priorities), `timertest` (precise sleeps and timeouts), `spreadtest` (balancing between busy CPUs) (Rust, `no_std` with `alloc`, hardware floating point) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `irq`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
 | Test | `tools/boot-test.sh` boots headless with an NVMe (GPT) and a SATA (MBR) disk image and a USB stick, and checks every CPU, all three mounts, the USB keyboard and mouse behind a hub, igb and e1000e network cards, a DHCP lease and a ping to the gateway over the igb card, the MediaTek firmware download, a Bluetooth scan, classic and LE gamepad pairing, input and reconnection and headset pairing, microphone recording and reconnection against the simulated adapter, a 440 Hz test tone and a four-note melody from a user program on the emulated HD Audio card (measured in QEMU's WAV output), disk writes on all three disks and saving, overwriting and deleting files on their FAT32 volumes (checked with fsck.fat and mtools afterwards), an exFAT stick plugged in while running, read, written and checked with fsck.exfat, an NTFS drive's folders and fragmented and sparse files, five programs keeping their floating point and vector registers apart, threads sharing a lock and a heap and ending with their program, interrupts from the USB, NVMe and SATA controllers and the igb card, the security audit and self-test, the config read and the whole IPC demo |
 
@@ -349,7 +359,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 ### Still to do in Phase 1
 
 1. Saving the vector registers lazily or with XSAVES to make switches cheaper; reusing freed address ranges.
-2. A real-time class with deadlines and protection against a high-priority thread starving the rest; balancing that also spreads running threads (today only an idle CPU pulls work) and keeps cache and NUMA locality in mind.
+2. A real-time class with deadlines and protection against a high-priority thread starving the rest; balancing that keeps cache and NUMA locality in mind (preferring a CPU that shares the thread's L3 cache, which on Ryzen means the same CCX).
 3. Event objects, and handles to threads and processes (killing a program from another one).
 4. An ACPICA port (the current table walker never touches AML), TSC-deadline timer mode, a tickless idle CPU (no 10 ms tick while nothing runs, to save battery), and x2APIC mode.
 5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, e1000 interrupts, and sockets for user programs.

@@ -7,7 +7,9 @@
 //!   wake-up time, whichever is sooner, so a 2 ms sleep takes 2 ms rather
 //!   than a whole 10 ms tick.
 //! - User threads move between CPUs: a CPU about to go idle takes a waiting
-//!   user thread from the busiest other CPU's ready queue (work stealing).
+//!   user thread from the busiest other CPU's ready queue (work stealing),
+//!   and every `BALANCE_TICKS` each CPU also pulls one from any CPU with at
+//!   least two more threads than itself, so busy CPUs even out too.
 //!   A thread is only taken once the CPU that last ran it has finished
 //!   saving its context (`on_cpu` is cleared inside `switch_context`).
 //!   Kernel threads stay on the CPU they were created on, since some of them
@@ -237,6 +239,8 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CPU: AtomicUsize = AtomicUsize::new(0);
 /// Threads moved to another CPU by work stealing.
 pub static MIGRATIONS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones periodic balancing moved between busy CPUs.
+pub static BALANCE_PULLS: AtomicU64 = AtomicU64::new(0);
 
 /// Microseconds per scheduler tick (the time slice).
 pub const TICK_US: u64 = 1_000_000 / crate::apic::TIMER_HZ;
@@ -494,12 +498,53 @@ fn steal(me: &percpu::PerCpu) {
     }
 }
 
+/// How often (in ticks) a CPU checks whether another has more threads.
+const BALANCE_TICKS: u64 = 4;
+
+/// Periodic balancing: pulls one waiting user thread from the busiest CPU
+/// if that CPU has at least two more threads (running or ready) than this
+/// one. Moving one then never makes the busiest CPU the lighter one, so
+/// threads do not bounce back and forth. Like `steal`, only one run queue
+/// lock is held at a time.
+fn pull_if_imbalanced(me: &percpu::PerCpu) {
+    let mine = me.rq.lock().load();
+    let mut victim = None;
+    let mut most = mine + 1;
+    for i in 0..percpu::count() {
+        if i == me.index {
+            continue;
+        }
+        let Some(c) = percpu::get(i) else { continue };
+        let n = c.rq.lock().load();
+        if n > most {
+            most = n;
+            victim = Some(c);
+        }
+    }
+    let Some(victim) = victim else { return };
+    let taken = {
+        let mut rq = victim.rq.lock();
+        // Its load may have dropped since we looked.
+        if rq.load() < mine + 2 {
+            return;
+        }
+        rq.ready.take_migratable()
+    };
+    if let Some(t) = taken {
+        t.cpu.store(me.index, Ordering::SeqCst);
+        MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+        BALANCE_PULLS.fetch_add(1, Ordering::Relaxed);
+        me.rq.lock().ready.push(t);
+    }
+}
+
 /// Called from the timer interrupt on every CPU. When a tick is due the
 /// running thread's time slice is over; otherwise the interrupt is for a
 /// sleeper, which only takes the CPU if it outranks the running thread.
 pub fn on_timer() {
     let cpu = percpu::this();
     let now = crate::apic::micros();
+    let mut balance = false;
     let reschedule = {
         let mut rq = cpu.rq.lock();
         if now >= rq.tick_due {
@@ -508,7 +553,7 @@ pub fn on_timer() {
             if let Some(cur) = rq.current.as_ref() {
                 cur.runtime_ticks.fetch_add(1, Ordering::Relaxed);
             }
-            cpu.ticks.fetch_add(1, Ordering::Relaxed);
+            balance = cpu.ticks.fetch_add(1, Ordering::Relaxed) % BALANCE_TICKS == 0;
             true
         } else if rq.wake_due(now) {
             true
@@ -517,6 +562,9 @@ pub fn on_timer() {
             false
         }
     };
+    if balance {
+        pull_if_imbalanced(cpu);
+    }
     if reschedule {
         schedule();
     }

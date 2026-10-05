@@ -166,13 +166,15 @@ pub const MSR_EFER: u32 = 0xC000_0080;
 /// Sets EFLAGS.AC: lets the kernel touch user pages while SMAP is on.
 #[inline]
 pub unsafe fn stac() {
-    asm!("stac", options(nomem, nostack));
+    // Not `nomem`: the compiler must not move user memory accesses across it.
+    asm!("stac", options(nostack));
 }
 
 /// Clears EFLAGS.AC: user pages are off limits to the kernel again.
 #[inline]
 pub unsafe fn clac() {
-    asm!("clac", options(nomem, nostack));
+    // Not `nomem`: the compiler must not move user memory accesses across it.
+    asm!("clac", options(nostack));
 }
 
 /// A hardware random number, if the CPU has RDRAND and it delivers.

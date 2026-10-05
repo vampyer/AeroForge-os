@@ -120,7 +120,11 @@ impl Shell {
                             i, s.ready, s.switches, ticks, s.current);
                     }
                 }
-                kprintln!("  {} thread migrations between CPUs", sched::MIGRATIONS.load(Ordering::Relaxed));
+                kprintln!(
+                    "  {} thread migrations between CPUs ({} by balancing busy CPUs)",
+                    sched::MIGRATIONS.load(Ordering::Relaxed),
+                    sched::BALANCE_PULLS.load(Ordering::Relaxed)
+                );
             }
             "run" => match process::spawn(arg, 0) {
                 Ok(pid) => kprintln!("  started {} as pid {}", arg, pid),
