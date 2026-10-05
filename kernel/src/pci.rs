@@ -43,6 +43,35 @@ impl Device {
         (addr != 0).then_some(addr)
     }
 
+    pub fn read16(&self, off: u64) -> u16 {
+        (self.read32(off & !3) >> ((off & 2) * 8)) as u16
+    }
+
+    pub fn write16(&self, off: u64, v: u16) {
+        let shift = (off & 2) * 8;
+        let old = self.read32(off & !3) & !(0xFFFF << shift);
+        self.write32(off & !3, old | ((v as u32) << shift));
+    }
+
+    /// Config-space offset of capability `id` (0x05 MSI, 0x11 MSI-X, ...).
+    pub fn capability(&self, id: u8) -> Option<u64> {
+        if self.read16(0x06) & (1 << 4) == 0 {
+            return None; // no capability list
+        }
+        let mut off = (self.read32(0x34) & 0xFC) as u64;
+        for _ in 0..48 {
+            if off < 0x40 {
+                return None;
+            }
+            let header = self.read16(off);
+            if header as u8 == id {
+                return Some(off);
+            }
+            off = ((header >> 8) & 0xFC) as u64;
+        }
+        None
+    }
+
     /// Lets the device decode memory accesses and master DMA; masks legacy INTx.
     pub fn enable_mmio_and_dma(&self) {
         let cmd = self.read32(0x04);

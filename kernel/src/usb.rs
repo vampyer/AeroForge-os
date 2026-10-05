@@ -11,12 +11,24 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use crate::bt::{self, hid};
 use crate::dhi::{self, InputEvent, UsbDevice};
 use crate::sync::IrqMutex;
-use crate::{console, interrupts, pci, sched};
+use crate::{console, interrupts, pci, percpu, sched};
 
 pub struct Controller {
     pub id: i32,
     pub location: String,
     pub devices: Vec<UsbDevice>,
+    pci: pci::Device,
+    /// "MSI-X" or "MSI" once interrupts are on; None while only polled.
+    pub irq: Option<&'static str>,
+}
+
+/// Signalled by every xHCI interrupt: wakes the poll thread (and the
+/// Bluetooth thread, whose HCI events arrive through the controller too).
+pub static IRQ: sched::Event = sched::Event::new();
+
+fn on_irq() {
+    IRQ.signal();
+    bt::WAKE.signal();
 }
 
 pub static CONTROLLERS: IrqMutex<Vec<Controller>> = IrqMutex::new(Vec::new());
@@ -52,7 +64,7 @@ pub fn probe() -> (usize, usize) {
         }
         let location = alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.dev, dev.func);
         sync_pads(id, &location, false);
-        CONTROLLERS.lock().push(Controller { id, location, devices: read_devices(id) });
+        CONTROLLERS.lock().push(Controller { id, location, devices: read_devices(id), pci: *dev, irq: None });
         ctrls += 1;
         total += count as usize;
     }
@@ -155,6 +167,19 @@ pub fn poll_thread(_: u64) {
     MOUSE_X.store(w as i32 / 2, Ordering::Relaxed);
     MOUSE_Y.store(h as i32 / 2, Ordering::Relaxed);
     let mut events = [InputEvent::default(); 32];
+    // Interrupts aimed at this CPU, where this thread runs.
+    for c in CONTROLLERS.lock().iter_mut() {
+        c.irq = crate::msi::attach(&c.pci, &alloc::format!("xhci{} ({})", c.id, c.location), on_irq, percpu::this().index);
+        match c.irq {
+            Some(kind) => {
+                unsafe { dhi::aero_xhci_enable_irq(c.id) };
+                console::print_colored(console::DIM, format_args!("       xhci{}: {} interrupts on, polling at once when events arrive
+", c.id, kind));
+            }
+            None => console::print_colored(console::YELLOW, format_args!("[WARN] xhci{}: no MSI-X or MSI, polling every tick
+", c.id)),
+        }
+    }
     loop {
         for (k, &id) in ids.iter().enumerate() {
             let n = unsafe { dhi::aero_xhci_poll(id, events.as_mut_ptr(), events.len() as i32) };
@@ -195,7 +220,9 @@ pub fn poll_thread(_: u64) {
                 drain_pads(id);
             }
         }
-        sched::sleep_ticks(1);
+        // An interrupt cuts the wait short; the tick bounds it (hub status
+        // and anything an interrupt might have missed).
+        IRQ.wait(1);
     }
 }
 

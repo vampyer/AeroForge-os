@@ -169,6 +169,7 @@ extern "C" {
     pub fn aero_ahci_flush(disk: i32) -> i32;
     pub fn aero_xhci_init(ops: *const DhiOps, mmio_phys: u64, devices: *mut i32) -> i32;
     pub fn aero_xhci_poll(ctrl: i32, out: *mut InputEvent, max: i32) -> i32;
+    pub fn aero_xhci_enable_irq(ctrl: i32);
     pub fn aero_xhci_device(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
     pub fn aero_xhci_disk(ctrl: i32, index: i32, out: *mut BlockInfo) -> i32;
     pub fn aero_xhci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;

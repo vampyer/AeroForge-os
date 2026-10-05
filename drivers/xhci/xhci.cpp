@@ -1,12 +1,14 @@
 // AeroForge xHCI (USB 3) driver (C++20, freestanding), behind the Driver Host
 // Interface.
 //
-// Polling mode: the kernel calls aero_xhci_poll() regularly and the driver
-// drains its event ring. At init it resets the controller, enumerates every
+// The kernel calls aero_xhci_poll() regularly and the driver drains its
+// event ring; once aero_xhci_enable_irq() has run, the controller also raises
+// an interrupt (MSI-X or MSI, set up by the kernel) for new events, so the
+// kernel can poll right away instead of at its next tick. At init it resets the controller, enumerates every
 // device on the root ports and behind hubs, reads its descriptors and
 // configures HID boot-protocol keyboards and mice and bulk-only mass storage
-// (USB sticks and drives, SCSI commands). Interrupts (MSI-X), UAS and hotplug
-// come later.
+// (USB sticks and drives, SCSI commands). UAS comes
+// later.
 
 #include "dhi.h"
 
@@ -45,6 +47,11 @@ constexpr uint32_t kPortConnectChange = 1u << 17;
 
 // Interrupter 0, relative to the runtime base.
 constexpr uint32_t kIman   = 0x20;
+constexpr uint32_t kImod   = 0x24;
+constexpr uint32_t kImanPending = 1u << 0;  // RW1C
+constexpr uint32_t kImanEnable  = 1u << 1;
+constexpr uint32_t kCmdIrqEnable = 1u << 2;
+constexpr uint32_t kStsEventIrq  = 1u << 3;  // RW1C
 constexpr uint32_t kErstsz = 0x28;
 constexpr uint32_t kErstba = 0x30;
 constexpr uint32_t kErdp   = 0x38;
@@ -614,7 +621,7 @@ private:
         erst[0] = uint32_t(events_.phys);
         erst[1] = uint32_t(events_.phys >> 32);
         erst[2] = kRingTrbs;
-        rt32(kIman) = rt32(kIman) & ~2u;  // interrupts off: we poll
+        rt32(kIman) = rt32(kIman) & ~kImanEnable;  // off until aero_xhci_enable_irq
         rt32(kErstsz) = 1;
         rt64(kErdp, events_.phys);
         rt64(kErstba, erst_.phys);
@@ -1745,6 +1752,12 @@ private:
     void process_events() {
         auto* ring = static_cast<volatile Trb*>(events_.virt);
         bool any = false;
+        if (irq_) {
+            // Acknowledge before draining, so an event that lands meanwhile
+            // raises a new interrupt.
+            rt32(kIman) = kImanPending | kImanEnable;
+            op32(kUsbSts) = kStsEventIrq;
+        }
         for (;;) {
             volatile Trb& t = ring[ev_index_];
             const uint32_t d3 = t.d3;
@@ -1757,8 +1770,21 @@ private:
                 ev_cycle_ ^= 1;
             }
         }
-        if (any) rt64(kErdp, (events_.phys + uint64_t(ev_index_) * sizeof(Trb)) | (1u << 3));
+        // Writing ERDP with EHB (bit 3) also re-arms the interrupter.
+        if (any || irq_) rt64(kErdp, (events_.phys + uint64_t(ev_index_) * sizeof(Trb)) | (1u << 3));
     }
+
+public:
+    // Interrupts from interrupter 0, at most one every 40 us (IMOD counts 250 ns).
+    void enable_irq() {
+        if (base_ == nullptr) return;
+        rt32(kImod) = 160;
+        rt32(kIman) = kImanPending | kImanEnable;
+        op32(kUsbCmd) = op32(kUsbCmd) | kCmdIrqEnable;
+        irq_ = true;
+    }
+
+private:
 
     void handle_event(uint64_t ptr, uint32_t d2, uint32_t d3) {
         const uint32_t type = (d3 >> 10) & 0x3F;
@@ -1938,6 +1964,7 @@ private:
     uint32_t generation_ = 0;
     uint64_t pending_ports_ = 0;           // bit per root port with a status change to look at
     uint32_t polls_ = 0;
+    bool irq_ = false;
     dhi_dma hub_buf_{};
     uint8_t report_len_[kMaxSlots + 1] = {};
 
@@ -2007,6 +2034,10 @@ extern "C" int32_t aero_xhci_init(const dhi_ops* ops, uint64_t mmio_phys, int32_
     if (n < 0) return n;
     *devices = n;
     return g_count++;
+}
+
+extern "C" void aero_xhci_enable_irq(int32_t ctrl) {
+    if (ctrl >= 0 && ctrl < g_count) g_controllers[ctrl].enable_irq();
 }
 
 extern "C" int32_t aero_xhci_poll(int32_t ctrl, dhi_input_event* out, int32_t max) {

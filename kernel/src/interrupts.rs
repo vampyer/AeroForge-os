@@ -177,6 +177,7 @@ extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
         }
         VECTOR_TLB_SHOOTDOWN => crate::tlb::on_ipi(),
         apic::SPURIOUS_VECTOR => {}
+        0x40..=0xEF if crate::msi::dispatch(vector) => {}
         _ => apic::eoi(),
     }
     // A thread whose process is exiting does not go back to ring 3.

@@ -89,6 +89,7 @@ impl Shell {
                 kprintln!("  rm <path>   delete a file or an empty directory");
                 kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
                 kprintln!("  mem         buddy allocator, slab heap and paging");
+                kprintln!("  irq         device interrupts (MSI-X, MSI) and how often they fired");
                 kprintln!("  cpu         processor and SMP status");
                 kprintln!("  acpi        firmware tables found");
                 kprintln!("  uptime      time since boot");
@@ -410,6 +411,15 @@ impl Shell {
                 }
                 Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
             },
+            "irq" => {
+                let sources = crate::msi::sources();
+                if sources.is_empty() {
+                    kprintln!("  no device interrupts (everything is polled)");
+                }
+                for (vector, name, kind, cpu, count) in sources {
+                    kprintln!("  vector {:#04x}  {:<5} -> cpu{}  {:>8} interrupts  {}", vector, kind, cpu, count, name);
+                }
+            }
             "mem" => {
                 let (total, free) = {
                     let b = memory::BUDDY.lock();
