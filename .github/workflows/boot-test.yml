@@ -31,4 +31,5 @@ jobs:
             build/aeroforge.iso
             build/boot-test.log
             build/fakebt.log
+            build/fakepad.log
           if-no-files-found: ignore

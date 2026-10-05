@@ -77,7 +77,7 @@ impl Shell {
                 kprintln!("  bt          Bluetooth adapters");
                 kprintln!("  bt scan [s] look for Bluetooth devices for s seconds (default 5)");
                 kprintln!("  bt pair <address>  pair a Bluetooth gamepad or headset (put it in pairing mode first)");
-                kprintln!("  gamepad     Bluetooth gamepads and what they are pressing");
+                kprintln!("  gamepad     Bluetooth and USB gamepads and what they are pressing");
                 kprintln!("  mic [record [s]]  Bluetooth headset microphones; record and show level and pitch");
                 kprintln!("  sound [test [hz] [s] | use <c>.<o>]  audio outputs; play a test tone; pick the output");
                 kprintln!("  disks       disks and partitions");
@@ -244,12 +244,16 @@ impl Shell {
             "gamepad" => {
                 let pads = bt::GAMEPADS.lock();
                 if pads.is_empty() {
-                    kprintln!("  no gamepads; pair one with 'bt pair <address>' (see 'bt scan')");
+                    kprintln!("  no gamepads; plug one into USB before starting, or pair one with 'bt pair <address>' (see 'bt scan')");
                 }
                 for g in pads.iter() {
-                    let adapter = bt::ADAPTERS.lock().get(g.adapter).map_or(String::from("?"), |a| a.name.clone());
-                    kprintln!("  {} \"{}\" on {}, {}, {}, {} report(s)", bt::addr_string(&g.address), g.name, adapter,
-                        if g.connected { "connected" } else { "not connected" }, g.layout, g.reports);
+                    if let Some(place) = &g.usb {
+                        kprintln!("  \"{}\" on {}, {}, {} report(s)", g.name, place, g.layout, g.reports);
+                    } else {
+                        let adapter = bt::ADAPTERS.lock().get(g.adapter).map_or(String::from("?"), |a| a.name.clone());
+                        kprintln!("  {} \"{}\" on {}, {}, {}, {} report(s)", bt::addr_string(&g.address), g.name, adapter,
+                            if g.connected { "connected" } else { "not connected" }, g.layout, g.reports);
+                    }
                     let mut buttons = String::new();
                     for n in 0..32 {
                         if g.pad.buttons & (1 << n) != 0 {

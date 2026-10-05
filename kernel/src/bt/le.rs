@@ -741,7 +741,7 @@ impl Host {
         }
         report.extend_from_slice(pdu.get(3..).unwrap_or(&[]));
         let mut pads = GAMEPADS.lock();
-        if let Some(g) = pads.iter_mut().find(|g| g.address == c.address) {
+        if let Some(g) = pads.iter_mut().find(|g| g.usb.is_none() && g.address == c.address) {
             if g.connected && hid::decode(&c.layout, &report, &mut g.pad) {
                 g.reports += 1;
             }

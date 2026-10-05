@@ -16,7 +16,10 @@
 # four notes through the audio system calls; last, 'bt pair' and 'gamepad' for
 # the simulated LE gamepad: it must pair (SMP), be read over HID over GATT,
 # report its input, reconnect on its own with the stored long-term key and
-# report again. Intended for CI (design doc, Phase 0).
+# report again. Two simulated USB gamepads (tools/fakepad), an Xbox 360 style
+# one and a HID one behind the hub, must show up in 'gamepad' with their
+# input decoded, and the Xbox style one must get its player 1 LED command.
+# Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -33,7 +36,13 @@ cc -O2 -Wall -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser -lm
 FAKEBT_LOG=build/fakebt.log
 build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin 2>"$FAKEBT_LOG" &
 FAKEBT_PID=$!
-for _ in $(seq 50); do [ -S build/fakebt.sock ] && break; sleep 0.1; done
+cc -O2 -Wall -o build/fakepad tools/fakepad/fakepad.c -lusbredirparser
+FAKEPAD_LOG=build/fakepad.log
+build/fakepad build/xpad.sock --xinput 2>"$FAKEPAD_LOG" &
+XPAD_PID=$!
+build/fakepad build/hidpad.sock --hid 2>>"$FAKEPAD_LOG" &
+HIDPAD_PID=$!
+for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG" build/qemu-monitor.sock build/sound.wav
 
@@ -46,12 +55,14 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
     -drive file=build/usb.img,if=none,id=stick,format=raw -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
     -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
+    -chardev socket,id=xpad,path=build/xpad.sock -device usb-redir,chardev=xpad,bus=xhci.0,port=4 \
+    -chardev socket,id=hidpad,path=build/hidpad.sock -device usb-redir,chardev=hidpad,bus=xhci.0,port=1.3 \
     -nic user,model=igb -nic user,model=e1000e \
     -device ich9-intel-hda,id=hda -device hda-output,bus=hda.0,audiodev=snd -audiodev wav,id=snd,path=build/sound.wav \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
     -monitor unix:build/qemu-monitor.sock,server,nowait &
 QEMU_PID=$!
-trap 'kill $QEMU_PID $FAKEBT_PID 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
 fail() {
@@ -141,8 +152,14 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "buttons: 4 5, hat left, axes: X +0 Y -127 Z +0 Rz +0" "$LOG" || { fail "LE gamepad input not decoded" "$FAKEBT_LOG"; }
         grep -q "LE reconnect OK" "$FAKEBT_LOG" || { fail "LE gamepad could not reconnect with the stored key" "$FAKEBT_LOG"; }
         grep -q "buttons: 6 11, hat up-right, axes: X +127 Y +0 Z -127 Rz +0" "$LOG" || { fail "LE gamepad input after the reconnect not decoded" "$FAKEBT_LOG"; }
+        # QEMU's xHCI port=4 is root port 8 (its four USB 3 ports come first).
+        grep -q "Xbox 360 style gamepad \"Controller\" on USB .* port 8 (6 axes, hat, 11 buttons)" "$LOG" || { fail "Xbox style USB gamepad not set up" "$FAKEPAD_LOG"; }
+        grep -q "gamepad \"Generic USB Joystick\" on USB .* hub [0-9]* port 3 (4 axes, hat, 12 buttons)" "$LOG" || { fail "HID USB gamepad behind the hub not set up" "$FAKEPAD_LOG"; }
+        grep -q "buttons: 1 4 5 8, hat down-right, axes: X +127 Y -127 Z +127 Rx -127 Ry +0 Rz -127" "$LOG" || { fail "Xbox style USB gamepad input not decoded" "$FAKEPAD_LOG"; }
+        grep -q "buttons: 2 10, hat left, axes: X -127 Y +0 Z +127 Rz +0" "$LOG" || { fail "HID USB gamepad input not decoded" "$FAKEPAD_LOG"; }
+        grep -q "LED: player 1" "$FAKEPAD_LOG" && ! grep -q "FAIL" "$FAKEPAD_LOG" || { fail "USB gamepad set-up went wrong" "$FAKEPAD_LOG"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

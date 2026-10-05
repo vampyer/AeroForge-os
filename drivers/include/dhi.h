@@ -175,6 +175,20 @@ int32_t aero_xhci_bt_sco(int32_t bt, uint8_t alt);
 int32_t aero_xhci_bt_control(int32_t bt, uint8_t req_type, uint8_t request, uint16_t value,
                              uint16_t index, void *data, uint16_t len);
 
+/* Gamepads found during init: Xbox 360 style (XInput) pads, which most
+ * 2.4 GHz dongles present, and HID joysticks and gamepads. Fills `out` for
+ * the controller's gamepad `index` (0, 1, ...), copies its HID report
+ * descriptor (for XInput pads, one describing the reports the driver turns
+ * theirs into) into `desc` and returns its length, or -1 when there is no
+ * such gamepad. */
+int32_t aero_xhci_pad(int32_t ctrl, int32_t index, dhi_usb_device *out, void *desc, uint32_t max);
+
+/* Copies the next input report from any of the controller's gamepads into
+ * `data` (with the report ID first if the descriptor uses them) and that
+ * gamepad's index into `pad`. Returns the length, or 0 if nothing is
+ * waiting. Never blocks. */
+int32_t aero_xhci_pad_report(int32_t ctrl, int32_t *pad, void *data, uint32_t max);
+
 /* ---- Intel Ethernet driver, e1000/e1000e family (drivers/e1000) ---- */
 
 typedef struct dhi_net_info {
