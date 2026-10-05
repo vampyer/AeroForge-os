@@ -98,7 +98,9 @@ pub fn spawn(module_name: &str, parent: u64) -> Result<u64, &'static str> {
     let mut v = USER_STACK_TOP - USER_STACK_SIZE;
     while v < USER_STACK_TOP {
         let f = memory::alloc_frame_zeroed().ok_or("out of memory")?;
-        memory::map_page(pml4, v, f, memory::flags::USER | memory::flags::WRITABLE)?;
+        // The stack is data: never executable.
+        let nx = if crate::security::nx_enabled() { memory::flags::NO_EXECUTE } else { 0 };
+        memory::map_page(pml4, v, f, memory::flags::USER | memory::flags::WRITABLE | nx)?;
         v += memory::PAGE_SIZE;
     }
     PROCESSES.lock().insert(process.pid, process.clone());

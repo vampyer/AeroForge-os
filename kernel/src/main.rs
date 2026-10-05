@@ -15,6 +15,7 @@ mod elf;
 mod fat;
 mod fb;
 mod gdt;
+mod kstack;
 mod interrupts;
 mod ipc;
 mod limine;
@@ -25,6 +26,7 @@ mod percpu;
 mod pic;
 mod process;
 mod sched;
+mod security;
 mod serial;
 mod shell;
 mod smp;
@@ -117,6 +119,10 @@ extern "C" fn kmain() -> ! {
     }
     kok!("Serial console on COM1 (115200 8N1)");
 
+    // ---- Security: CPU protections first, so later mappings can use NX ----
+    security::init_cpu(true);
+    security::init_canary();
+
     // ---- Memory: everything after this may allocate ----
     let hhdm = HHDM_REQ.response().expect("no HHDM response").offset;
     let memmap = MEMMAP_REQ.response().expect("no memory map");
@@ -128,6 +134,8 @@ extern "C" fn kmain() -> ! {
             "       kernel image at phys {:#x} -> virt {:#x}\n", k.physical_base, k.virtual_base));
     }
     heap_self_test();
+    let pages = security::protect_kernel_image();
+    kok!("W^X: kernel code read-only, kernel data non-executable ({} pages)", pages);
 
     // ---- CPU tables ----
     let bsp_lapic = MP_REQ.response().map_or(0, |m| m.bsp_lapic_id);
@@ -211,6 +219,9 @@ extern "C" fn kmain() -> ! {
         let online = smp::start_aps(mp);
         kok!("SMP: {} of {} CPU(s) online, each with its own run queue", online, mp.cpu_count);
     }
+    let slots = security::lock_kernel_half();
+    kok!("NX: rest of the kernel half non-executable ({} top-level slots: direct map, heap, stacks)", slots);
+    report_security();
 
     let n = modules::init(MODULE_REQ.response());
     kok!("{} user program(s) loaded by the bootloader", n);
@@ -288,4 +299,23 @@ fn panic(info: &PanicInfo) -> ! {
     console::print_colored(console::RED, format_args!("\n*** AEROKERNEL PANIC ***\n{}\n", info));
     serial::write_str("\nSystem halted.\n");
     arch::halt_forever();
+}
+
+fn report_security() {
+    let probe = kstack::KernelStack::new(4096);
+    let a = security::audit(probe.as_ref().and_then(|s| s.guard_page()));
+    drop(probe);
+    let on = |b: bool| if b { "on" } else { "OFF" };
+    kok!("Security: NX {}, SMEP {}, SMAP {}, UMIP {}, write-protect {}, stack canary from {}",
+        on(a.nx), on(a.smep), on(a.smap), on(a.umip), on(a.wp), if a.canary_hw { "RDRAND" } else { "TSC" });
+    if a.wx_pages == 0 && a.writable_code == 0 && a.exec_data == 0 && !a.heap_executable && a.stack_guard_unmapped {
+        kok!("Security audit passed: {} kernel pages, 0 writable+executable, heap non-executable, stack guard pages unmapped",
+            a.image_pages);
+    } else {
+        console::print_colored(console::YELLOW, format_args!(
+            "[WARN] Security audit: {} W+X page(s), {} writable code page(s), {} executable data page(s), heap {}, stack guard {}\n",
+            a.wx_pages, a.writable_code, a.exec_data,
+            if a.heap_executable { "EXECUTABLE" } else { "non-executable" },
+            if a.stack_guard_unmapped { "unmapped" } else { "MAPPED" }));
+    }
 }

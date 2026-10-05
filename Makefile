@@ -9,12 +9,12 @@ LIMINE_BRANCH ?= v9.x-binary
 OVMF_CODE     ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS     ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 QEMU          ?= qemu-system-x86_64
-QEMU_FLAGS    ?= -M q35 -m 512M -smp 4 -no-reboot -no-shutdown
+QEMU_FLAGS    ?= -M q35 -cpu max -m 512M -smp 4 -no-reboot -no-shutdown
 
 BUILD  := build
 KERNEL := kernel/target/x86_64-unknown-none/release/aerokernel
 USERBIN := userland/target/x86_64-unknown-none/release
-PROGRAMS := aerosmss echod client crasher
+PROGRAMS := aerosmss echod client crasher sectest nxtest rotest
 ISO    := $(BUILD)/aeroforge.iso
 LIMINE := $(BUILD)/limine
 

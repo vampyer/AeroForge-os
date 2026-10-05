@@ -29,7 +29,7 @@ fn main() {
                 "-fno-exceptions",
                 "-fno-rtti",
                 "-fno-pic",
-                "-fno-stack-protector",
+                "-fstack-protector-strong", "-mstack-protector-guard=global",
                 "-fno-threadsafe-statics",
                 "-mcmodel=kernel",
                 "-mno-red-zone",

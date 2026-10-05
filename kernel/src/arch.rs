@@ -136,3 +136,57 @@ pub unsafe fn wrmsr(msr: u32, v: u64) {
 pub unsafe fn write_cr3(v: u64) {
     asm!("mov cr3, {}", in(reg) v, options(nostack, preserves_flags));
 }
+
+#[inline]
+pub fn read_cr0() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+#[inline]
+pub unsafe fn write_cr0(v: u64) {
+    asm!("mov cr0, {}", in(reg) v, options(nostack, preserves_flags));
+}
+
+#[inline]
+pub fn read_cr4() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr4", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+#[inline]
+pub unsafe fn write_cr4(v: u64) {
+    asm!("mov cr4, {}", in(reg) v, options(nostack, preserves_flags));
+}
+
+pub const MSR_EFER: u32 = 0xC000_0080;
+
+/// Sets EFLAGS.AC: lets the kernel touch user pages while SMAP is on.
+#[inline]
+pub unsafe fn stac() {
+    asm!("stac", options(nomem, nostack));
+}
+
+/// Clears EFLAGS.AC: user pages are off limits to the kernel again.
+#[inline]
+pub unsafe fn clac() {
+    asm!("clac", options(nomem, nostack));
+}
+
+/// A hardware random number, if the CPU has RDRAND and it delivers.
+pub fn rdrand() -> Option<u64> {
+    if cpuid(1).ecx & (1 << 30) == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let v: u64;
+        let ok: u8;
+        unsafe { asm!("rdrand {}", "setc {}", out(reg) v, out(reg_byte) ok, options(nomem, nostack)) };
+        if ok != 0 {
+            return Some(v);
+        }
+    }
+    None
+}
