@@ -440,12 +440,36 @@ pub struct UserSocket {
     remote: IrqMutex<Option<IpEndpoint>>,
     /// TCP: the handshake finished once.
     connected: AtomicBool,
+    /// TCP after `listen`: sockets listening on the port, each waiting for
+    /// one connection; `accept` hands out one that got its connection and
+    /// puts a fresh one in its place.
+    backlog: IrqMutex<Vec<SocketHandle>>,
+    listening: AtomicBool,
 }
 
 impl Drop for UserSocket {
     fn drop(&mut self) {
-        CLOSING.lock().push((self.handle, self.tcp));
+        let mut closing = CLOSING.lock();
+        closing.push((self.handle, self.tcp));
+        closing.extend(self.backlog.lock().drain(..).map(|h| (h, true)));
     }
+}
+
+/// Connections a listening socket can take before `accept` picks them up.
+const BACKLOG: usize = 4;
+
+/// A fresh TCP socket listening on `port`.
+fn add_listener(st: &mut Stack, port: u16) -> Result<SocketHandle, SockError> {
+    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUFFER]), tcp::SocketBuffer::new(vec![0; TCP_BUFFER]));
+    s.listen(port).map_err(|_| SockError::Invalid)?;
+    PROGRAM_SOCKETS.fetch_add(1, Ordering::Relaxed);
+    Ok(st.sockets.add(s))
+}
+
+/// What a program can learn about the network: zero addresses when there
+/// is no lease yet.
+pub fn info() -> Option<Lease> {
+    *LEASE.lock()
 }
 
 const TCP_BUFFER: usize = 64 * 1024;
@@ -504,7 +528,64 @@ impl UserSocket {
             st.sockets.add(s)
         };
         PROGRAM_SOCKETS.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(UserSocket { handle, tcp, remote: IrqMutex::new(None), connected: AtomicBool::new(false) }))
+        Ok(Arc::new(UserSocket::new(handle, tcp)))
+    }
+
+    fn new(handle: SocketHandle, tcp: bool) -> UserSocket {
+        UserSocket {
+            handle,
+            tcp,
+            remote: IrqMutex::new(None),
+            connected: AtomicBool::new(false),
+            backlog: IrqMutex::new(Vec::new()),
+            listening: AtomicBool::new(false),
+        }
+    }
+
+    /// TCP: waits for connections on `port`, `BACKLOG` at a time.
+    pub fn listen(&self, port: u16) -> Result<(), SockError> {
+        if !self.tcp || port == 0 || self.connected.load(Ordering::Relaxed) || self.remote.lock().is_some() {
+            return Err(SockError::Invalid);
+        }
+        if self.listening.swap(true, Ordering::SeqCst) {
+            return Err(SockError::Invalid);
+        }
+        let mut guard = STACK.lock();
+        let st = guard.as_mut().ok_or(SockError::NoNetwork)?;
+        let mut backlog = self.backlog.lock();
+        for _ in 0..BACKLOG {
+            backlog.push(add_listener(st, port)?);
+        }
+        Ok(())
+    }
+
+    /// TCP after `listen`: waits up to `timeout_us` (0 = no limit) for a
+    /// connection and returns it as a new socket.
+    pub fn accept(&self, timeout_us: u64) -> Result<Arc<UserSocket>, SockError> {
+        if !self.listening.load(Ordering::SeqCst) {
+            return Err(SockError::Invalid);
+        }
+        let deadline = (timeout_us != 0).then(|| apic::micros().saturating_add(timeout_us));
+        let conn = wait_for(deadline, |st| {
+            let mut backlog = self.backlog.lock();
+            let i = backlog.iter().position(|&h| {
+                matches!(st.sockets.get::<tcp::Socket>(h).state(), tcp::State::Established | tcp::State::CloseWait)
+            })?;
+            let h = backlog[i];
+            let s = st.sockets.get::<tcp::Socket>(h);
+            let (port, remote) = (s.listen_endpoint().port, s.remote_endpoint());
+            // A fresh listener takes its place in the backlog.
+            match add_listener(st, port) {
+                Ok(fresh) => backlog[i] = fresh,
+                Err(e) => return Some(Err(e)),
+            }
+            Some(Ok((h, remote)))
+        });
+        let (h, remote) = conn?;
+        let sock = UserSocket::new(h, true);
+        *sock.remote.lock() = remote;
+        sock.connected.store(true, Ordering::Relaxed);
+        Ok(Arc::new(sock))
     }
 
     /// UDP: sets the peer. TCP: connects, waiting up to `timeout_us`
