@@ -1,5 +1,5 @@
-//! The (very) early file namespace. Every FAT32 volume is mounted, readable
-//! and writable: the first one found at boot at "/", each further one at
+//! The (very) early file namespace. Every FAT32 and exFAT volume is
+//! mounted, readable and writable: the first one found at boot at "/", each further one at
 //! "/<device name>" (for example "/sata0p1"). Volumes on USB disks plugged
 //! in later are mounted the same way and go away when the disk is
 //! unplugged. Real mount tables, more filesystems and user-space filesystem
@@ -11,19 +11,50 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::block::{BlockDevice, DEVICES};
-use crate::fat::{DirEntry, FatVolume};
+use crate::exfat::ExfatVolume;
+use crate::fat::FatVolume;
 use crate::sync::IrqMutex;
+
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+impl DirEntry {
+    /// A directory entry standing for another volume's mount point.
+    pub fn mount_point(name: &str) -> Self {
+        Self { name: String::from(name), is_dir: true, size: 0 }
+    }
+}
+
+/// A mounted filesystem. Paths are inside the volume, "/"-separated.
+pub trait Volume: Send + Sync {
+    /// "FAT32", "exFAT".
+    fn kind(&self) -> &'static str;
+    fn label(&self) -> &str;
+    fn dev(&self) -> &Arc<dyn BlockDevice>;
+    fn list(&self, path: &str) -> Result<Vec<DirEntry>, &'static str>;
+    /// Reads up to `limit` bytes of a file.
+    fn read_file(&self, path: &str, limit: usize) -> Result<Vec<u8>, &'static str>;
+    /// Creates the file, or replaces what it holds.
+    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), &'static str>;
+    fn create_dir(&self, path: &str) -> Result<(), &'static str>;
+    /// Deletes a file or an empty directory.
+    fn remove(&self, path: &str) -> Result<(), &'static str>;
+}
 
 pub struct Mount {
     /// "/" for the root volume, "/<device>" for the others.
     pub path: String,
-    pub vol: FatVolume,
+    pub vol: alloc::boxed::Box<dyn Volume>,
 }
 
 /// Root first. Lookups clone the Arc and drop the lock before touching the disk.
 static MOUNTS: IrqMutex<Vec<Arc<Mount>>> = IrqMutex::new(Vec::new());
 
-/// Mounts every FAT32 volume found at boot. Returns the mounts made, root first.
+/// Mounts every FAT32 and exFAT volume found at boot. Returns the mounts made, root first.
 pub fn mount_all() -> Vec<Arc<Mount>> {
     let devices: Vec<_> = DEVICES.lock().iter().cloned().collect();
     for dev in devices {
@@ -32,14 +63,17 @@ pub fn mount_all() -> Vec<Arc<Mount>> {
     MOUNTS.lock().clone()
 }
 
-/// Mounts `dev` if it holds a FAT32 volume and is not mounted yet.
+/// Mounts `dev` if it holds a FAT32 or exFAT volume and is not mounted yet.
 pub fn mount(dev: Arc<dyn BlockDevice>) -> Option<Arc<Mount>> {
     if mount_point_of(dev.name()).is_some() {
         return None;
     }
-    let vol = FatVolume::mount(dev).ok()?;
+    let vol: alloc::boxed::Box<dyn Volume> = match FatVolume::mount(dev.clone()) {
+        Ok(v) => alloc::boxed::Box::new(v),
+        Err(_) => alloc::boxed::Box::new(ExfatVolume::mount(dev).ok()?),
+    };
     let mut mounts = MOUNTS.lock();
-    let path = if mounts.is_empty() { String::from("/") } else { format!("/{}", vol.dev.name()) };
+    let path = if mounts.is_empty() { String::from("/") } else { format!("/{}", vol.dev().name()) };
     let m = Arc::new(Mount { path, vol });
     mounts.push(m.clone());
     Some(m)
@@ -50,7 +84,7 @@ pub fn mount(dev: Arc<dyn BlockDevice>) -> Option<Arc<Mount>> {
 pub fn unmount_disk(disk: &str) -> Vec<String> {
     let mut gone = Vec::new();
     MOUNTS.lock().retain(|m| {
-        let keep = !crate::block::on_disk(m.vol.dev.name(), disk);
+        let keep = !crate::block::on_disk(m.vol.dev().name(), disk);
         if !keep {
             gone.push(m.path.clone());
         }
@@ -131,5 +165,5 @@ pub fn remove(path: &str) -> Result<(), &'static str> {
 
 /// Where a block device is mounted, if anywhere.
 pub fn mount_point_of(dev: &str) -> Option<String> {
-    MOUNTS.lock().iter().find(|m| m.vol.dev.name() == dev).map(|m| m.path.clone())
+    MOUNTS.lock().iter().find(|m| m.vol.dev().name() == dev).map(|m| m.path.clone())
 }

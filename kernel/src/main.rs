@@ -13,6 +13,7 @@ mod bt;
 mod console;
 mod dhi;
 mod elf;
+mod exfat;
 mod fat;
 mod fb;
 mod gamepad;
@@ -241,10 +242,10 @@ extern "C" fn kmain() -> ! {
     }
     let mounts = vfs::mount_all();
     for m in &mounts {
-        kok!("FAT32 volume \"{}\" on {} mounted at {}", m.vol.label, m.vol.dev.name(), m.path);
+        kok!("{} volume \"{}\" on {} mounted at {}", m.vol.kind(), m.vol.label(), m.vol.dev().name(), m.path);
     }
     if mounts.is_empty() {
-        kprintln!("[WARN] no FAT32 volume found, running without files");
+        kprintln!("[WARN] no FAT32 or exFAT volume found, running without files");
     }
 
     // ---- Scheduler ----

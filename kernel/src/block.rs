@@ -266,7 +266,7 @@ pub fn on_disk(dev: &str, disk: &str) -> bool {
 
 /// Brings the controller's USB disks up to date after something was plugged
 /// in or unplugged: unplugged disks are unmounted and forgotten, new ones
-/// registered and their FAT32 volumes mounted.
+/// registered and their FAT32 and exFAT volumes mounted.
 pub fn sync_usb(ctrl: i32) {
     let now = usb_disks_of(ctrl);
     let gone: Vec<String> = USB_DISKS.lock().iter()
@@ -297,7 +297,7 @@ pub fn sync_usb(ctrl: i32) {
         }
         for d in devices {
             if let Some(m) = crate::vfs::mount(d) {
-                crate::kok!("FAT32 volume \"{}\" on {} mounted at {}", m.vol.label, m.vol.dev.name(), m.path);
+                crate::kok!("{} volume \"{}\" on {} mounted at {}", m.vol.kind(), m.vol.label(), m.vol.dev().name(), m.path);
             }
         }
     }
