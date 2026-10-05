@@ -42,7 +42,7 @@
 # running, which 'ps' must no longer show. 'balancetest' runs six busy
 # threads on the four CPUs: CPUs that run out of work must take waiting
 # threads from busier ones, and 'sched' must count the moves. 'priotest'
-# times a high-priority thread against eight busy normal ones: it must run
+# times a high-priority thread against sixteen busy normal ones: it must run
 # ahead of them. 'timertest' checks that 2 ms sleeps take about 2 ms (not a
 # 10 ms tick), that 144 Hz frame pacing holds and that futex timeouts work.
 # Last, 'irq'
@@ -291,7 +291,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[balancetest\] 6 threads on [0-9]* CPUs, [1-9][0-9]* moved to an idle CPU, results agree, [0-9]* ms: OK" "$LOG" \
             || { fail "idle CPUs did not take waiting threads from busy ones, or a moved thread computed a wrong result"; }
         grep -q "^  [1-9][0-9]* thread migrations between CPUs" "$LOG" || { fail "the scheduler counted no thread migrations"; }
-        grep -q "\[priotest\] high priority ran ahead of 8 busy threads, bad requests refused: OK" "$LOG" \
+        grep -q "\[priotest\] high priority ran ahead of 16 busy threads, bad requests refused: OK" "$LOG" \
             || { fail "a high-priority thread did not run ahead of busy normal ones, or bad priority requests were accepted"; }
         grep -q "\[timertest\] sleeps precise, 144 Hz pacing kept, futex timeouts work: OK" "$LOG" \
             || { fail "sleeps were not precise to well under a tick, frame pacing slipped, or futex timeouts failed"; }

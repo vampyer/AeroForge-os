@@ -301,8 +301,8 @@ a higher level than the one running preempts it straight away: another CPU gets 
 IPI as before, and a CPU that wakes a thread itself (say from a device interrupt while idle)
 now sends one to itself instead of leaving the thread until the next tick. Stealing takes the
 highest-priority thread it may move. `ps` shows each thread's level. The new `priotest` program
-times the same work alone (70 ms in QEMU), in a normal thread among eight busy ones (210 ms) and
-in a high-priority one (70 ms), and fails if high priority does not win.
+times the same work alone (200 ms in QEMU), in a normal thread among sixteen busy ones (about 1 s) and
+in a high-priority one (200 ms), and fails if high priority does not win.
 
 Since 0.30 sleeps are precise. The LAPIC timer used to fire every 10 ms and a sleep ended on the
 next tick after it was due, so `sleep_ms(2)` could take anything up to 10 ms and a game had no way
