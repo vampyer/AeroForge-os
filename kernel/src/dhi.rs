@@ -84,14 +84,14 @@ pub struct UsbDevice {
     pub iface_class: u8,
     pub iface_subclass: u8,
     pub iface_protocol: u8,
-    pub _pad: u8,
+    pub parent_slot: u8,
     pub name: [u8; 32],
 }
 
 impl UsbDevice {
     pub const fn zeroed() -> Self {
         Self { vendor: 0, product: 0, port: 0, speed: 0, slot: 0, dev_class: 0, iface_class: 0,
-            iface_subclass: 0, iface_protocol: 0, _pad: 0, name: [0; 32] }
+            iface_subclass: 0, iface_protocol: 0, parent_slot: 0, name: [0; 32] }
     }
 }
 

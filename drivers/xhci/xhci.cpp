@@ -320,17 +320,38 @@ private:
             if ((sc & kPortEnabled) == 0) return;
         }
         set_portsc(port, (sc & kPortPower) | (sc & kPortChangeBits));  // clear change bits
-        const uint8_t speed = uint8_t((sc >> 10) & 0xF);
+        Where at{};
+        at.root_port = uint8_t(port);
+        at.port = uint8_t(port);
+        attach(at, uint8_t((sc >> 10) & 0xF));
+    }
 
+    // Where a device sits in the USB tree.
+    struct Where {
+        uint8_t root_port = 0;   // root hub port the path starts at
+        uint32_t route = 0;      // route string: hub port per tier, 4 bits each
+        uint8_t depth = 0;       // hubs between the root port and the device
+        uint8_t parent_slot = 0; // 0 = root hub
+        uint8_t port = 0;        // port on the parent
+        uint8_t tt_slot = 0, tt_port = 0;  // transaction translator for LS/FS behind a HS hub
+    };
+
+    // Addresses, describes and starts the device at `at`; hubs recurse into their ports.
+    void attach(const Where& at, uint8_t speed) {
+        if (count_ >= kMaxDevices) return;
         Device& d = devices_[count_];
-        d.info.port = uint8_t(port);
+        d.info.port = at.port;
+        d.info.parent_slot = at.parent_slot;
         d.info.speed = speed;
-        if (!address_device(d, port, speed)) {
-            ops_->log(Line().s("xhci: port ").u(uint64_t(port)).s(": device did not take an address").str());
+        Line where;
+        if (at.parent_slot) where.s("hub ").u(at.parent_slot).s(" port ").u(at.port);
+        else where.s("port ").u(at.port);
+        if (!address_device(d, at, speed)) {
+            ops_->log(Line().s("xhci: ").s(where.str()).s(": device did not take an address").str());
             return;
         }
         if (!read_descriptors(d)) {
-            ops_->log(Line().s("xhci: port ").u(uint64_t(port)).s(": could not read descriptors").str());
+            ops_->log(Line().s("xhci: ").s(where.str()).s(": could not read descriptors").str());
             return;
         }
         ++count_;
@@ -338,18 +359,114 @@ private:
 
         static const char* const kSpeed[] = {"?", "full speed", "low speed", "high speed", "SuperSpeed", "SuperSpeed+"};
         Line l;
-        l.s("xhci: port ").u(uint64_t(port)).s(", slot ").u(d.slot).s(": ").x4(d.info.vendor).s(":").x4(d.info.product)
+        l.s("xhci: ").s(where.str()).s(", slot ").u(d.slot).s(": ").x4(d.info.vendor).s(":").x4(d.info.product)
          .s(" \"").s(d.info.name).s("\", ").s(speed < 6 ? kSpeed[speed] : "?");
         if (d.hid == HidKind::Keyboard) l.s(", HID boot keyboard");
         if (d.hid == HidKind::Mouse) l.s(", HID boot mouse");
+        const bool hub = d.info.dev_class == 9 || d.info.iface_class == 9;
+        if (hub) l.s(", hub");
         ops_->log(l.str());
+
+        if (hub) {
+            if (at.depth >= 5) {
+                ops_->log("xhci: hubs nested too deep (USB allows 5), ports ignored");
+                return;
+            }
+            start_hub(d, at, speed);
+        }
+    }
+
+    // ------------------------------------------------------------------ hubs
+
+    // Port status bits (USB 2.0 11.24.2.7; USB 3 hubs share the low ones).
+    static constexpr uint16_t kHubPortConnection = 1u << 0;
+    static constexpr uint16_t kHubPortEnable = 1u << 1;
+    static constexpr uint16_t kHubPortReset = 1u << 4;
+    static constexpr uint16_t kHubPortLowSpeed = 1u << 9;
+    static constexpr uint16_t kHubPortHighSpeed = 1u << 10;
+    static constexpr uint16_t kFeaturePortReset = 4, kFeaturePortPower = 8;
+    static constexpr uint16_t kFeatureCConnection = 16, kFeatureCReset = 20, kFeatureBhReset = 28;
+
+    bool hub_port_status(Device& d, int port, const dhi_dma& buf, uint16_t* status, uint16_t* change) {
+        if (control(d, 0xA3, 0, 0, uint16_t(port), 4, buf.phys) < 4) return false;
+        const auto* b = static_cast<const uint8_t*>(buf.virt);
+        *status = uint16_t(b[0] | b[1] << 8);
+        *change = uint16_t(b[2] | b[3] << 8);
+        return true;
+    }
+
+    void start_hub(Device& hub, const Where& at, uint8_t speed) {
+        dhi_dma buf{};
+        if (ops_->dma_alloc(64, &buf) != 0) return;
+        const auto* b = static_cast<const uint8_t*>(buf.virt);
+        const bool superspeed = speed >= 4;
+
+        // Hub descriptor: number of ports and power-on delay.
+        const int n = control(hub, 0xA0, 6, superspeed ? 0x2A00 : 0x2900, 0, 16, buf.phys);
+        if (n < 7) {
+            ops_->log("xhci: hub descriptor unreadable, ports ignored");
+            ops_->dma_free(&buf);
+            return;
+        }
+        const int ports = b[2] > 15 ? 15 : b[2];
+        const uint32_t power_ms = uint32_t(b[5]) * 2;
+        const bool mtt = !superspeed && speed == 3 && hub.info.iface_protocol == 2;
+
+        // Tell the controller this slot is a hub (Configure Endpoint, slot context only).
+        for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(hub.in_ctx.virt)[i] = 0;
+        ctx(hub.in_ctx, 0)[1] = 1;
+        volatile uint32_t* sl = ctx(hub.in_ctx, 1);
+        const volatile uint32_t* out_slot = ctx(hub.out_ctx, 0);
+        for (int i = 0; i < 4; ++i) sl[i] = out_slot[i];
+        sl[0] |= (1u << 26) | (mtt ? 1u << 25 : 0);
+        sl[1] = (sl[1] & 0x00FFFFFF) | (uint32_t(ports) << 24);
+        sl[3] = 0;
+        command(hub.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(hub.slot) << 24), nullptr);
+        if (superspeed) control(hub, 0x20, 12, uint16_t(at.depth), 0, 0, 0);  // SET_HUB_DEPTH
+
+        for (int p = 1; p <= ports; ++p) control(hub, 0x23, 3, kFeaturePortPower, uint16_t(p), 0, 0);
+        ops_->delay_us((power_ms > 100 ? power_ms : 100) * 1000);
+
+        for (int p = 1; p <= ports && count_ < kMaxDevices; ++p) {
+            uint16_t status = 0, change = 0;
+            if (!hub_port_status(hub, p, buf, &status, &change) || !(status & kHubPortConnection)) continue;
+            control(hub, 0x23, 1, kFeatureCConnection, uint16_t(p), 0, 0);
+            control(hub, 0x23, 3, superspeed ? kFeatureBhReset : kFeaturePortReset, uint16_t(p), 0, 0);
+            bool enabled = false;
+            for (int i = 0; i < 50 && !enabled; ++i) {
+                ops_->delay_us(10000);
+                if (hub_port_status(hub, p, buf, &status, &change))
+                    enabled = !(status & kHubPortReset) && (status & kHubPortEnable || superspeed);
+            }
+            control(hub, 0x23, 1, kFeatureCReset, uint16_t(p), 0, 0);
+            if (!enabled) continue;
+            ops_->delay_us(10000);  // reset recovery
+
+            uint8_t child_speed = superspeed ? 4 : (status & kHubPortLowSpeed) ? 2 : (status & kHubPortHighSpeed) ? 3 : 1;
+            Where child{};
+            child.root_port = at.root_port;
+            child.route = at.route | (uint32_t(p) << (4 * at.depth));
+            child.depth = uint8_t(at.depth + 1);
+            child.parent_slot = hub.slot;
+            child.port = uint8_t(p);
+            if (speed == 3 && child_speed < 3) {
+                // Low/full speed device behind a high-speed hub: that hub translates.
+                child.tt_slot = hub.slot;
+                child.tt_port = uint8_t(p);
+            } else {
+                child.tt_slot = at.tt_slot;
+                child.tt_port = at.tt_port;
+            }
+            attach(child, child_speed);
+        }
+        ops_->dma_free(&buf);
     }
 
     volatile uint32_t* ctx(const dhi_dma& mem, int index) const {
         return reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(mem.virt) + index * ctx_size_);
     }
 
-    bool address_device(Device& d, int port, uint8_t speed) {
+    bool address_device(Device& d, const Where& at, uint8_t speed) {
         uint32_t slot = 0;
         if (command(0, 0, trb_type(kTrbEnableSlot), &slot) != kCcSuccess || slot == 0 || int(slot) > slots_)
             return false;
@@ -364,8 +481,9 @@ private:
         volatile uint32_t* control = ctx(d.in_ctx, 0);
         control[1] = 0b11;  // add slot + EP0
         volatile uint32_t* sl = ctx(d.in_ctx, 1);
-        sl[0] = (1u << 27) | (uint32_t(speed) << 20);  // one context entry
-        sl[1] = uint32_t(port) << 16;                   // root hub port
+        sl[0] = (1u << 27) | (uint32_t(speed) << 20) | (at.route & 0xFFFFF);  // one context entry
+        sl[1] = uint32_t(at.root_port) << 16;                                  // root hub port
+        sl[2] = uint32_t(at.tt_slot) | uint32_t(at.tt_port) << 8;              // TT for LS/FS behind a HS hub
         volatile uint32_t* ep = ctx(d.in_ctx, 2);
         const uint32_t mps = speed >= 4 ? 512 : speed == 3 ? 64 : 8;
         ep[1] = (mps << 16) | (4u << 3) | (3u << 1);  // control endpoint, 3 retries
