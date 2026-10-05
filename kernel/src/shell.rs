@@ -81,6 +81,7 @@ impl Shell {
                 kprintln!("  mic [record [s]]  Bluetooth headset microphones; record and show level and pitch");
                 kprintln!("  sound [test [hz] [s] | use <c>.<o>]  audio outputs; play a test tone; pick the output");
                 kprintln!("  disks       disks and partitions");
+                kprintln!("  diskwrite <disk> <lba> <n>  write, flush and read back a test pattern (unused blocks only)");
                 kprintln!("  ls [path]   list a directory on the mounted disk");
                 kprintln!("  cat <path>  print a text file");
                 kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
@@ -340,6 +341,19 @@ impl Shell {
                         Some(at) => kprintln!("  {:<9} {}  [mounted at {}]", d.name(), d.describe(), at),
                         None => kprintln!("  {:<9} {}", d.name(), d.describe()),
                     }
+                }
+            }
+            "diskwrite" => {
+                let mut args = arg.split_whitespace();
+                let dev = args.next().unwrap_or("");
+                let lba = args.next().and_then(|a| a.parse().ok());
+                let count = args.next().and_then(|a| a.parse().ok());
+                match (lba, count) {
+                    (Some(lba), Some(count)) => match block::write_test(dev, lba, count) {
+                        Ok(msg) => kprintln!("  {}", msg),
+                        Err(e) => console::print_colored(YELLOW, format_args!("  diskwrite: {}\n", e)),
+                    },
+                    _ => console::print_colored(YELLOW, format_args!("  usage: diskwrite <disk> <lba> <blocks>\n")),
                 }
             }
             "ls" => {

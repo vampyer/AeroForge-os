@@ -23,7 +23,9 @@
 # gamepad system call, in the Xbox layout; last, both USB pads unplug
 # themselves and plug back in (hot-plug on a root port and behind the hub),
 # and 'padtest' must read them again; a second USB stick plugged into the
-# hub must be mounted and readable, and unmounted when it is pulled out.
+# hub must be mounted and readable, and unmounted when it is pulled out;
+# last, 'diskwrite' must write, flush and read back a test pattern on the
+# NVMe, SATA and USB disks, and the disk images must hold it after QEMU exits.
 # Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -130,13 +132,22 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "device_del stick2"; STAGE=18
     elif [ $STAGE = 18 ] && grep -q "USB disk usb1 unplugged" "$LOG"; then
         sleep 1; type_keys $'ls /usb1p1\n'; STAGE=19
+    elif [ $STAGE = 19 ] && grep -q "  /usb1p1: " "$LOG"; then
+        # Writes: 80 blocks spans several transfers on every driver.
+        sleep 1; type_keys $'diskwrite nvme0 1000 80\n'; STAGE=20
+    elif [ $STAGE = 20 ] && grep -q "to nvme0 at LBA 1000\|diskwrite: " "$LOG"; then
+        sleep 1; type_keys $'diskwrite sata0 1000 80\n'; STAGE=21
+    elif [ $STAGE = 21 ] && grep -q "to sata0 at LBA 1000\|diskwrite: " "$LOG"; then
+        sleep 1; type_keys $'diskwrite usb0 1000 80\n'; STAGE=22
+    elif [ $STAGE = 22 ] && grep -q "to usb0 at LBA 1000\|diskwrite: " "$LOG"; then
+        sleep 1; type_keys $'diskwrite nvme0p1 1000 80\n'; STAGE=23
     fi
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         fail "kernel panic" "$LOG"
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
-        && { [ $STAGE = 19 ] && grep -q "  /usb1p1: " "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
+        && { [ $STAGE = 23 ] && grep -q "diskwrite: give a whole disk" "$LOG" || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
@@ -199,8 +210,17 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "FAT32 volume \"HOTSTICK\" on usb1p1 mounted at /usb1p1" "$LOG" || { fail "the USB stick plugged in later was not mounted"; }
         grep -q "USB disk usb1 unplugged, /usb1p1 unmounted" "$LOG" || { fail "the unplugged USB stick was not unmounted"; }
         grep -q "  /usb1p1: " "$LOG" || { fail "the unplugged USB stick's files were still reachable"; }
+        for d in nvme0 sata0 usb0; do
+            grep -q "wrote 80 blocks to $d at LBA 1000, flushed, read back OK" "$LOG" || { fail "writing to $d failed"; }
+        done
+        grep -q "diskwrite: give a whole disk, not a partition" "$LOG" || { fail "diskwrite did not refuse to write inside a partition"; }
+        # The data must be on the disks themselves once QEMU has gone.
+        kill $QEMU_PID 2>/dev/null; wait $QEMU_PID 2>/dev/null || true
+        python3 tools/check-disk-write.py build/disk.img nvme0 1000 80 || { fail "the NVMe disk image lacks the written data"; }
+        python3 tools/check-disk-write.py build/sata.img sata0 1000 80 || { fail "the SATA disk image lacks the written data"; }
+        python3 tools/check-disk-write.py build/usb.img usb0 1000 80 || { fail "the USB disk image lacks the written data"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read and unmounted a USB stick plugged in while running, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read and unmounted a USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

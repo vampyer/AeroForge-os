@@ -1,8 +1,8 @@
 // AeroForge AHCI (SATA) driver (C++20, freestanding), behind the Driver Host
 // Interface.
 //
-// Polling mode, one command slot per port: enough to read disks. NCQ,
-// interrupts and writes come later.
+// Polling mode, one command slot per port: reads, writes and cache flushes.
+// NCQ and interrupts come later.
 
 #include "dhi.h"
 
@@ -41,6 +41,9 @@ constexpr uint32_t kSigSataDisk = 0x00000101;
 constexpr uint8_t kFisRegH2D = 0x27;
 constexpr uint8_t kAtaIdentify = 0xEC;
 constexpr uint8_t kAtaReadDmaExt = 0x25;
+constexpr uint8_t kAtaWriteDmaExt = 0x35;
+constexpr uint8_t kAtaFlushCacheExt = 0xEA;
+constexpr uint16_t kHeaderWrite = 1u << 6;
 
 constexpr uint32_t kMaxTransfer = 8192;
 constexpr int kMaxDisks = 8;
@@ -116,14 +119,23 @@ public:
         return issue(kAtaReadDmaExt, lba, count, buf, count * 512u) ? 0 : -3;
     }
 
+    int32_t write(uint64_t lba, uint32_t count, uint64_t buf) {
+        if (count == 0 || count * 512u > kMaxTransfer) return -1;
+        if (lba + count > sectors_) return -2;
+        return issue(kAtaWriteDmaExt, lba, count, buf, count * 512u) ? 0 : -3;
+    }
+
+    int32_t flush() { return issue(kAtaFlushCacheExt, 0, 0, 0, 0) ? 0 : -3; }
+
 private:
     bool issue(uint8_t command, uint64_t lba, uint32_t count, uint64_t buf, uint32_t bytes) {
         // Wait until the device isn't busy.
         for (int i = 0; i < 100000 && (read32(kPxTfd) & (kTfdBusy | kTfdDrq)); ++i) ops_->delay_us(10);
 
         auto* header = static_cast<CommandHeader*>(cmd_list_.virt);
-        header->flags = sizeof(uint32_t) * 5 / 4;  // CFL: 5-dword H2D FIS, read direction
-        header->prdtl = 1;
+        header->flags = sizeof(uint32_t) * 5 / 4;  // CFL: 5-dword H2D FIS
+        if (command == kAtaWriteDmaExt) header->flags |= kHeaderWrite;
+        header->prdtl = bytes > 0 ? 1 : 0;
         header->prdbc = 0;
 
         auto* t = static_cast<CommandTable*>(table_.virt);
@@ -134,7 +146,7 @@ private:
         t->cfis[4] = uint8_t(lba);
         t->cfis[5] = uint8_t(lba >> 8);
         t->cfis[6] = uint8_t(lba >> 16);
-        t->cfis[7] = command == kAtaIdentify ? 0 : (1u << 6);  // LBA mode
+        t->cfis[7] = command == kAtaIdentify || command == kAtaFlushCacheExt ? 0 : (1u << 6);  // LBA mode
         t->cfis[8] = uint8_t(lba >> 24);
         t->cfis[9] = uint8_t(lba >> 32);
         t->cfis[10] = uint8_t(lba >> 40);
@@ -238,4 +250,14 @@ extern "C" int32_t aero_ahci_init(const dhi_ops* ops, uint64_t abar_phys, dhi_bl
 extern "C" int32_t aero_ahci_read(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys) {
     if (disk < 0 || disk >= g_count) return -1;
     return g_disks[disk].read(lba, count, buf_phys);
+}
+
+extern "C" int32_t aero_ahci_write(int32_t disk, uint64_t lba, uint32_t count, uint64_t buf_phys) {
+    if (disk < 0 || disk >= g_count) return -1;
+    return g_disks[disk].write(lba, count, buf_phys);
+}
+
+extern "C" int32_t aero_ahci_flush(int32_t disk) {
+    if (disk < 0 || disk >= g_count) return -1;
+    return g_disks[disk].flush();
 }

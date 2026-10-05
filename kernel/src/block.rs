@@ -13,8 +13,18 @@ use crate::{console, pci};
 pub trait BlockDevice: Send + Sync {
     fn name(&self) -> &str;
     fn block_size(&self) -> u32;
+    fn block_count(&self) -> u64;
+    /// For a partition: its first block and block count on the whole disk.
+    fn extent(&self) -> Option<(u64, u64)> {
+        None
+    }
     /// Reads whole blocks starting at `lba`; `buf.len()` must be a multiple of the block size.
     fn read(&self, lba: u64, buf: &mut [u8]) -> Result<(), &'static str>;
+    /// Writes whole blocks starting at `lba`; `buf.len()` must be a multiple of the block size.
+    /// The data may stay in the drive's cache until `flush`.
+    fn write(&self, lba: u64, buf: &[u8]) -> Result<(), &'static str>;
+    /// Commits the drive's write cache to media.
+    fn flush(&self) -> Result<(), &'static str>;
     fn describe(&self) -> String;
 }
 
@@ -58,6 +68,9 @@ impl BlockDevice for DriverDisk {
     fn block_size(&self) -> u32 {
         self.block_size
     }
+    fn block_count(&self) -> u64 {
+        self.block_count
+    }
     fn read(&self, mut lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
         let bs = self.block_size as usize;
         if buf.len() % bs != 0 {
@@ -81,6 +94,44 @@ impl BlockDevice for DriverDisk {
             lba += blocks as u64;
         }
         Ok(())
+    }
+    fn write(&self, mut lba: u64, buf: &[u8]) -> Result<(), &'static str> {
+        let bs = self.block_size as usize;
+        if buf.len() % bs != 0 {
+            return Err("write size is not a multiple of the block size");
+        }
+        if lba + (buf.len() / bs) as u64 > self.block_count {
+            return Err("write past end of disk");
+        }
+        // Copy into the bounce buffer, then the controller DMAs from it.
+        let bounce = self.bounce.lock();
+        for chunk in buf.chunks(self.max_transfer as usize) {
+            let blocks = (chunk.len() / bs) as u32;
+            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), bounce.virt, chunk.len()) };
+            let rc = unsafe {
+                match self.backend {
+                    Backend::Nvme(c) => dhi::aero_nvme_write(c, lba, blocks, bounce.phys),
+                    Backend::Ahci(d) => dhi::aero_ahci_write(d, lba, blocks, bounce.phys),
+                    Backend::Usb(d) => dhi::aero_xhci_write(d, lba, blocks, bounce.phys),
+                }
+            };
+            if rc != 0 {
+                return Err("disk write failed");
+            }
+            lba += blocks as u64;
+        }
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), &'static str> {
+        let _bounce = self.bounce.lock();  // one command at a time per disk
+        let rc = unsafe {
+            match self.backend {
+                Backend::Nvme(c) => dhi::aero_nvme_flush(c),
+                Backend::Ahci(d) => dhi::aero_ahci_flush(d),
+                Backend::Usb(d) => dhi::aero_xhci_flush(d),
+            }
+        };
+        if rc == 0 { Ok(()) } else { Err("disk flush failed") }
     }
     fn describe(&self) -> String {
         let bus = match self.backend {
@@ -252,6 +303,48 @@ pub fn sync_usb(ctrl: i32) {
     }
 }
 
+/// The test pattern `write_test` puts in block `lba` of `dev`; the boot test
+/// checks the disk image for it after QEMU exits (tools/check-disk-write.py).
+fn test_block(dev: &str, lba: u64, bs: usize) -> Vec<u8> {
+    let mut b: Vec<u8> = (0..bs).map(|i| (i as u64 * 7 + lba) as u8).collect();
+    let head = format!("AeroForge write test {} LBA {}\n", dev, lba);
+    b[..head.len()].copy_from_slice(head.as_bytes());
+    b
+}
+
+/// Writes a test pattern to `count` blocks of whole disk `dev` from `lba`,
+/// flushes, and reads it back. Only the unused gap between the partition
+/// tables and the partitions may be written, so no data can be harmed.
+pub fn write_test(dev: &str, lba: u64, count: u64) -> Result<String, &'static str> {
+    let devices: Vec<_> = DEVICES.lock().iter().cloned().collect();
+    let disk = devices.iter().find(|d| d.name() == dev).ok_or("no such disk")?;
+    if disk.extent().is_some() {
+        return Err("give a whole disk, not a partition");
+    }
+    // LBA 0-33 hold the MBR or GPT and its entries; the last 33 the backup GPT.
+    if count == 0 || count > 1024 || lba < 34 || lba + count > disk.block_count().saturating_sub(33) {
+        return Err("blocks outside the area between the partition tables");
+    }
+    let overlaps = devices.iter().filter(|p| on_disk(p.name(), dev)).filter_map(|p| p.extent())
+        .any(|(start, n)| lba < start + n && start < lba + count);
+    if overlaps {
+        return Err("blocks overlap a partition");
+    }
+    let bs = disk.block_size() as usize;
+    let mut data = Vec::with_capacity(bs * count as usize);
+    for i in 0..count {
+        data.extend_from_slice(&test_block(dev, lba + i, bs));
+    }
+    disk.write(lba, &data)?;
+    disk.flush()?;
+    let mut back = vec![0u8; data.len()];
+    disk.read(lba, &mut back)?;
+    if back != data {
+        return Err("read back different data");
+    }
+    Ok(format!("wrote {} blocks to {} at LBA {}, flushed, read back OK", count, dev, lba))
+}
+
 // ------------------------------------------------------------- partitions
 
 pub struct Partition {
@@ -270,12 +363,28 @@ impl BlockDevice for Partition {
     fn block_size(&self) -> u32 {
         self.disk.block_size()
     }
+    fn block_count(&self) -> u64 {
+        self.count
+    }
+    fn extent(&self) -> Option<(u64, u64)> {
+        Some((self.start, self.count))
+    }
     fn read(&self, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
         let blocks = buf.len() as u64 / self.block_size() as u64;
         if lba + blocks > self.count {
             return Err("read past end of partition");
         }
         self.disk.read(self.start + lba, buf)
+    }
+    fn write(&self, lba: u64, buf: &[u8]) -> Result<(), &'static str> {
+        let blocks = buf.len() as u64 / self.block_size() as u64;
+        if lba + blocks > self.count {
+            return Err("write past end of partition");
+        }
+        self.disk.write(self.start + lba, buf)
+    }
+    fn flush(&self) -> Result<(), &'static str> {
+        self.disk.flush()
     }
     fn describe(&self) -> String {
         format!("{} sectors from LBA {} = {} MiB, {} partition{}",
