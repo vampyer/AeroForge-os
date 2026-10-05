@@ -139,6 +139,16 @@ to 255). For Xbox style USB pads that layout is exact; for other pads it is a gu
 database like SDL's arrives, and `exact` tells programs which. The `padtest` program prints every
 pad that way, and the boot test checks its output for all four simulated pads.
 
+Since 0.16 USB devices can be plugged in and unplugged while AeroForge runs. The xHCI driver
+acts on the controller's port status change events for root ports and asks each hub's ports for
+changes a few times a second; a new device is set up as at start-up (keyboards, mice, gamepads,
+Bluetooth adapters, disks), and an unplugged one (with everything behind it, for a hub) gives
+back its slot and memory. The kernel notices through a change counter (`aero_xhci_generation`),
+refreshes `lsusb`, and marks unplugged gamepads as not connected; a pad plugged back into the
+same port takes its old place in the list. The simulated pads unplug and replug themselves in
+the boot test, one on a root port and one behind the hub. USB disks plugged in later are not
+mounted yet, and an adapter's Bluetooth host does not restart after a replug.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

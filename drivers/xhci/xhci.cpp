@@ -41,6 +41,7 @@ constexpr uint32_t kPortEnabled   = 1u << 1;
 constexpr uint32_t kPortReset     = 1u << 4;
 constexpr uint32_t kPortPower     = 1u << 9;
 constexpr uint32_t kPortChangeBits = 0x7Fu << 17;  // CSC..CEC, write 1 to clear
+constexpr uint32_t kPortConnectChange = 1u << 17;
 
 // Interrupter 0, relative to the runtime base.
 constexpr uint32_t kIman   = 0x20;
@@ -56,9 +57,9 @@ struct Trb {
 static_assert(sizeof(Trb) == 16);
 
 constexpr uint32_t kTrbNormal = 1, kTrbSetup = 2, kTrbData = 3, kTrbStatus = 4, kTrbIsoch = 5, kTrbLink = 6;
-constexpr uint32_t kTrbEnableSlot = 9, kTrbAddressDevice = 11, kTrbConfigureEndpoint = 12,
+constexpr uint32_t kTrbEnableSlot = 9, kTrbDisableSlot = 10, kTrbAddressDevice = 11, kTrbConfigureEndpoint = 12,
                    kTrbEvaluateContext = 13, kTrbResetEndpoint = 14, kTrbSetTrDequeue = 16;
-constexpr uint32_t kEvtTransfer = 32, kEvtCommandDone = 33;
+constexpr uint32_t kEvtTransfer = 32, kEvtCommandDone = 33, kEvtPortStatus = 34;
 
 constexpr uint32_t kTrbCycle = 1u << 0;
 constexpr uint32_t kTrbToggle = 1u << 1;   // link TRB: toggle cycle
@@ -166,6 +167,14 @@ public:
         return phys;
     }
 
+    void free(const dhi_ops* ops) {
+        if (mem_.virt != nullptr) ops->dma_free(&mem_);
+        mem_ = dhi_dma{};
+        trbs_ = nullptr;
+        enqueue_ = 0;
+        cycle_ = 1;
+    }
+
     uint64_t phys() const { return mem_.phys; }
     // Where the next TRB goes, with the cycle bit it will carry (for Set TR Dequeue Pointer).
     uint64_t dequeue_for_reset() const { return mem_.phys + uint64_t(enqueue_) * sizeof(Trb) | cycle_; }
@@ -206,9 +215,23 @@ constexpr uint8_t kXInputReportDesc[] = {
 };
 constexpr int kXInputReport = 13;
 
+// Where a device sits in the USB tree.
+struct Where {
+    uint8_t root_port = 0;   // root hub port the path starts at
+    uint32_t route = 0;      // route string: hub port per tier, 4 bits each
+    uint8_t depth = 0;       // hubs between the root port and the device
+    uint8_t parent_slot = 0; // 0 = root hub
+    uint8_t port = 0;        // port on the parent
+    uint8_t tt_slot = 0, tt_port = 0;  // transaction translator for LS/FS behind a HS hub
+    uint8_t psiv = 0;        // root port speed ID as the controller reported it (0 = use the speed code)
+};
+
 struct Device {
+    bool alive = false;                    // in use (entries of unplugged devices are reused)
     dhi_usb_device info{};
+    Where at{};
     uint8_t slot = 0;
+    uint8_t hub_ports = 0;                 // a hub: its port count (0 = not a hub)
     Ring ep0{};
     dhi_dma in_ctx{}, out_ctx{};
 
@@ -316,6 +339,8 @@ public:
         // events (including key presses) are queued and handed out next time.
         if (!try_lock()) return 0;
         process_events();
+        service_ports();
+        if (++polls_ % 32 == 0) poll_hubs();
         int32_t n = 0;
         while (n < max && q_tail_ != q_head_) {
             out[n++] = queue_[q_tail_];
@@ -451,7 +476,7 @@ public:
             for (uint32_t k = 0; k < n; ++k) desc[k] = src[k];
             return int32_t(n);
         }
-        return -1;
+        return index >= 0 && index < pad_count_ ? -2 : -1;
     }
 
     int32_t pad_report(int32_t* pad, uint8_t* out, uint32_t max) {
@@ -469,11 +494,16 @@ public:
         return n;
     }
 
+    // Device entry `index`: 0 = filled in, 1 = empty (unplugged), -1 = past the last entry.
     int32_t device_info(int32_t index, dhi_usb_device* out) const {
         if (index < 0 || index >= count_) return -1;
+        if (!devices_[index].alive) return 1;
         *out = devices_[index].info;
         return 0;
     }
+
+    // Bumped whenever a device is plugged in or unplugged.
+    uint32_t generation() const { return generation_; }
 
 private:
     // ---------------------------------------------------------------- setup
@@ -607,21 +637,17 @@ private:
         attach(at, speed_code(port, at.psiv));
     }
 
-    // Where a device sits in the USB tree.
-    struct Where {
-        uint8_t root_port = 0;   // root hub port the path starts at
-        uint32_t route = 0;      // route string: hub port per tier, 4 bits each
-        uint8_t depth = 0;       // hubs between the root port and the device
-        uint8_t parent_slot = 0; // 0 = root hub
-        uint8_t port = 0;        // port on the parent
-        uint8_t tt_slot = 0, tt_port = 0;  // transaction translator for LS/FS behind a HS hub
-        uint8_t psiv = 0;        // root port speed ID as the controller reported it (0 = use the speed code)
-    };
-
     // Addresses, describes and starts the device at `at`; hubs recurse into their ports.
     void attach(const Where& at, uint8_t speed) {
-        if (count_ >= kMaxDevices) return;
-        Device& d = devices_[count_];
+        int index = 0;
+        while (index < count_ && devices_[index].alive) ++index;
+        if (index >= kMaxDevices) {
+            ops_->log("xhci: too many USB devices, one ignored");
+            return;
+        }
+        Device& d = devices_[index];
+        d = Device{};
+        d.at = at;
         d.info.port = at.port;
         d.info.parent_slot = at.parent_slot;
         d.info.speed = speed;
@@ -630,13 +656,17 @@ private:
         else where.s("port ").u(at.port);
         if (!address_device(d, at, speed)) {
             ops_->log(Line().s("xhci: ").s(where.str()).s(": device did not take an address").str());
+            release(d);
             return;
         }
         if (!read_descriptors(d)) {
             ops_->log(Line().s("xhci: ").s(where.str()).s(": could not read descriptors").str());
+            release(d);
             return;
         }
-        ++count_;
+        d.alive = true;
+        if (index == count_) ++count_;
+        ++generation_;
         if (d.hid != HidKind::None && !start_hid(d)) d.hid = HidKind::None;
         if (d.storage && !start_storage(d)) d.storage = false;
         if ((d.pad != PadKind::None || candidates_ > 0) && !start_pad(d)) d.pad = PadKind::None;
@@ -720,40 +750,129 @@ private:
 
         for (int p = 1; p <= ports; ++p) control(hub, 0x23, 3, kFeaturePortPower, uint16_t(p), 0, 0);
         ops_->delay_us((power_ms > 100 ? power_ms : 100) * 1000);
+        hub.hub_ports = uint8_t(ports);
 
-        for (int p = 1; p <= ports && count_ < kMaxDevices; ++p) {
+        for (int p = 1; p <= ports; ++p) {
             uint16_t status = 0, change = 0;
             if (!hub_port_status(hub, p, buf, &status, &change) || !(status & kHubPortConnection)) continue;
             control(hub, 0x23, 1, kFeatureCConnection, uint16_t(p), 0, 0);
-            control(hub, 0x23, 3, superspeed ? kFeatureBhReset : kFeaturePortReset, uint16_t(p), 0, 0);
-            bool enabled = false;
-            for (int i = 0; i < 50 && !enabled; ++i) {
-                ops_->delay_us(10000);
-                if (hub_port_status(hub, p, buf, &status, &change))
-                    enabled = !(status & kHubPortReset) && (status & kHubPortEnable || superspeed);
-            }
-            control(hub, 0x23, 1, kFeatureCReset, uint16_t(p), 0, 0);
-            if (!enabled) continue;
-            ops_->delay_us(10000);  // reset recovery
-
-            uint8_t child_speed = superspeed ? 4 : (status & kHubPortLowSpeed) ? 2 : (status & kHubPortHighSpeed) ? 3 : 1;
-            Where child{};
-            child.root_port = at.root_port;
-            child.route = at.route | (uint32_t(p) << (4 * at.depth));
-            child.depth = uint8_t(at.depth + 1);
-            child.parent_slot = hub.slot;
-            child.port = uint8_t(p);
-            if (speed == 3 && child_speed < 3) {
-                // Low/full speed device behind a high-speed hub: that hub translates.
-                child.tt_slot = hub.slot;
-                child.tt_port = uint8_t(p);
-            } else {
-                child.tt_slot = at.tt_slot;
-                child.tt_port = at.tt_port;
-            }
-            attach(child, child_speed);
+            attach_hub_port(hub, p, buf);
         }
         ops_->dma_free(&buf);
+    }
+
+    // Resets the device on hub port `p` and attaches it.
+    void attach_hub_port(Device& hub, int p, const dhi_dma& buf) {
+        const Where& at = hub.at;
+        const uint8_t speed = hub.info.speed;
+        const bool superspeed = speed >= 4;
+        uint16_t status = 0, change = 0;
+        control(hub, 0x23, 3, superspeed ? kFeatureBhReset : kFeaturePortReset, uint16_t(p), 0, 0);
+        bool enabled = false;
+        for (int i = 0; i < 50 && !enabled; ++i) {
+            ops_->delay_us(10000);
+            if (hub_port_status(hub, p, buf, &status, &change))
+                enabled = !(status & kHubPortReset) && (status & kHubPortEnable || superspeed);
+        }
+        control(hub, 0x23, 1, kFeatureCReset, uint16_t(p), 0, 0);
+        if (!enabled) return;
+        ops_->delay_us(10000);  // reset recovery
+
+        uint8_t child_speed = superspeed ? 4 : (status & kHubPortLowSpeed) ? 2 : (status & kHubPortHighSpeed) ? 3 : 1;
+        Where child{};
+        child.root_port = at.root_port;
+        child.route = at.route | (uint32_t(p) << (4 * at.depth));
+        child.depth = uint8_t(at.depth + 1);
+        child.parent_slot = hub.slot;
+        child.port = uint8_t(p);
+        if (speed == 3 && child_speed < 3) {
+            // Low/full speed device behind a high-speed hub: that hub translates.
+            child.tt_slot = hub.slot;
+            child.tt_port = uint8_t(p);
+        } else {
+            child.tt_slot = at.tt_slot;
+            child.tt_port = at.tt_port;
+        }
+        attach(child, child_speed);
+    }
+
+    // ------------------------------------------------------------- hot-plug
+
+    // Root ports whose connection changed, from Port Status Change events;
+    // handled outside the event handler because attaching waits for commands.
+    void service_ports() {
+        while (pending_ports_ != 0) {
+            const int port = __builtin_ctzll(pending_ports_);
+            pending_ports_ &= pending_ports_ - 1;
+            if (port < 1 || port > max_ports_) continue;
+            const uint32_t sc = portsc(port);
+            set_portsc(port, (sc & kPortPower) | (sc & kPortChangeBits));  // clear change bits
+            if (!(sc & kPortConnectChange)) continue;  // a reset finishing, not a plug
+            // Unplugged, or replaced by another device: whatever was there is gone.
+            for (int i = 0; i < count_; ++i)
+                if (devices_[i].alive && devices_[i].at.root_port == port && devices_[i].at.depth == 0) detach(i);
+            if (sc & kPortConnected) {
+                ops_->delay_us(100000);  // debounce (USB 2.0 7.1.7.3)
+                probe_port(port);
+            }
+        }
+    }
+
+    // Hubs report plugs on an interrupt endpoint; asking each port's status
+    // a few times a second is simpler and cheap.
+    void poll_hubs() {
+        if (hub_buf_.virt == nullptr && ops_->dma_alloc(64, &hub_buf_) != 0) return;
+        for (int i = 0; i < count_; ++i) {
+            Device& hub = devices_[i];
+            if (!hub.alive || hub.hub_ports == 0) continue;
+            for (int p = 1; p <= hub.hub_ports && hub.alive; ++p) {
+                uint16_t status = 0, change = 0;
+                if (!hub_port_status(hub, p, hub_buf_, &status, &change) || !(change & kHubPortConnection)) continue;
+                control(hub, 0x23, 1, kFeatureCConnection, uint16_t(p), 0, 0);
+                for (int j = 0; j < count_; ++j) {
+                    const Device& c = devices_[j];
+                    if (c.alive && c.at.parent_slot == hub.slot && c.at.port == p) detach(j);
+                }
+                if (status & kHubPortConnection) {
+                    ops_->delay_us(100000);  // debounce
+                    attach_hub_port(hub, p, hub_buf_);
+                }
+            }
+        }
+    }
+
+    // Forgets an unplugged device (and, for a hub, everything behind it).
+    void detach(int index) {
+        Device& d = devices_[index];
+        if (!d.alive) return;
+        if (d.hub_ports != 0) {
+            for (int j = 0; j < count_; ++j)
+                if (devices_[j].alive && devices_[j].at.parent_slot == d.slot && j != index) detach(j);
+        }
+        Line l;
+        l.s("xhci: ");
+        if (d.at.parent_slot) l.s("hub ").u(d.at.parent_slot).s(" port ").u(d.at.port);
+        else l.s("port ").u(d.at.port);
+        l.s(", slot ").u(d.slot).s(": ").x4(d.info.vendor).s(":").x4(d.info.product).s(" \"").s(d.info.name)
+         .s("\" unplugged");
+        ops_->log(l.str());
+        release(d);
+        ++generation_;
+    }
+
+    // Gives back a device's slot and memory and clears its entry.
+    void release(Device& d) {
+        if (d.slot != 0) {
+            command(0, 0, trb_type(kTrbDisableSlot) | (uint32_t(d.slot) << 24), nullptr);
+            static_cast<volatile uint64_t*>(dcbaa_.virt)[d.slot] = 0;
+        }
+        Ring* rings[] = {&d.ep0, &d.intr, &d.ring_in, &d.ring_out, &d.evt_ring, &d.sco_in_ring, &d.sco_out_ring,
+                         &d.pad_ring, &d.pad_out_ring};
+        for (Ring* r : rings) r->free(ops_);
+        dhi_dma* mems[] = {&d.in_ctx, &d.out_ctx, &d.reports, &d.ms_buf, &d.bt_bufs, &d.sco_bufs, &d.pad_bufs};
+        for (dhi_dma* m : mems)
+            if (m->virt != nullptr) ops_->dma_free(m);
+        d = Device{};
     }
 
     volatile uint32_t* ctx(const dhi_dma& mem, int index) const {
@@ -1633,7 +1752,12 @@ private:
             }
             return;
         }
-        if (type != kEvtTransfer) return;  // port status changes: hotplug comes later
+        if (type == kEvtPortStatus) {
+            const uint32_t port = uint32_t(ptr >> 24) & 0xFF;
+            if (port < 64) pending_ports_ |= 1ull << port;
+            return;
+        }
+        if (type != kEvtTransfer) return;
         Device* d = by_slot(slot);
         if (d == nullptr) return;
         const uint8_t ep = uint8_t((d3 >> 16) & 0x1F);
@@ -1790,7 +1914,11 @@ private:
     uint32_t cmd_code_ = 0, cmd_slot_ = 0;
 
     Device devices_[kMaxDevices]{};
-    int count_ = 0;
+    int count_ = 0;                        // entries used so far (some may be empty again)
+    uint32_t generation_ = 0;
+    uint64_t pending_ports_ = 0;           // bit per root port with a status change to look at
+    uint32_t polls_ = 0;
+    dhi_dma hub_buf_{};
     uint8_t report_len_[kMaxSlots + 1] = {};
 
     // Scratch state while parsing one configuration descriptor.
@@ -1914,6 +2042,11 @@ extern "C" int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device*
 extern "C" int32_t aero_xhci_pad(int32_t ctrl, int32_t index, dhi_usb_device* out, void* desc, uint32_t max) {
     if (ctrl < 0 || ctrl >= g_count || out == nullptr || (max > 0 && desc == nullptr)) return -1;
     return g_controllers[ctrl].pad_info(index, out, static_cast<uint8_t*>(desc), max);
+}
+
+extern "C" uint32_t aero_xhci_generation(int32_t ctrl) {
+    if (ctrl < 0 || ctrl >= g_count) return 0;
+    return g_controllers[ctrl].generation();
 }
 
 extern "C" int32_t aero_xhci_pad_report(int32_t ctrl, int32_t* pad, void* data, uint32_t max) {

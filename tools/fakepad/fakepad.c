@@ -18,12 +18,16 @@
  * report ID 1: X at minimum, Y centred, Z at maximum, Rz centred, hat left,
  * buttons 2 and 10 held.
  *
+ * SIGUSR1 unplugs the pad (usbredir device disconnect, which QEMU passes on
+ * to the guest as an unplug) and the next one plugs it in again.
+ *
  * Build: cc -O2 -o build/fakepad tools/fakepad/fakepad.c -lusbredirparser
  * Run:   build/fakepad <socket> --xinput|--hid */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,6 +45,13 @@ static int xinput;
 static int reports_started;
 static double next_report;
 static int reports_sent;
+static volatile sig_atomic_t toggle_plug;
+static int plugged;
+
+static void on_usr1(int sig) {
+    (void)sig;
+    toggle_plug = 1;
+}
 
 static void say(const char *fmt, ...) {
     va_list ap;
@@ -322,14 +333,19 @@ static void interface_and_ep_info(void) {
     usbredirparser_send_ep_info(parser, &ep);
 }
 
-static void hello(void *priv, struct usb_redir_hello_header *h) {
-    (void)priv;
-    say("connected to %s", h->version);
+static void present(void) {
     interface_and_ep_info();
     struct usb_redir_device_connect_header dc = {usb_redir_speed_full, xinput ? 0xFF : 0x00, xinput ? 0xFF : 0x00,
                                                  xinput ? 0xFF : 0x00, vendor_id(), product_id(), 0x0114};
     usbredirparser_send_device_connect(parser, &dc);
+    plugged = 1;
     say("presenting %04x:%04x", vendor_id(), product_id());
+}
+
+static void hello(void *priv, struct usb_redir_hello_header *h) {
+    (void)priv;
+    say("connected to %s", h->version);
+    present();
 }
 
 static void log_cb(void *priv, int level, const char *msg) {
@@ -358,6 +374,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     xinput = strcmp(argv[2], "--xinput") == 0;
+    signal(SIGUSR1, on_usr1);
 
     int listener = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -401,6 +418,17 @@ int main(int argc, char **argv) {
         poll(&p, 1, 10);
         if (p.revents & (POLLIN | POLLHUP)) {
             if (usbredirparser_do_read(parser) != 0) break;
+        }
+        if (toggle_plug) {
+            toggle_plug = 0;
+            if (plugged) {
+                usbredirparser_send_device_disconnect(parser);
+                plugged = reports_started = 0;
+                say("unplugged");
+            } else {
+                say("plugged in again");
+                present();
+            }
         }
         if (reports_started && now() >= next_report) {
             send_report();

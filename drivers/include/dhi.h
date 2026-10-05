@@ -130,9 +130,18 @@ int32_t aero_xhci_init(const dhi_ops *ops, uint64_t mmio_phys, int32_t *devices)
 /* Drains the controller's event ring. Fills up to `max` input events and
  * returns how many. Call regularly (the driver polls; no interrupts yet). */
 int32_t aero_xhci_poll(int32_t ctrl, dhi_input_event *out, int32_t max);
+/* aero_xhci_poll also sets up devices plugged into a root port or a hub
+ * after init and forgets unplugged ones. */
 
-/* Describes device `index` (0..devices-1) of a controller. 0 = ok. */
+/* Describes device `index` of a controller: 0 = ok, 1 = that entry is
+ * empty (its device was unplugged), -1 = past the last entry. Devices
+ * plugged in later take empty entries or new ones at the end. */
 int32_t aero_xhci_device(int32_t ctrl, int32_t index, dhi_usb_device *out);
+
+/* A counter the driver bumps whenever a device is plugged in or unplugged
+ * (noticed while aero_xhci_poll runs): when it changes, read the devices
+ * and gamepads again. */
+uint32_t aero_xhci_generation(int32_t ctrl);
 
 /* USB mass storage (bulk-only transport, SCSI) found during init. Fills
  * `out` for the controller's disk `index` (0, 1, ...) and returns a disk id
@@ -179,8 +188,8 @@ int32_t aero_xhci_bt_control(int32_t bt, uint8_t req_type, uint8_t request, uint
  * 2.4 GHz dongles present, and HID joysticks and gamepads. Fills `out` for
  * the controller's gamepad `index` (0, 1, ...), copies its HID report
  * descriptor (for XInput pads, one describing the reports the driver turns
- * theirs into) into `desc` and returns its length, or -1 when there is no
- * such gamepad. */
+ * theirs into) into `desc` and returns its length; -2 when that gamepad was
+ * unplugged, -1 past the last one. A pad plugged in again gets a new index. */
 int32_t aero_xhci_pad(int32_t ctrl, int32_t index, dhi_usb_device *out, void *desc, uint32_t max);
 
 /* Copies the next input report from any of the controller's gamepads into
