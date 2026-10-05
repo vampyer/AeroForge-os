@@ -335,8 +335,12 @@ threads waiting nudges an idle one to come and take them (`sched` counts these).
 that woke every tick for nothing now sleep longer: the mixer waits for a program to write sound
 (it still runs every tick while playing), and the USB thread, woken by interrupts anyway, only
 checks on its own every 100 ms. The new `wakeups` command counts each CPU's timer interrupts over
-a second; in QEMU an idle CPU takes 0 to 2 instead of 100. Still waking every tick: the network
-thread when a card has no interrupts (the older e1000 family) and the Bluetooth thread.
+a second; in QEMU an idle CPU takes 0 to 2 instead of 100. Since 0.32.1 the Bluetooth thread is
+quiet too: it services adapters every tick only while something is under way (pairing, a
+recording, voice audio, commands or data still to send) and otherwise waits for a USB interrupt or
+a job from the shell, checking its deadlines every 100 ms. With gamepads and a headset paired, all
+four CPUs together now take about 30 timer interrupts in an idle second instead of about 120. Still
+waking every tick: the network thread when a card has no interrupts (the older e1000 family).
 
 | Area | Status |
 |---|---|
