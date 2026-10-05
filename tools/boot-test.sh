@@ -4,7 +4,9 @@
 # client finishes its round trips), and both the NVMe (GPT) and SATA (MBR)
 # test disks and a USB stick get mounted, and a USB keyboard and mouse get set up behind a USB hub, and the
 # Intel igb card gets an address over DHCP and pings the gateway (a second,
-# e1000e card must come up with a link). Intended for CI (design doc, Phase 0).
+# e1000e card must come up with a link), and a simulated MediaTek Bluetooth
+# adapter (tools/fakebt) gets its firmware, comes up and finds the simulated
+# gamepads in a scan. Intended for CI (design doc, Phase 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,6 +19,11 @@ make iso >/dev/null
 ./tools/make-disk.sh >/dev/null
 ./tools/make-sata-disk.sh >/dev/null 2>&1
 ./tools/make-usb-disk.sh >/dev/null 2>&1
+cc -O2 -Wall -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser
+FAKEBT_LOG=build/fakebt.log
+build/fakebt build/fakebt.sock build/firmware/mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin 2>"$FAKEBT_LOG" &
+FAKEBT_PID=$!
+for _ in $(seq 50); do [ -S build/fakebt.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG"
 
@@ -28,17 +35,19 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
     -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
     -drive file=build/usb.img,if=none,id=stick,format=raw -device usb-storage,bus=xhci.0,port=2,drive=stick,serial=AEROUSB1 \
+    -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
     -nic user,model=igb -nic user,model=e1000e \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none &
 QEMU_PID=$!
-trap 'kill $QEMU_PID 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID 2>/dev/null || true' EXIT
 
 for _ in $(seq "$TIMEOUT"); do
     if grep -q "PANIC" "$LOG" 2>/dev/null; then
         echo "FAIL: kernel panic"; sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG"; exit 1
     fi
     if [ "$(grep -c "done, exiting" "$LOG" 2>/dev/null)" -ge 3 ] && grep -q "rotest (pid" "$LOG" && grep -q "nxtest (pid" "$LOG" \
-        && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG"; then
+        && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
+        && grep -q "hci0: scan found\|WARN.*hci0" "$LOG"; then
         sleep 1
         sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { echo "FAIL: not all CPUs came online"; exit 1; }
@@ -57,8 +66,13 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "eth1: Intel 8086:10d3 (e1000 driver) .*link up" "$LOG" || { echo "FAIL: Intel e1000e card not set up"; exit 1; }
         grep -q "DHCP: eth0 got 10.0.2.15/24, gateway 10.0.2.2" "$LOG" || { echo "FAIL: no DHCP lease"; exit 1; }
         grep -q "ping 10.0.2.2: reply from 10.0.2.2" "$LOG" || { echo "FAIL: no ping reply from the gateway"; exit 1; }
+        grep -q "hci0: MediaTek MT7961 firmware .* loaded" "$LOG" || { echo "FAIL: MediaTek Bluetooth firmware not loaded"; cat "$FAKEBT_LOG"; exit 1; }
+        grep -q "firmware OK" "$FAKEBT_LOG" && ! grep -q "FAIL" "$FAKEBT_LOG" || { echo "FAIL: simulated adapter rejected the firmware download"; cat "$FAKEBT_LOG"; exit 1; }
+        grep -q "hci0: Bluetooth 5.2 adapter 0e8d:0608 up, address F0:0D:AE:F0:12:01, made by MediaTek" "$LOG" || { echo "FAIL: Bluetooth adapter not up"; cat "$FAKEBT_LOG"; exit 1; }
+        grep -q "11:22:33:44:55:66  classic .* gamepad .*\"Wireless Gamepad\"" "$LOG" || { echo "FAIL: classic Bluetooth gamepad not found by the scan"; exit 1; }
+        grep -q "C0:FF:EE:00:12:34  LE random .* gamepad .*\"BLE Pad\"" "$LOG" || { echo "FAIL: LE gamepad not found by the scan"; exit 1; }
         grep -q "read /system/session.cfg" "$LOG" || { echo "FAIL: aerosmss did not read its config from disk"; exit 1; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware and found the gamepads in a scan, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

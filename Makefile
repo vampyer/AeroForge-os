@@ -15,10 +15,12 @@ BUILD  := build
 KERNEL := kernel/target/x86_64-unknown-none/release/aerokernel
 USERBIN := userland/target/x86_64-unknown-none/release
 PROGRAMS := aerosmss echod client crasher sectest nxtest rotest
+FIRMWARE := mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin mediatek/BT_RAM_CODE_MT7961_1a_2_hdr.bin \
+            mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin
 ISO    := $(BUILD)/aeroforge.iso
 LIMINE := $(BUILD)/limine
 
-.PHONY: all kernel userland iso disk run run-headless clean
+.PHONY: all kernel userland firmware iso disk run run-headless clean
 all: iso
 
 kernel:
@@ -31,11 +33,17 @@ $(LIMINE)/BOOTX64.EFI:
 	rm -rf $(LIMINE)
 	git clone --depth 1 --branch $(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git $(LIMINE)
 
-iso: kernel userland $(LIMINE)/BOOTX64.EFI
+firmware:
+	./tools/fetch-firmware.sh
+
+iso: kernel userland firmware $(LIMINE)/BOOTX64.EFI
 	rm -rf $(BUILD)/iso_root
 	mkdir -p $(BUILD)/iso_root/boot/limine $(BUILD)/iso_root/boot/bin $(BUILD)/iso_root/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso_root/boot/aerokernel
 	for p in $(PROGRAMS); do cp $(USERBIN)/$$p $(BUILD)/iso_root/boot/bin/; done
+	mkdir -p $(BUILD)/iso_root/boot/firmware/mediatek
+	for f in $(FIRMWARE); do cp $(BUILD)/firmware/$$f $(BUILD)/iso_root/boot/firmware/$$f; done
+	cp $(BUILD)/firmware/LICENCE.mediatek $(BUILD)/iso_root/boot/firmware/
 	cp boot/limine.conf $(LIMINE)/limine-uefi-cd.bin $(BUILD)/iso_root/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(BUILD)/iso_root/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J \

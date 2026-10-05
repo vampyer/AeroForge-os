@@ -104,6 +104,28 @@ pub struct NetInfo {
     pub speed_mbps: u32,
 }
 
+pub const BT_COMMAND: u8 = 1;
+pub const BT_ACL: u8 = 2;
+pub const BT_EVENT: u8 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BtmtkChip {
+    pub dev_id: u32,
+    pub fw_version: u32,
+    pub flavor: u32,
+    pub supported: u32,
+    pub firmware: [u8; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BtmtkResult {
+    pub sections: u32,
+    pub bytes: u32,
+    pub error: [u8; 48],
+}
+
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
@@ -116,6 +138,12 @@ extern "C" {
     pub fn aero_xhci_device(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
     pub fn aero_xhci_disk(ctrl: i32, index: i32, out: *mut BlockInfo) -> i32;
     pub fn aero_xhci_read(disk: i32, lba: u64, count: u32, buf_phys: u64) -> i32;
+    pub fn aero_xhci_bt(ctrl: i32, index: i32, out: *mut UsbDevice) -> i32;
+    pub fn aero_xhci_bt_send(bt: i32, kind: u8, data: *const u8, len: u32) -> i32;
+    pub fn aero_xhci_bt_recv(bt: i32, kind: *mut u8, data: *mut u8, max: u32) -> i32;
+    pub fn aero_btmtk_is_mediatek(vendor: u16, product: u16) -> i32;
+    pub fn aero_btmtk_chip(ops: *const DhiOps, bt: i32, out: *mut BtmtkChip) -> i32;
+    pub fn aero_btmtk_setup(ops: *const DhiOps, bt: i32, firmware: *const u8, size: u32, out: *mut BtmtkResult) -> i32;
     pub fn aero_e1000_supports(device_id: u16) -> i32;
     pub fn aero_e1000_init(ops: *const DhiOps, mmio_phys: u64, info: *mut NetInfo) -> i32;
     pub fn aero_e1000_send(nic: i32, frame: *const u8, len: u32) -> i32;

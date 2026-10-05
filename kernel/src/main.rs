@@ -9,6 +9,7 @@ mod acpi;
 mod apic;
 mod arch;
 mod block;
+mod bt;
 mod console;
 mod dhi;
 mod elf;
@@ -205,6 +206,14 @@ extern "C" fn kmain() -> ! {
     if usb_disks > 0 {
         kok!("USB mass storage: {} disk(s)", usb_disks);
     }
+    let bt_adapters = bt::probe();
+    for a in bt::ADAPTERS.lock().iter() {
+        console::print_colored(console::DIM, format_args!("       {}: USB {:04x}:{:04x} \"{}\"\n",
+            a.name, a.usb.vendor, a.usb.product, dhi::c_field(&a.usb.name)));
+    }
+    if bt_adapters > 0 {
+        kok!("Bluetooth: {} USB adapter(s), set-up continues on the bt thread", bt_adapters);
+    }
     let nics = net::probe();
     for n in net::NICS.lock().iter() {
         console::print_colored(console::DIM, format_args!("       {}: Intel {:04x}:{:04x} ({} driver) at {}, MAC {}, link {}\n",
@@ -240,8 +249,9 @@ extern "C" fn kmain() -> ! {
     kok!("NX: rest of the kernel half non-executable ({} top-level slots: direct map, heap, stacks)", slots);
     report_security();
 
-    let n = modules::init(MODULE_REQ.response());
-    kok!("{} user program(s) loaded by the bootloader", n);
+    modules::init(MODULE_REQ.response());
+    let firmware = modules::list().len() - modules::programs().count();
+    kok!("{} user program(s) and {} firmware file(s) loaded by the bootloader", modules::programs().count(), firmware);
 
     kprintln!();
     console::print_colored(console::GREEN, format_args!("AeroKernel is up."));
@@ -257,6 +267,9 @@ extern "C" fn kmain() -> ! {
     }
     if nics > 0 {
         sched::spawn_kernel("net", net::net_thread, 0, Some(2 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
+    }
+    if bt_adapters > 0 {
+        sched::spawn_kernel("bt", bt::bt_thread, 0, Some(3 % smp::ONLINE.load(core::sync::atomic::Ordering::SeqCst) as usize));
     }
     sched::spawn_kernel("shell", shell::run, 0, Some(0));
 
