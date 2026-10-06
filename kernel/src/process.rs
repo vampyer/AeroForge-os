@@ -22,6 +22,17 @@ pub mod rights {
 pub enum Object {
     Port(Arc<Port>),
     Socket(Arc<crate::net::UserSocket>),
+    Event(Arc<crate::wait::Event>),
+    /// A child process: waitable until it exits, and killable.
+    Process(Arc<Exit>),
+}
+
+/// What outlives a process for those holding a handle to it (a handle
+/// does not keep the process itself, and so its memory, alive).
+pub struct Exit {
+    pub pid: u64,
+    pub exited: AtomicBool,
+    pub code: AtomicI64,
 }
 
 #[derive(Clone)]
@@ -68,6 +79,7 @@ pub struct Process {
     /// Set once the process is exiting: its threads may only exit now.
     pub exiting: AtomicBool,
     pub parent: u64,
+    pub exit: Arc<Exit>,
     /// Memory handed out by SYS_MEM_MAP.
     vm: IrqMutex<Vm>,
 }
@@ -101,8 +113,9 @@ pub const MAX_MAP: u64 = 1 << 30;
 pub fn spawn(module_name: &str, parent: u64) -> Result<u64, &'static str> {
     let image = modules::find(module_name).ok_or("no such program")?;
     let pml4 = memory::new_address_space().ok_or("out of memory")?;
+    let pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
     let process = Arc::new(Process {
-        pid: NEXT_PID.fetch_add(1, Ordering::SeqCst),
+        pid,
         name: String::from(module_name),
         pml4,
         handles: IrqMutex::new(HandleTable::default()),
@@ -110,6 +123,7 @@ pub fn spawn(module_name: &str, parent: u64) -> Result<u64, &'static str> {
         exit_code: AtomicI64::new(0),
         exiting: AtomicBool::new(false),
         parent,
+        exit: Arc::new(Exit { pid, exited: AtomicBool::new(false), code: AtomicI64::new(0) }),
         vm: IrqMutex::new(Vm { next: HEAP_BASE, regions: BTreeMap::new() }),
     });
     // From here on, dropping `process` frees the address space on failure.
@@ -123,7 +137,6 @@ pub fn spawn(module_name: &str, parent: u64) -> Result<u64, &'static str> {
         v += memory::PAGE_SIZE;
     }
     PROCESSES.lock().insert(process.pid, process.clone());
-    let pid = process.pid;
     sched::spawn_user(process, module_name, entry, USER_STACK_TOP - 8, 0);
     Ok(pid)
 }
@@ -242,6 +255,9 @@ pub fn on_exit(p: &Arc<Process>) {
     }
     PROCESSES.lock().remove(&p.pid);
     futex::forget_process(p.pid);
+    p.exit.code.store(code, Ordering::SeqCst);
+    p.exit.exited.store(true, Ordering::SeqCst);
+    crate::wait::notify();
     if code != 0 {
         console::print_colored(console::YELLOW, format_args!("[kernel] {} (pid {}) exited with code {}\n", p.name, p.pid, code));
     }

@@ -45,6 +45,7 @@ mod tlb;
 mod syscall;
 mod usb;
 mod vfs;
+mod wait;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 

@@ -58,6 +58,8 @@ impl Port {
         if let Some(t) = g.waiters.pop_front() {
             sched::wake(&t);
         }
+        drop(g);
+        crate::wait::notify();
         Ok(())
     }
 

@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, arch, console, futex, gamepad, gdt, net, percpu, sched, security, sound, vfs};
+use crate::{apic, arch, console, futex, gamepad, gdt, net, percpu, sched, security, sound, vfs, wait};
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -158,6 +158,12 @@ pub const SYS_SOCKET_RECV: u64 = 37;
 pub const SYS_SOCKET_LISTEN: u64 = 38;
 pub const SYS_SOCKET_ACCEPT: u64 = 39;
 pub const SYS_NET_INFO: u64 = 40;
+pub const SYS_EVENT_CREATE: u64 = 41;
+pub const SYS_EVENT_SET: u64 = 42;
+pub const SYS_EVENT_RESET: u64 = 43;
+pub const SYS_WAIT_ANY: u64 = 44;
+pub const SYS_PROCESS_HANDLE: u64 = 45;
+pub const SYS_PROCESS_KILL: u64 = 46;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -252,6 +258,31 @@ fn socket_handle(proc_: &process::Process, h: u64, need: u32) -> Result<alloc::s
     match &handle.object {
         Object::Socket(s) => Ok(s.clone()),
         _ => Err(E_BADHANDLE),
+    }
+}
+
+fn event_handle(proc_: &process::Process, h: u64, need: u32) -> Result<alloc::sync::Arc<wait::Event>, i64> {
+    let table = proc_.handles.lock();
+    let handle = table.get(h).ok_or(E_BADHANDLE)?;
+    if handle.rights & need != need {
+        return Err(E_RIGHTS);
+    }
+    match &handle.object {
+        Object::Event(e) => Ok(e.clone()),
+        _ => Err(E_BADHANDLE),
+    }
+}
+
+/// Most handles one SYS_WAIT_ANY watches.
+const MAX_WAIT: u64 = 64;
+
+/// Is the object ready for a waiter? Takes an auto-reset event's signal.
+fn ready(object: &Object) -> bool {
+    match object {
+        Object::Port(p) => p.queued() > 0,
+        Object::Socket(s) => s.readable(),
+        Object::Event(e) => e.take(),
+        Object::Process(x) => x.exited.load(core::sync::atomic::Ordering::SeqCst),
     }
 }
 
@@ -562,6 +593,77 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
             }
             to_user(a0, &bytes)?;
+            Ok(0)
+        }
+        SYS_EVENT_CREATE => {
+            // a0: 1 = manual reset (stays set until reset), 0 = auto reset.
+            let event = wait::Event::new(a0 != 0);
+            Ok(proc_.handles.lock().insert(Handle { object: Object::Event(event), rights: rights::ALL }))
+        }
+        SYS_EVENT_SET => {
+            event_handle(&proc_, a0, rights::SEND)?.set();
+            Ok(0)
+        }
+        SYS_EVENT_RESET => {
+            event_handle(&proc_, a0, rights::SEND)?.reset();
+            Ok(0)
+        }
+        SYS_WAIT_ANY => {
+            // Array of u64 handles, count, timeout in µs (0 = none). Returns
+            // the index of the first ready handle: a port with a message, a
+            // socket with data (or a connection to accept, or closed), a set
+            // event, an exited process.
+            if a1 == 0 || a1 > MAX_WAIT {
+                return Err(E_INVAL);
+            }
+            let raw = user_bytes(a0, a1 * 8)?;
+            let objects = {
+                let table = proc_.handles.lock();
+                raw.chunks_exact(8)
+                    .map(|b| {
+                        let h = u64::from_le_bytes(b.try_into().unwrap());
+                        let handle = table.get(h).ok_or(E_BADHANDLE)?;
+                        if handle.rights & rights::RECV == 0 && !matches!(handle.object, Object::Process(_)) {
+                            return Err(E_RIGHTS);
+                        }
+                        Ok(handle.object.clone())
+                    })
+                    .collect::<Result<Vec<Object>, i64>>()?
+            };
+            drop(proc_);
+            let deadline = (a2 != 0).then(|| apic::micros().saturating_add(a2));
+            wait::wait_any(deadline, || objects.iter().position(ready)).map(|i| i as u64).map_err(|e| match e {
+                wait::WaitError::TimedOut => E_TIMEDOUT,
+                wait::WaitError::Killed => E_INVAL,
+            })
+        }
+        SYS_PROCESS_HANDLE => {
+            // A handle to child process a0 (one this process spawned).
+            let child = process::PROCESSES.lock().get(&a0).cloned().ok_or(E_NOTFOUND)?;
+            if child.parent != proc_.pid {
+                return Err(E_RIGHTS);
+            }
+            let exit = child.exit.clone();
+            drop(child);
+            Ok(proc_.handles.lock().insert(Handle { object: Object::Process(exit), rights: rights::ALL }))
+        }
+        SYS_PROCESS_KILL => {
+            // Process handle, exit code. Its threads stop; waiters see it exit.
+            let exit = {
+                let table = proc_.handles.lock();
+                let handle = table.get(a0).ok_or(E_BADHANDLE)?;
+                if handle.rights & rights::SEND == 0 {
+                    return Err(E_RIGHTS);
+                }
+                match &handle.object {
+                    Object::Process(x) => x.clone(),
+                    _ => return Err(E_BADHANDLE),
+                }
+            };
+            let target = process::PROCESSES.lock().get(&exit.pid).cloned();
+            if let Some(p) = target {
+                process::kill(&p, a1 as i64);
+            }
             Ok(0)
         }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),

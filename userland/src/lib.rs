@@ -53,6 +53,12 @@ pub mod sys {
     pub const SOCKET_LISTEN: u64 = 38;
     pub const SOCKET_ACCEPT: u64 = 39;
     pub const NET_INFO: u64 = 40;
+    pub const EVENT_CREATE: u64 = 41;
+    pub const EVENT_SET: u64 = 42;
+    pub const EVENT_RESET: u64 = 43;
+    pub const WAIT_ANY: u64 = 44;
+    pub const PROCESS_HANDLE: u64 = 45;
+    pub const PROCESS_KILL: u64 = 46;
 }
 
 pub mod rights {
@@ -511,6 +517,11 @@ pub mod net {
                 .map(|n| n as usize)
         }
 
+        /// The handle, for `wait_any`.
+        pub fn handle(&self) -> &Handle {
+            &self.0
+        }
+
         /// TCP: waits for connections on `port` (take them with `accept`).
         pub fn listen(&self, port: u16) -> Result<(), i64> {
             check(unsafe { syscall(sys::SOCKET_LISTEN, self.0 .0, port as u64, 0, 0) }).map(|_| ())
@@ -539,6 +550,52 @@ pub mod net {
             })
             .map(|n| n as usize)
         }
+    }
+}
+
+/// Waits until one of `handles` is ready, up to `timeout_us` (0 = no
+/// limit), and returns its index. Ready means: a port has a message, a
+/// socket has data (or a connection to accept, or was closed), an event is
+/// set (an auto-reset event is reset by this), a process has exited.
+pub fn wait_any(handles: &[&Handle], timeout_us: u64) -> Result<usize, i64> {
+    let raw: alloc::vec::Vec<u64> = handles.iter().map(|h| h.0).collect();
+    check(unsafe { syscall(sys::WAIT_ANY, raw.as_ptr() as u64, raw.len() as u64, timeout_us, 0) }).map(|i| i as usize)
+}
+
+/// An event object: `set` wakes a `wait_any` on it. Auto-reset events let one
+/// waiter through per `set`; manual-reset ones stay set until `reset`.
+pub struct Event(pub Handle);
+
+impl Event {
+    pub fn auto_reset() -> Result<Event, i64> {
+        check(unsafe { syscall(sys::EVENT_CREATE, 0, 0, 0, 0) }).map(|h| Event(Handle(h)))
+    }
+
+    pub fn manual_reset() -> Result<Event, i64> {
+        check(unsafe { syscall(sys::EVENT_CREATE, 1, 0, 0, 0) }).map(|h| Event(Handle(h)))
+    }
+
+    pub fn set(&self) -> Result<(), i64> {
+        check(unsafe { syscall(sys::EVENT_SET, self.0 .0, 0, 0, 0) }).map(|_| ())
+    }
+
+    pub fn reset(&self) -> Result<(), i64> {
+        check(unsafe { syscall(sys::EVENT_RESET, self.0 .0, 0, 0, 0) }).map(|_| ())
+    }
+}
+
+/// A handle to a child process (one this program spawned): `wait_any`
+/// sees it once the child has exited.
+pub struct Child(pub Handle);
+
+impl Child {
+    pub fn open(pid: u64) -> Result<Child, i64> {
+        check(unsafe { syscall(sys::PROCESS_HANDLE, pid, 0, 0, 0) }).map(|h| Child(Handle(h)))
+    }
+
+    /// Ends the child with exit code `code`.
+    pub fn kill(&self, code: i64) -> Result<(), i64> {
+        check(unsafe { syscall(sys::PROCESS_KILL, self.0 .0, code as u64, 0, 0) }).map(|_| ())
     }
 }
 
