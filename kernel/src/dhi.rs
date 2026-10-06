@@ -170,6 +170,45 @@ pub struct VirtioPci {
     pub _pad: u32,
 }
 
+/// One AMD display pipe as read at init (see dhi.h).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DcnPipe {
+    pub address: u64,
+    pub inuse: u64,
+    pub hubp_cntl: u32,
+    pub surface_config: u32,
+    pub pitch: u32,
+    pub flip_control: u32,
+    pub otg_control: u32,
+    pub otg_status: u32,
+    pub frame_count: u32,
+    pub h_total: u32,
+    pub v_total: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DcnInfo {
+    pub pipes: [DcnPipe; 4],
+    pub memsize_mb: u32,
+    pub pipe: i32,
+    pub otg: i32,
+    pub _pad: u32,
+    pub fb_base: u64,
+    pub fb_top: u64,
+    pub fb_offset: u64,
+}
+
+extern "C" {
+    pub fn aero_dcn_init(ops: *const DhiOps, mmio_phys: u64, out: *mut DcnInfo) -> i32;
+    pub fn aero_dcn_frame_count() -> u32;
+    pub fn aero_dcn_flip(address: u64) -> i32;
+    pub fn aero_dcn_flip_pending() -> i32;
+    pub fn aero_dcn_scanout() -> u64;
+}
+
 extern "C" {
     pub fn aero_ps2kbd_init(ops: *const DhiOps) -> i32;
     pub fn aero_ps2kbd_on_irq(out: *mut KeyEvent) -> i32;
