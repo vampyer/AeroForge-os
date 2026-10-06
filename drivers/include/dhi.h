@@ -396,6 +396,55 @@ int32_t aero_vgpu_scanout(uint32_t id, uint32_t width, uint32_t height);
  * and update the screen. `stride` is the resource's row length in bytes. */
 int32_t aero_vgpu_flush(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t stride);
 
+/* ---- AMD display engine, DCN 2.1 (drivers/amdgpu/dcn.cpp) ---- */
+
+/* One display pipe (HUBP and OTG of the same number), as read at init. */
+typedef struct dhi_dcn_pipe {
+    uint64_t address;         /* surface the pipe is set to show */
+    uint64_t inuse;           /* surface it is reading now */
+    uint32_t hubp_cntl;
+    uint32_t surface_config;  /* low 7 bits: pixel format (8 = ARGB8888) */
+    uint32_t pitch;           /* pixels per row */
+    uint32_t flip_control;
+    uint32_t otg_control;     /* bit 0: timing generator running */
+    uint32_t otg_status;
+    uint32_t frame_count;
+    uint32_t h_total;
+    uint32_t v_total;
+    uint32_t _pad;
+} dhi_dcn_pipe;
+
+typedef struct dhi_dcn_info {
+    dhi_dcn_pipe pipes[4];
+    uint32_t memsize_mb;      /* graphics memory (carve-out) size */
+    int32_t pipe;             /* the firmware's pipe, or -1 */
+    int32_t otg;              /* first running timing generator, or -1 */
+    uint32_t _pad;
+    /* The display engine's view of graphics memory: addresses in
+     * [fb_base, fb_top] are graphics memory at system address
+     * fb_offset + (address - fb_base). All 0 if not set up. */
+    uint64_t fb_base;
+    uint64_t fb_top;
+    uint64_t fb_offset;
+} dhi_dcn_info;
+
+/* Maps the register BAR (BAR 5) and reads the display pipes. 0 = a pipe
+ * showing a surface and a running timing generator were found. */
+int32_t aero_dcn_init(const dhi_ops *ops, uint64_t mmio_phys, dhi_dcn_info *out);
+
+/* Frames started by the timing generator (24 bits, wraps). */
+uint32_t aero_dcn_frame_count(void);
+
+/* Queues a flip of the firmware's pipe to `address` at the next vertical
+ * blank. 0 = ok. */
+int32_t aero_dcn_flip(uint64_t address);
+
+/* 1 while the queued flip has not happened yet. */
+int32_t aero_dcn_flip_pending(void);
+
+/* The surface address the pipe is reading now. */
+uint64_t aero_dcn_scanout(void);
+
 #ifdef __cplusplus
 }
 #endif

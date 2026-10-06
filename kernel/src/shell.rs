@@ -132,6 +132,9 @@ impl Shell {
             "display" => match crate::display::info() {
                 Some(d) => {
                     kprintln!("  {}x{} through the {}", d.width, d.height, d.kind);
+                    if let Some(hz) = d.flip_hz {
+                        kprintln!("  program frames switch at the vertical blank, {} Hz", hz);
+                    }
                     match d.owner {
                         Some(pid) => kprintln!("  pid {} has the whole screen", pid),
                         None => kprintln!("  showing the console"),

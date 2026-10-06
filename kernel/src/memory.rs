@@ -535,6 +535,13 @@ pub fn map_physical(phys: u64, len: u64) -> u64 {
     map_physical_with(phys, len, NO_EXECUTE)
 }
 
+/// Write-combining mapping, for graphics memory the CPU only writes (uses
+/// PAT entry 5, which Limine sets to write-combining on every CPU).
+pub fn map_wc(phys: u64, len: u64) -> u64 {
+    const PTE_PAT: u64 = 1 << 7; // in a 4 KiB entry; PAT index = PAT:PCD:PWT = 1:0:1
+    map_physical_with(phys, len, WRITABLE | PTE_PAT | WRITE_THROUGH | NO_EXECUTE)
+}
+
 /// Uncached mapping for device registers.
 pub fn map_mmio(phys: u64, len: u64) -> u64 {
     map_physical_with(phys, len, WRITABLE | NO_CACHE | WRITE_THROUGH | NO_EXECUTE)

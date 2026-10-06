@@ -293,6 +293,7 @@ extern "C" fn kmain() -> ! {
     let firmware = modules::list().len() - modules::programs().count();
     kok!("{} user program(s) and {} firmware file(s) loaded by the bootloader", modules::programs().count(), firmware);
 
+    display::probe_radeon();
     // Late, so it is still on screen at the prompt (a photo is the only
     // way to read it on real hardware without a working keyboard).
     display::report_gpus();
