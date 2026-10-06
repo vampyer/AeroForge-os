@@ -194,6 +194,16 @@ pub fn copy_from_user(ptr: u64, len: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Copies user bytes straight into kernel memory, for large copies (screen
+/// frames) where a temporary Vec would cost too much.
+///
+/// # Safety
+/// The caller has checked [ptr, ptr+len) with `check_user`, and `dst` is
+/// valid for `len` bytes.
+pub unsafe fn copy_from_user_unchecked(ptr: u64, dst: *mut u8, len: usize) {
+    with_user_access(|| core::ptr::copy_nonoverlapping(ptr as *const u8, dst, len));
+}
+
 /// Copies kernel bytes into user memory.
 pub fn copy_to_user(ptr: u64, data: &[u8]) -> bool {
     if !check_user(ptr, data.len() as u64, true) {

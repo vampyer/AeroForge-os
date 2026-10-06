@@ -12,6 +12,7 @@ mod block;
 mod bt;
 mod console;
 mod dhi;
+mod display;
 mod elf;
 mod exfat;
 mod fat;
@@ -27,6 +28,7 @@ mod limine;
 mod memory;
 mod modules;
 mod msi;
+mod pagebuf;
 mod net;
 mod ntfs;
 mod pci;
@@ -115,7 +117,7 @@ extern "C" fn kmain() -> ! {
         let f = unsafe { &**fbr.framebuffers };
         if f.bpp == 32 {
             let fb = unsafe { fb::Fb::new(f.address, f.width as usize, f.height as usize, f.pitch as usize) };
-            console::CONSOLE.lock().attach_framebuffer(fb);
+            console::CONSOLE.lock().attach_framebuffer(fb, false);
         }
     }
 
@@ -146,6 +148,9 @@ extern "C" fn kmain() -> ! {
             "       kernel image at phys {:#x} -> virt {:#x}\n", k.physical_base, k.virtual_base));
     }
     heap_self_test();
+    if let Some((w, h)) = display::adopt_gop() {
+        kok!("Display: console drawn off-screen and presented to the firmware framebuffer ({}x{})", w, h);
+    }
     let pages = security::protect_kernel_image();
     kok!("W^X: kernel code read-only, kernel data non-executable ({} pages)", pages);
 
@@ -199,6 +204,11 @@ extern "C" fn kmain() -> ! {
     match pci::init() {
         Ok(n) => kok!("PCIe: {} function(s) found through ECAM", n),
         Err(e) => kprintln!("[WARN] PCIe: {}", e),
+    }
+    match display::probe_virtio() {
+        Ok(Some((w, h))) => kok!("C++ virtio-gpu driver attached through DHI v{}: console on screen at {}x{}", dhi::ABI_VERSION, w, h),
+        Ok(None) => {}
+        Err(e) => kprintln!("[WARN] virtio-gpu: {}", e),
     }
     let nvme = block::probe_nvme();
     let sata = block::probe_ahci();
@@ -283,6 +293,11 @@ extern "C" fn kmain() -> ! {
     let firmware = modules::list().len() - modules::programs().count();
     kok!("{} user program(s) and {} firmware file(s) loaded by the bootloader", modules::programs().count(), firmware);
 
+    // Late, so it is still on screen at the prompt (a photo is the only
+    // way to read it on real hardware without a working keyboard).
+    display::report_gpus();
+    shell::print_usb();
+
     kprintln!();
     console::print_colored(console::GREEN, format_args!("AeroKernel is up."));
     kprintln!(" Starting aerosmss, the session manager. Type 'help' for commands.");
@@ -362,6 +377,7 @@ fn heap_self_test() {
 fn panic(info: &PanicInfo) -> ! {
     arch::disable_interrupts();
     unsafe { console::force_unlock() };
+    unsafe { display::force_console() };
     console::print_colored(console::RED, format_args!("\n*** AEROKERNEL PANIC ***\n{}\n", info));
     serial::write_str("\nSystem halted.\n");
     arch::halt_forever();

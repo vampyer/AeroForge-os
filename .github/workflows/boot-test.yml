@@ -22,6 +22,9 @@ jobs:
       - name: Build and boot in QEMU (UEFI, 4 CPUs, NVMe disk)
         run: TIMEOUT=300 ./tools/boot-test.sh
 
+      - name: Display test on virtio-gpu (no firmware framebuffer)
+        run: ./tools/display-test.sh
+
       - name: Upload ISO and serial log
         if: always()
         uses: actions/upload-artifact@v4
@@ -32,4 +35,6 @@ jobs:
             build/boot-test.log
             build/fakebt.log
             build/fakepad.log
+            build/display-test.log
+            build/*.ppm
           if-no-files-found: ignore

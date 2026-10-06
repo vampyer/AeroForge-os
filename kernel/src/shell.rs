@@ -71,6 +71,7 @@ impl Shell {
                 kprintln!("  run <prog>  start a user program ({})", program_list());
                 kprintln!("  ports       published IPC ports");
                 kprintln!("  lspci       PCIe devices");
+                kprintln!("  display     the screen: size, how it is driven, who has it");
                 kprintln!("  lsusb       USB controllers and devices");
                 kprintln!("  mouse       USB mouse pointer position and buttons");
                 kprintln!("  ifconfig    network cards, link and address");
@@ -128,6 +129,16 @@ impl Shell {
                     sched::IDLE_NUDGES.load(Ordering::Relaxed)
                 );
             }
+            "display" => match crate::display::info() {
+                Some(d) => {
+                    kprintln!("  {}x{} through the {}", d.width, d.height, d.kind);
+                    match d.owner {
+                        Some(pid) => kprintln!("  pid {} has the whole screen", pid),
+                        None => kprintln!("  showing the console"),
+                    }
+                }
+                None => kprintln!("  no display (serial console only)"),
+            },
             "wakeups" => {
                 // This shell sleeps meanwhile, so its CPU can go idle too.
                 let count = || -> alloc::vec::Vec<u64> {
@@ -162,25 +173,7 @@ impl Shell {
                         d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass, d.prog_if, d.kind());
                 }
             }
-            "lsusb" => {
-                let ctrls = usb::CONTROLLERS.lock();
-                if ctrls.is_empty() {
-                    kprintln!("  no USB controllers");
-                }
-                for c in ctrls.iter() {
-                    kprintln!("  xHCI controller {} at {}: {} device(s)", c.id, c.location, c.devices.len());
-                    for d in &c.devices {
-                        let at = if d.parent_slot == 0 {
-                            alloc::format!("port {}", d.port)
-                        } else {
-                            alloc::format!("hub {} port {}", d.parent_slot, d.port)
-                        };
-                        kprintln!("    {:<15} slot {:<2} {:04x}:{:04x}  {:<9} {:<13} {}",
-                            at, d.slot, d.vendor, d.product, usb::speed_name(d.speed), usb::class_name(d),
-                            dhi::c_field(&d.name));
-                    }
-                }
-            }
+            "lsusb" => print_usb(),
             "mouse" => {
                 use core::sync::atomic::Ordering::Relaxed;
                 let b = usb::MOUSE_BUTTONS.load(Relaxed);
@@ -497,4 +490,26 @@ fn program_list() -> String {
         s.push_str(&m.name);
     }
     s
+}
+
+/// Every USB controller and device (the `lsusb` command; also printed at
+/// the end of boot, for a photo on hardware where typing does not work).
+pub fn print_usb() {
+    let ctrls = usb::CONTROLLERS.lock();
+    if ctrls.is_empty() {
+        kprintln!("  no USB controllers");
+    }
+    for c in ctrls.iter() {
+        kprintln!("  xHCI controller {} at {}: {} device(s)", c.id, c.location, c.devices.len());
+        for d in &c.devices {
+            let at = if d.parent_slot == 0 {
+                alloc::format!("port {}", d.port)
+            } else {
+                alloc::format!("hub {} port {}", d.parent_slot, d.port)
+            };
+            kprintln!("    {:<15} slot {:<2} {:04x}:{:04x}  {:<9} {:<13} {}",
+                at, d.slot, d.vendor, d.product, usb::speed_name(d.speed), usb::class_name(d),
+                dhi::c_field(&d.name));
+        }
+    }
 }

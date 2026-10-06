@@ -27,12 +27,25 @@ struct Screen {
     rows: usize,
 }
 
+/// The last HISTORY characters written, with their colours, so a screen
+/// that appears later in boot (virtio-gpu, after PCI) can show them.
+const HISTORY: usize = 8192;
+
 pub struct Console {
     screen: Option<Screen>,
     fg: u32,
+    hist: [u8; HISTORY],
+    hist_fg: [u32; HISTORY],
+    hist_len: usize, // total written; the ring holds the last HISTORY
 }
 
-pub static CONSOLE: Mutex<Console> = Mutex::new(Console { screen: None, fg: WHITE });
+pub static CONSOLE: Mutex<Console> = Mutex::new(Console {
+    screen: None,
+    fg: WHITE,
+    hist: [0; HISTORY],
+    hist_fg: [0; HISTORY],
+    hist_len: 0,
+});
 
 impl Screen {
     fn newline(&mut self) {
@@ -77,11 +90,50 @@ impl Screen {
 }
 
 impl Console {
-    pub fn attach_framebuffer(&mut self, mut fb: Fb) {
+    /// Draws the desktop on `fb` and puts the console there. With `replay`,
+    /// the recent history is drawn again (for a screen found late in boot).
+    pub fn attach_framebuffer(&mut self, mut fb: Fb, replay: bool) {
         let layout = fb::draw_scene(&mut fb);
         let cols = layout.text_w / CELL_W;
         let rows = layout.text_h / CELL_H;
-        self.screen = Some(Screen { fb, layout, col: 0, row: 0, cols, rows });
+        let mut screen = Screen { fb, layout, col: 0, row: 0, cols, rows };
+        if replay {
+            let start = self.hist_len.saturating_sub(HISTORY);
+            for i in start..self.hist_len {
+                screen.put(self.hist[i % HISTORY], self.hist_fg[i % HISTORY]);
+            }
+        }
+        self.screen = Some(screen);
+        self.present();
+    }
+
+    /// Moves the console to another image of the same size (an off-screen
+    /// copy of the screen), returning the old one.
+    pub fn retarget(&mut self, fb: Fb) -> Option<Fb> {
+        let s = self.screen.as_mut()?;
+        Some(core::mem::replace(&mut s.fb, fb))
+    }
+
+    /// The image the console draws into, for the display layer.
+    pub fn image(&self) -> Option<&Fb> {
+        self.screen.as_ref().map(|s| &s.fb)
+    }
+
+    /// Hands what changed to the display layer.
+    fn present(&mut self) {
+        if let Some(s) = self.screen.as_mut() {
+            crate::display::present_console(&mut s.fb);
+        }
+    }
+
+    /// Marks the whole screen changed and shows it (after a program gave
+    /// the display back).
+    pub fn redraw(&mut self) {
+        if let Some(s) = self.screen.as_mut() {
+            let (w, h) = (s.fb.width, s.fb.height);
+            s.fb.mark(0, 0, w, h);
+        }
+        self.present();
     }
 
     pub fn set_color(&mut self, fg: u32) {
@@ -92,6 +144,7 @@ impl Console {
         if let Some(s) = self.screen.as_mut() {
             fb::draw_tray(&mut s.fb, &s.layout, text);
         }
+        self.present();
     }
 
     pub fn screen_size(&self) -> Option<(usize, usize)> {
@@ -102,11 +155,18 @@ impl Console {
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         serial::write_str(s);
+        for b in s.bytes() {
+            let i = self.hist_len % HISTORY;
+            self.hist[i] = b;
+            self.hist_fg[i] = self.fg;
+            self.hist_len += 1;
+        }
         if let Some(screen) = self.screen.as_mut() {
             for b in s.bytes() {
                 screen.put(b, self.fg);
             }
         }
+        self.present();
         Ok(())
     }
 }

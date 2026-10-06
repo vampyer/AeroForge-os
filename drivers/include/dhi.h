@@ -365,6 +365,37 @@ int32_t aero_hda_pending(int32_t ctrl);
 
 void aero_hda_stop(int32_t ctrl);
 
+/* ---- virtio-gpu driver (drivers/virtio_gpu), QEMU's paravirtual GPU ---- */
+
+/* Where a virtio 1.x PCI device's register regions are (physical
+ * addresses), found by the kernel from the device's PCI capabilities. */
+typedef struct dhi_virtio_pci {
+    uint64_t common;
+    uint64_t notify;
+    uint64_t isr;
+    uint64_t device;
+    uint32_t notify_mult;
+    uint32_t _pad;
+} dhi_virtio_pci;
+
+/* Resets the device and sets up its control queue (one device). Returns 0
+ * and the first scanout's preferred size, or a negative error. */
+int32_t aero_vgpu_init(const dhi_ops *ops, const dhi_virtio_pci *pci, uint32_t *width, uint32_t *height);
+
+/* Creates 2D resource `id` (B8G8R8X8, width x height) backed by `count`
+ * 4 KiB pages at the given physical addresses, in order (rows of
+ * width * 4 bytes, no padding). 0 = ok. */
+int32_t aero_vgpu_create(uint32_t id, uint32_t width, uint32_t height, const uint64_t *pages, uint32_t count);
+
+int32_t aero_vgpu_destroy(uint32_t id);
+
+/* Shows resource `id` on scanout 0. 0 = ok. */
+int32_t aero_vgpu_scanout(uint32_t id, uint32_t width, uint32_t height);
+
+/* The rectangle changed in the resource's memory: copy it to the device
+ * and update the screen. `stride` is the resource's row length in bytes. */
+int32_t aero_vgpu_flush(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t stride);
+
 #ifdef __cplusplus
 }
 #endif

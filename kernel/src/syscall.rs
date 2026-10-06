@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, arch, console, futex, gamepad, gdt, net, percpu, sched, security, sound, vfs, wait};
+use crate::{apic, arch, console, display, futex, gamepad, gdt, net, percpu, sched, security, sound, vfs, wait};
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -170,12 +170,24 @@ pub const SYS_EVENT_RESET: u64 = 43;
 pub const SYS_WAIT_ANY: u64 = 44;
 pub const SYS_PROCESS_HANDLE: u64 = 45;
 pub const SYS_PROCESS_KILL: u64 = 46;
+pub const SYS_DISPLAY_ACQUIRE: u64 = 47;
+pub const SYS_DISPLAY_PRESENT: u64 = 48;
+pub const SYS_DISPLAY_RELEASE: u64 = 49;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Largest file one SYS_FILE_WRITE can save.
 const MAX_FILE_WRITE: u64 = 8 * 1024 * 1024;
+
+fn display_error(e: display::Error) -> i64 {
+    match e {
+        display::Error::NoDisplay => E_NOTFOUND,
+        display::Error::Busy | display::Error::NotOwner => E_RIGHTS,
+        display::Error::Fault => E_FAULT,
+        display::Error::NoMemory => E_FULL,
+    }
+}
 
 const E_BADHANDLE: i64 = -1;
 const E_FAULT: i64 = -2;
@@ -672,6 +684,19 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             }
             Ok(0)
         }
+        SYS_DISPLAY_ACQUIRE => {
+            // The whole screen for this process; returns width << 32 | height.
+            display::acquire(proc_.pid).map(|(w, h)| (w as u64) << 32 | h as u64).map_err(display_error)
+        }
+        SYS_DISPLAY_PRESENT => {
+            // Image at a0 with rows of a1 pixels (0x00RRGGBB); a2 packs the
+            // rectangle to show: x | y << 16 | w << 32 | h << 48.
+            let field = |shift: u64| ((a2 >> shift) & 0xFFFF) as usize;
+            display::present(proc_.pid, a0, a1 as usize, (field(0), field(16), field(32), field(48)))
+                .map(|_| 0)
+                .map_err(display_error)
+        }
+        SYS_DISPLAY_RELEASE => Ok(display::release(proc_.pid) as u64),
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
         SYS_AUDIO_WRITE => {
             // Interleaved 48 kHz 16-bit stereo frames; returns how many were
