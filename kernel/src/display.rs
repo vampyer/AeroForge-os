@@ -520,10 +520,14 @@ pub fn probe_radeon() {
     let mut log = [(0u64, None::<u64>, 0u64); FLIPS as usize];
     for i in 0..FLIPS {
         let target = bufs[((i + 1) % 2) as usize].1;
-        // Start just after a frame begins, so a vblank flip has to wait.
+        // Start in the middle of a frame, so a vblank flip has to wait about
+        // half a frame. (The frame counter ticks at the start of the vertical
+        // blank, and a flip queued right then still lands in that blank.)
         let f = unsafe { dhi::aero_dcn_frame_count() };
         let t0 = apic::micros();
         while unsafe { dhi::aero_dcn_frame_count() } == f && apic::micros() - t0 < 100_000 {}
+        let t1 = apic::micros();
+        while apic::micros() - t1 < frame_us / 2 {}
         unsafe { dhi::aero_dcn_flip(target) };
         let waited_us = wait_flip(false);
         let now = unsafe { dhi::aero_dcn_scanout() };
@@ -557,6 +561,6 @@ pub fn probe_radeon() {
             }
         });
     } else {
-        crate::kprintln!("[WARN] Radeon page flips: {} of {} correct, {} waited for a vertical blank; page flips off", ok, FLIPS, waited);
+        crate::kprintln!("[WARN] Radeon page flips: {} of {} correct, {} waited for a vertical blank ({} Hz); page flips off", ok, FLIPS, waited, hz);
     }
 }
