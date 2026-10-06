@@ -399,7 +399,8 @@ display engine's address of the screen matches the CPU's, places a second screen
 first in graphics memory and flips between the two eight times. Only if every flip lands at a
 vertical blank do programs' full-screen frames go through the flips from then on: `display_present`
 draws into the buffer that is not on screen and returns once the display engine has switched to it,
-so frames never tear. The boot also prints each graphics device and the USB devices just before
+so frames never tear. Tested on a Minisforum UM590 (Vega 8, 4K screen at 30 Hz): 8 of 8 flips
+landed at a vertical blank. The boot also prints each graphics device and the USB devices just before
 the prompt, so a photo of the screen tells what was found on real hardware.
 
 | Area | Status |
