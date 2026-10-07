@@ -416,6 +416,15 @@ quick click between two reads is not lost) and the typed keys (`keys_read`, 51);
 owns the screen, keys go to it instead of the shell. The boot test drags the Notes window with
 QEMU's mouse, types into it and checks a screenshot.
 
+Since 0.39 the desktop has icons down the left (Computer, Notes, System; click to pick one,
+double-click to open it) and a Computer window that browses the disks: folders first, then files
+with their sizes, a Back button (or Backspace) to go up, page buttons for long folders and a status
+bar. Double-clicking a folder goes into it; double-clicking a text file opens it in Notes. The root
+folder also shows the other disks (`sata0p1`, `usb0p1` and so on) as folders. Double-clicking a
+title bar maximizes the window. A new system call, `dir_list` (53), gives programs a folder's
+entries (`aero::list_dir`). The boot test opens Computer from its icon, goes into `/docs` and opens
+the welcome file in Notes.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -444,7 +453,7 @@ QEMU's mouse, types into it and checks a screenshot.
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
 `thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
 `socket_recv`, `socket_listen`, `socket_accept`, `net_info`, `event_create`, `event_set`, `event_reset`,
-`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`.
+`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1

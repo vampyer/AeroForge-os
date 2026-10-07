@@ -176,12 +176,16 @@ pub const SYS_DISPLAY_RELEASE: u64 = 49;
 pub const SYS_POINTER: u64 = 50;
 pub const SYS_KEYS_READ: u64 = 51;
 pub const SYS_TIME: u64 = 52;
+pub const SYS_DIR_LIST: u64 = 53;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Largest file one SYS_FILE_WRITE can save.
 const MAX_FILE_WRITE: u64 = 8 * 1024 * 1024;
+
+/// Largest buffer one SYS_DIR_LIST fills.
+const MAX_DIR_LIST: u64 = 256 * 1024;
 
 fn display_error(e: display::Error) -> i64 {
     match e {
@@ -538,6 +542,28 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             let path = user_str(a0, a1)?;
             writable_by_programs(&path)?;
             vfs::remove(&path).map_err(fs_error).map(|_| 0)
+        }
+        SYS_DIR_LIST => {
+            // The entries of a directory into a user buffer, one record each:
+            // flags (1 = directory), size (8 bytes, little-endian), name length,
+            // name. Stops at the last record that fits; returns the bytes used.
+            let path = user_str(a0, a1)?;
+            let entries = vfs::list(&path).map_err(fs_error)?;
+            let cap = a3.min(MAX_DIR_LIST) as usize;
+            let mut out = Vec::new();
+            for e in entries {
+                let name = &e.name.as_bytes()[..e.name.len().min(255)];
+                if out.len() + 10 + name.len() > cap {
+                    break;
+                }
+                out.push(e.is_dir as u8);
+                out.extend_from_slice(&e.size.to_le_bytes());
+                out.push(name.len() as u8);
+                out.extend_from_slice(name);
+            }
+            check_writable(a2, out.len() as u64)?;
+            to_user(a2, &out)?;
+            Ok(out.len() as u64)
         }
         SYS_DIR_CREATE => {
             let path = user_str(a0, a1)?;
