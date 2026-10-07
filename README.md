@@ -428,6 +428,11 @@ the welcome file in Notes.
 Since 0.40 windows change size when dragged by an edge or a corner, with a double-headed arrow
 pointer over the edges; the boot test makes the Computer window narrower and taller by its corner.
 
+Since 0.41 windows snap like Windows 7's Aero Snap: drag one by its title bar against the top of the
+screen to fill it, or against the left or right side to fill that half (a glass outline shows where
+first). Dragging a snapped or maximized window away gives back its old size. The boot test snaps
+Welcome to the left half, checks a screenshot, and drags it back.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

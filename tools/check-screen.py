@@ -7,6 +7,7 @@ Usage: check-screen.py drawtest <ppm>   red, green, blue and white quarters
        check-screen.py desktop <ppm> x y cx cy  the desktop with its taskbar,
                                         the Notes window moved to x,y and the
                                         Computer window at cx,cy
+       check-screen.py snap <ppm>       a window snapped to the left half
 """
 import sys
 
@@ -74,6 +75,13 @@ def main():
         paper = at(cx + 380, cy + 200)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
             sys.exit(f'{path}: the Computer window was not resized ({cx + 380},{cy + 200} is {paper})')
+    elif mode == 'snap':
+        # Welcome's white client area fills the left half below its text;
+        # the right half still shows wallpaper below the other windows.
+        paper = at(w * 3 // 4, h - 150)
+        if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
+            sys.exit(f'{path}: no wallpaper at {w * 3 // 4},{h - 150} ({paper})')
+        want = {(w // 4, h // 2): (255, 255, 255), (20, h - 100): (255, 255, 255)}
     else:
         sys.exit(__doc__)
     bad = [f'{xy} is {at(*xy)}, expected {rgb}' for xy, rgb in want.items() if at(*xy) != rgb]

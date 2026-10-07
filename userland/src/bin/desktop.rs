@@ -9,7 +9,10 @@
 //! in, Back or Backspace to go up, a text file to open it in Notes).
 //! The mouse moves a pointer; a window comes to the front
 //! when clicked, moves when dragged by its title bar and changes size when
-//! dragged by an edge or corner; its caption
+//! dragged by an edge or corner. Dragged against the top of the screen it
+//! fills the screen, against the left or right side it fills that half
+//! (a glass outline shows where first); dragging it away again gives back
+//! its old size. Its caption
 //! buttons minimize, maximize and close it; taskbar buttons switch between
 //! windows. The Start menu lists the programs and has "Exit to console";
 //! Esc also gives the screen back to the shell. Keys typed while Notes is
@@ -379,6 +382,8 @@ struct Desktop {
     /// The window being resized, which edges move, and where it and the
     /// pointer were when the drag began.
     resize: Option<(usize, Edges, Rect, i32, i32)>,
+    /// Where the window being dragged will snap to if let go now.
+    snap: Option<Rect>,
     menu: bool,
     /// Windows hidden by "Show desktop", to bring back on the next click.
     peeked: Vec<Kind>,
@@ -946,6 +951,7 @@ impl Desktop {
         for win in self.windows.iter().filter(|w| w.shown()) {
             self.window(c, win, Some(win.kind) == top);
         }
+        self.snap_preview(c);
         self.taskbar_and_menu(c);
         self.cursor(c);
     }
@@ -1002,6 +1008,30 @@ impl Desktop {
         self.windows[at].minimized = false;
         let top = self.raise(at);
         self.window_area(top).union(&self.taskbar())
+    }
+
+    /// Where a window dragged with the pointer at (x, y) snaps to: the whole
+    /// work area at the top edge, the left or right half at the sides.
+    fn snap_target(&self, x: i32, y: i32) -> Option<Rect> {
+        let work_h = self.h - TASKBAR * self.ui;
+        if y <= 0 {
+            Some(Rect::new(0, 0, self.w, work_h))
+        } else if x <= 0 {
+            Some(Rect::new(0, 0, self.w / 2, work_h))
+        } else if x >= self.w - 1 {
+            Some(Rect::new(self.w - self.w / 2, 0, self.w / 2, work_h))
+        } else {
+            None
+        }
+    }
+
+    fn snap_preview(&self, c: &mut Canvas) {
+        if let Some(r) = self.snap {
+            let s = self.ui;
+            let r = Rect::new(r.x + 6 * s, r.y + 6 * s, r.w - 12 * s, r.h - 12 * s);
+            c.rounded(r, 6 * s, false, rgb(200, 230, 255), rgb(120, 180, 240), 80);
+            c.rounded_outline(r, 6 * s, false, 0xFFFFFF, 200);
+        }
     }
 
     fn maximize(&mut self, i: usize) {
@@ -1099,7 +1129,7 @@ impl Desktop {
                 self.drag = None;
                 self.maximize(i);
                 dirty = dirty.union(&self.window_area(i));
-            } else if y < r.y + self.title_h() && self.windows[i].restore.is_none() {
+            } else if y < r.y + self.title_h() {
                 self.drag = Some((i, x - r.x, y - r.y));
             } else if self.windows[i].kind == Kind::Computer && self.client(&r).contains(x, y) {
                 dirty = dirty.union(&self.files_click(x, y, double));
@@ -1338,6 +1368,7 @@ fn main() -> i64 {
         pointer,
         drag: None,
         resize: None,
+        snap: None,
         menu: false,
         peeked: Vec::new(),
         started_us,
@@ -1369,17 +1400,42 @@ fn main() -> i64 {
             for _ in 0..presses.min(3) {
                 dirty = dirty.union(&desk.click(p.x as i32, p.y as i32));
             }
-            if let Some((i, gx, gy)) = desk.drag {
-                if p.buttons & 1 != 0 {
+            if let Some((i, mut gx, gy)) = desk.drag {
+                let (px, py) = (p.x as i32, p.y as i32);
+                if p.buttons & 1 != 0 && (px, py) != (old.x as i32, old.y as i32) {
                     let before = desk.window_area(i);
+                    // A maximized or snapped window gets its old size back
+                    // once it is dragged, keeping the same part of the title
+                    // bar under the pointer.
+                    let win = &mut desk.windows[i];
+                    if let Some(old) = win.restore.take() {
+                        gx = gx * old.w / win.rect.w.max(1);
+                        win.rect.w = old.w;
+                        win.rect.h = old.h;
+                        desk.drag = Some((i, gx, gy));
+                    }
                     let r = &mut desk.windows[i].rect;
-                    r.x = (p.x as i32 - gx).clamp(-r.w + 60, w - 60);
-                    r.y = (p.y as i32 - gy).clamp(0, h - 80);
+                    r.x = (px - gx).clamp(-r.w + 60, w - 60);
+                    r.y = (py - gy).clamp(0, h - 80);
+                    let snap = desk.snap_target(px, py);
+                    for area in [desk.snap, snap].into_iter().flatten() {
+                        dirty = dirty.union(&area);
+                    }
+                    desk.snap = snap;
                     dirty = dirty.union(&before).union(&desk.window_area(i));
-                } else {
-                    let r = desk.windows[i].rect;
-                    println!("[desktop] moved {} to {},{}", desk.windows[i].title, r.x, r.y);
+                } else if p.buttons & 1 == 0 {
+                    let win = &mut desk.windows[i];
+                    match desk.snap.take() {
+                        Some(target) => {
+                            dirty = dirty.union(&target);
+                            win.restore = Some(win.rect);
+                            win.rect = target;
+                            println!("[desktop] snapped {} to {},{} {}x{}", win.title, target.x, target.y, target.w, target.h);
+                        }
+                        None => println!("[desktop] moved {} to {},{} ({}x{})", win.title, win.rect.x, win.rect.y, win.rect.w, win.rect.h),
+                    }
                     desk.drag = None;
+                    dirty = dirty.union(&desk.window_area(i));
                 }
             }
             if let Some((i, edges, start, x0, y0)) = desk.resize {
