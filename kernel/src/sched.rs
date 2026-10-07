@@ -747,6 +747,21 @@ impl Event {
         self.pending.swap(false, Ordering::SeqCst)
     }
 
+    /// For code that cannot sleep: spins until signalled or `us`
+    /// microseconds pass. True if it was signalled.
+    pub fn spin_wait(&self, us: u64) -> bool {
+        let start = crate::apic::micros();
+        loop {
+            if self.pending.swap(false, Ordering::SeqCst) {
+                return true;
+            }
+            if crate::apic::micros() - start >= us {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// Safe from interrupt handlers.
     pub fn signal(&self) {
         self.pending.store(true, Ordering::SeqCst);

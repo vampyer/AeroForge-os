@@ -42,8 +42,9 @@ typedef struct dhi_ops {
     void    (*delay_us)(uint32_t us);
     /* ABI 3: waits for interrupt `source` (handed to the driver by the kernel)
      * to fire, for at most about 10 ms; returns at once if it already fired
-     * since the last wait. Where the caller cannot sleep (early boot) it just
-     * pauses briefly. Drivers re-check their hardware after it returns. */
+     * since the last wait. Where the caller cannot sleep (early boot) it spins
+     * for the interrupt instead, for at most about 10 ms too. Drivers re-check
+     * their hardware after it returns. */
     void    (*irq_wait)(uint32_t source);
 } dhi_ops;
 
