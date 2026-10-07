@@ -37,6 +37,21 @@ pub struct KeyEvent {
     pub modifiers: u8,
 }
 
+/// DHI_MOD_CTRL: a Ctrl key is held.
+pub const MOD_CTRL: u8 = 0x02;
+
+impl KeyEvent {
+    /// The character this key press types: Ctrl with a letter gives its
+    /// control code (Ctrl+S is 0x13), as on a terminal. 0 for none.
+    pub fn typed(&self) -> u8 {
+        if self.modifiers & MOD_CTRL != 0 && self.ascii.is_ascii_alphabetic() {
+            self.ascii.to_ascii_lowercase() - b'a' + 1
+        } else {
+            self.ascii
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BlockInfo {

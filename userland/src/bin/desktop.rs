@@ -17,7 +17,8 @@
 //! buttons minimize, maximize and close it; taskbar buttons switch between
 //! windows. The Start menu lists the programs and has "Exit to console";
 //! Esc also gives the screen back to the shell. Keys typed while Notes is
-//! in front go into it.
+//! in front go into it; its Save button (or Ctrl+S) writes them back to the
+//! file it opened, or to /Notes.txt.
 //!
 //! Only the parts of the screen that changed are redrawn and presented.
 //! Lines starting "[desktop]" go to the serial log for the boot test.
@@ -643,6 +644,12 @@ struct Desktop {
     ui: i32,
     windows: Vec<Window>, // back to front
     notes: String,
+    /// The file Notes opened, where Save writes; None until one is opened.
+    notes_path: Option<String>,
+    /// What Notes says next to its Save button ("Saved", "Not saved", ...).
+    notes_status: String,
+    /// The file was too long to open whole, so Save is refused.
+    notes_cut: bool,
     pointer: Pointer,
     drag: Option<(usize, i32, i32)>, // window, grab offset
     /// The window being resized, which edges move, and where it and the
@@ -782,6 +789,14 @@ impl Desktop {
     fn files_toolbar(&self, client: &Rect) -> Rect {
         Rect::new(client.x, client.y, client.w, 36 * self.ui)
     }
+    fn notes_toolbar(&self, client: &Rect) -> Rect {
+        Rect::new(client.x, client.y, client.w, 32 * self.ui)
+    }
+    fn notes_save(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let t = self.notes_toolbar(client);
+        Rect::new(t.x + 6 * s, t.y + 4 * s, 64 * s, t.h - 8 * s)
+    }
     fn files_back(&self, client: &Rect) -> (i32, i32, i32) {
         let t = self.files_toolbar(client);
         (t.x + 18 * self.ui, t.y + t.h / 2, 12 * self.ui)
@@ -912,38 +927,70 @@ impl Desktop {
                 say(c, &format!("Pointer  {}, {}", p.x, p.y), 0x202020);
                 say(c, &format!("Clicks   {}", p.presses), 0x202020);
             }
-            Kind::Notes => {
-                let cols = ((client.w - 20 * s) / Font::Normal.w(s)).max(1) as usize;
-                let rows = ((client.h - 20 * s) / line).max(1) as usize;
-                let mut lines: Vec<String> = Vec::new();
-                // Word wrap: break at the last space that fits, or mid-word
-                // when a word is longer than the line.
-                for part in self.notes.split('\n') {
-                    let mut rest: Vec<char> = part.chars().collect();
-                    loop {
-                        if rest.len() <= cols {
-                            lines.push(rest.iter().collect());
-                            break;
-                        }
-                        let cut = rest[..=cols].iter().rposition(|&ch| ch == ' ').filter(|&i| i > 0).unwrap_or(cols);
-                        lines.push(rest[..cut].iter().collect());
-                        let skip = rest[cut..].iter().take_while(|&&ch| ch == ' ').count();
-                        rest.drain(..cut + skip);
-                    }
-                }
-                let caret = active && (aero::clock_us() / 500_000) % 2 == 0;
-                if let Some(last) = lines.last_mut() {
-                    if caret {
-                        last.push('_');
-                    }
-                }
-                let skip = lines.len().saturating_sub(rows);
-                for l in &lines[skip..] {
-                    say(c, l, 0x101010);
-                }
-            }
+            Kind::Notes => self.notes_view(c, &client, active),
             Kind::Computer => self.files_view(c, &client),
             Kind::Calculator => self.calc_view(c, &client),
+        }
+    }
+
+    fn notes_view(&self, c: &mut Canvas, client: &Rect, active: bool) {
+        let s = self.ui;
+        // Toolbar: Save, the file's name and whether it is saved.
+        let t = self.notes_toolbar(client);
+        c.gradient(t, rgb(245, 250, 255), rgb(215, 230, 245), 255);
+        c.fill(Rect::new(t.x, t.y + t.h - 1, t.w, 1), rgb(160, 180, 205));
+        let b = self.notes_save(client);
+        let hover = b.contains(self.pointer.x as i32, self.pointer.y as i32);
+        let (top, bottom) = if hover { (rgb(235, 248, 255), rgb(170, 215, 250)) } else { (rgb(252, 253, 255), rgb(215, 225, 240)) };
+        c.rounded(b, 3 * s, false, top, bottom, 255);
+        c.rounded_outline(b, 3 * s, false, rgb(120, 140, 170), 255);
+        let label = "Save";
+        c.text(b.x + (b.w - Font::Normal.width(s, label)) / 2, b.y + (b.h - Font::Normal.h(s)) / 2, label, 0x101010, Font::Normal);
+        let text_y = t.y + (t.h - Font::Normal.h(s)) / 2;
+        let status_w = Font::Normal.width(s, &self.notes_status);
+        let status_x = t.x + t.w - 8 * s - status_w;
+        c.text(status_x, text_y, &self.notes_status, rgb(70, 90, 120), Font::Normal);
+        let name = self.notes_path.as_deref().map(|p| p.rsplit('/').next().unwrap_or(p)).unwrap_or("New note");
+        let room = ((status_x - 12 * s - (b.x + b.w + 10 * s)) / Font::Normal.w(s)).max(0) as usize;
+        let shown: String = if name.chars().count() > room {
+            name.chars().take(room.saturating_sub(3)).chain("...".chars()).collect()
+        } else {
+            String::from(name)
+        };
+        c.text(b.x + b.w + 10 * s, text_y, &shown, 0x101010, Font::Normal);
+
+        // The text, word-wrapped, showing the end when it does not fit.
+        let line = Font::Normal.h(s) + 4 * s;
+        let area = Rect::new(client.x, t.y + t.h, client.w, client.h - t.h);
+        let cols = ((area.w - 20 * s) / Font::Normal.w(s)).max(1) as usize;
+        let rows = ((area.h - 16 * s) / line).max(1) as usize;
+        let mut lines: Vec<String> = Vec::new();
+        // Word wrap: break at the last space that fits, or mid-word
+        // when a word is longer than the line.
+        for part in self.notes.split('\n') {
+            let mut rest: Vec<char> = part.chars().collect();
+            loop {
+                if rest.len() <= cols {
+                    lines.push(rest.iter().collect());
+                    break;
+                }
+                let cut = rest[..=cols].iter().rposition(|&ch| ch == ' ').filter(|&i| i > 0).unwrap_or(cols);
+                lines.push(rest[..cut].iter().collect());
+                let skip = rest[cut..].iter().take_while(|&&ch| ch == ' ').count();
+                rest.drain(..cut + skip);
+            }
+        }
+        let caret = active && (aero::clock_us() / 500_000) % 2 == 0;
+        if let Some(last) = lines.last_mut() {
+            if caret {
+                last.push('_');
+            }
+        }
+        let skip = lines.len().saturating_sub(rows);
+        let mut y = area.y + 8 * s;
+        for l in &lines[skip..] {
+            c.text(area.x + 10 * s, y, l, 0x101010, Font::Normal);
+            y += line;
         }
     }
 
@@ -1307,6 +1354,11 @@ impl Desktop {
                 area = area.union(&client);
             }
         }
+        let at = self.index(Kind::Notes);
+        if self.windows[at].shown() {
+            let save = self.notes_save(&self.client(&self.windows[at].rect));
+            area = area.union(&save);
+        }
         if self.menu {
             area = area.union(&self.menu_rect());
         }
@@ -1451,6 +1503,8 @@ impl Desktop {
                 dirty = dirty.union(&self.window_area(i));
             } else if y < r.y + self.title_h() {
                 self.drag = Some((i, x - r.x, y - r.y));
+            } else if self.windows[i].kind == Kind::Notes && self.notes_save(&self.client(&r)).contains(x, y) {
+                dirty = dirty.union(&self.save_notes());
             } else if self.windows[i].kind == Kind::Computer && self.client(&r).contains(x, y) {
                 dirty = dirty.union(&self.files_click(x, y, double));
             } else if self.windows[i].kind == Kind::Calculator {
@@ -1545,6 +1599,36 @@ impl Desktop {
         self.files_area()
     }
 
+    /// Writes Notes to its file (or /Notes.txt), then reads it back to be
+    /// sure it reached the disk the way it was typed.
+    fn save_notes(&mut self) -> Rect {
+        if self.notes_cut {
+            self.notes_status = String::from("Too long to save");
+            return self.window_area(self.index(Kind::Notes));
+        }
+        let path = self.notes_path.clone().unwrap_or_else(|| String::from("/Notes.txt"));
+        let data = self.notes.as_bytes();
+        self.notes_status = match aero::write_file(&path, data) {
+            Ok(_) => {
+                let mut back = alloc::vec![0u8; data.len() + 1];
+                let same = matches!(aero::read_file(&path, &mut back), Ok(n) if &back[..n] == data);
+                println!("[desktop] saved {} ({} bytes, {})", path, data.len(), if same { "read back the same" } else { "read back different" });
+                self.notes_path = Some(path);
+                String::from(if same { "Saved" } else { "Saved, but it reads back different" })
+            }
+            Err(e) => {
+                println!("[desktop] cannot save {} ({})", path, e);
+                String::from(match e {
+                    aero::E_RIGHTS => "Can't save here (read-only)",
+                    aero::E_FULL => "Can't save: the disk is full",
+                    aero::E_NOTFOUND => "Can't save: no disk there",
+                    _ => "Can't save that file",
+                })
+            }
+        };
+        self.window_area(self.index(Kind::Notes))
+    }
+
     /// Opens a text file in Notes.
     fn open_file(&mut self, path: String) -> Rect {
         let mut buf = alloc::vec![0u8; 4096];
@@ -1562,10 +1646,14 @@ impl Desktop {
             return self.files_area();
         }
         self.notes = String::from_utf8_lossy(text).replace('\r', "").replace('\t', "    ");
+        // Only the start of a long file fits; saving that would cut the file.
+        self.notes_cut = n == buf.len() || self.notes.len() > 3000;
         while self.notes.len() > 3000 {
             self.notes.pop();
         }
         println!("[desktop] opened {} in Notes ({} bytes)", path, n);
+        self.notes_status = String::from(if self.notes_cut { "Too long to save" } else { "" });
+        self.notes_path = Some(path);
         self.files_area().union(&self.bring(Kind::Notes))
     }
 
@@ -1631,6 +1719,11 @@ impl Desktop {
                 continue;
             }
             match k {
+                0x13 => {
+                    // Ctrl+S
+                    dirty = dirty.union(&self.save_notes());
+                    continue;
+                }
                 8 => {
                     self.notes.pop();
                 }
@@ -1639,8 +1732,9 @@ impl Desktop {
                         self.notes.push(k as char);
                     }
                 }
-                _ => {}
+                _ => continue,
             }
+            self.notes_status = String::from("Not saved");
             dirty = dirty.union(&self.window_area(self.windows.len() - 1));
         }
         dirty
@@ -1716,6 +1810,9 @@ fn main() -> i64 {
         ui,
         windows,
         notes: String::new(),
+        notes_path: None,
+        notes_status: String::new(),
+        notes_cut: false,
         pointer,
         drag: None,
         resize: None,
