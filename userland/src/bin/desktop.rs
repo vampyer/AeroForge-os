@@ -332,7 +332,7 @@ impl Canvas {
         let c = Rect::new(cx - radius - 1, cy - radius - 1, 2 * radius + 3, 2 * radius + 3).intersect(&self.clip);
         // Everything in quarter pixels from the centre.
         let r4 = radius * 4;
-        let star: Vec<(i32, i32)> = STAR.iter().map(|&(x, y)| (x * r4 * 46 / 100 / 1000, y * r4 * 46 / 100 / 1000 + r4 / 30)).collect();
+        let star: Vec<(i32, i32)> = STAR.iter().map(|&(x, y)| (x * r4 * 52 / 100 / 1000, y * r4 * 52 / 100 / 1000 + r4 / 30)).collect();
         for y in c.y..c.y + c.h {
             for x in c.x..c.x + c.w {
                 let (mut sum, mut hits) = ([0u32; 3], 0u32);
@@ -345,7 +345,7 @@ impl Canvas {
                     hits += 1;
                     let base = if d2 > (r4 * 76 / 100).pow(2) {
                         rgb(205, 30, 40)
-                    } else if d2 > (r4 * 56 / 100).pow(2) {
+                    } else if d2 > (r4 * 58 / 100).pow(2) {
                         rgb(250, 250, 250)
                     } else if inside_polygon(&star, dx, dy) {
                         rgb(10, 10, 14)
@@ -998,7 +998,7 @@ impl Desktop {
     fn start_menu(&self, c: &mut Canvas) {
         let s = self.ui;
         let m = self.menu_rect();
-        c.rounded(m, 6 * s, false, rgb(60, 110, 170), rgb(10, 35, 70), 215);
+        c.rounded(m, 6 * s, false, rgb(60, 110, 170), rgb(10, 35, 70), 245);
         c.rounded_outline(m, 6 * s, false, rgb(160, 200, 240), 220);
         // Left: the programs on white.
         let l = self.menu_left();
