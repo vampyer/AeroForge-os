@@ -229,6 +229,17 @@ pub fn poll_thread(_: u64) {
                         let old = MOUSE_BUTTONS.swap(ev.buttons as u32, Ordering::Relaxed);
                         crate::input::buttons(old, ev.buttons as u32);
                     }
+                    dhi::INPUT_TABLET => {
+                        // The pointer goes exactly where the tablet (or the
+                        // host's own pointer, in a virtual machine) points.
+                        MOUSE_EVENTS.fetch_add(1, Ordering::Relaxed);
+                        let x = (ev.dx.max(0) as i64 * w as i64 / 32768) as i32;
+                        let y = (ev.dy.max(0) as i64 * h as i64 / 32768) as i32;
+                        MOUSE_X.store(x.clamp(0, w as i32 - 1), Ordering::Relaxed);
+                        MOUSE_Y.store(y.clamp(0, h as i32 - 1), Ordering::Relaxed);
+                        let old = MOUSE_BUTTONS.swap(ev.buttons as u32, Ordering::Relaxed);
+                        crate::input::buttons(old, ev.buttons as u32);
+                    }
                     _ => {}
                 }
             }

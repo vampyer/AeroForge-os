@@ -1829,13 +1829,25 @@ impl Damage {
 }
 
 fn present(screen: &Screen, canvas: &mut Canvas, desk: &Desktop, area: Rect) {
+    let area = draw(canvas, desk, area);
+    show(screen, canvas, area);
+}
+
+/// Redraws `area` of the frame; returns the part that is on screen.
+fn draw(canvas: &mut Canvas, desk: &Desktop, area: Rect) -> Rect {
     let area = area.intersect(&Rect::new(0, 0, canvas.w, canvas.h));
-    if area.is_empty() {
-        return;
+    if !area.is_empty() {
+        canvas.clip = area;
+        desk.draw(canvas);
     }
-    canvas.clip = area;
-    desk.draw(canvas);
-    let _ = screen.present(&canvas.px, canvas.w as usize, area.x as usize, area.y as usize, area.w as usize, area.h as usize);
+    area
+}
+
+/// Puts `area` of the frame on the screen.
+fn show(screen: &Screen, canvas: &Canvas, area: Rect) {
+    if !area.is_empty() {
+        let _ = screen.present(&canvas.px, canvas.w as usize, area.x as usize, area.y as usize, area.w as usize, area.h as usize);
+    }
 }
 
 /// Where the desktop keeps its settings, on the first disk.
@@ -2062,9 +2074,13 @@ fn main() -> i64 {
         let moved = !spots.rects.is_empty() && dirty.is_empty();
         spots.add(dirty);
         let t0 = aero::clock_us();
+        // Draw each piece, then hand the screen one rectangle covering them
+        // all: one present per frame, however many pieces changed.
+        let mut shown = Rect::EMPTY;
         for area in spots.rects {
-            present(&screen, &mut canvas, &desk, area);
+            shown = shown.union(&draw(&mut canvas, &desk, area));
         }
+        show(&screen, &canvas, shown);
         if moved && desk.drag.is_none() && desk.resize.is_none() {
             let took = aero::clock_us() - t0;
             moves += 1;

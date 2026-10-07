@@ -135,6 +135,7 @@ int32_t aero_ahci_flush(int32_t disk);
 
 #define DHI_INPUT_KEY   1u
 #define DHI_INPUT_MOUSE 2u
+#define DHI_INPUT_TABLET 3u  /* absolute pointer: dx, dy hold X and Y scaled to 0..32767 */
 
 /* One input event from a USB HID device. For keys, key.scancode holds the
  * HID usage id (keyboard page), not a PS/2 scancode. */
