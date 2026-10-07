@@ -66,6 +66,7 @@ pub mod sys {
     pub const KEYS_READ: u64 = 51;
     pub const TIME: u64 = 52;
     pub const DIR_LIST: u64 = 53;
+    pub const MOUSE_SPEED: u64 = 54;
 }
 
 pub mod rights {
@@ -196,6 +197,12 @@ pub struct DirEntry {
     pub name: alloc::string::String,
     pub is_dir: bool,
     pub size: u64,
+}
+
+/// The mouse pointer speed, 1 (slowest) to 10; 5 moves one pixel per
+/// mouse count. `set` = Some(n) changes it first.
+pub fn mouse_speed(set: Option<u64>) -> Result<u64, i64> {
+    check(unsafe { syscall(sys::MOUSE_SPEED, set.unwrap_or(0), 0, 0, 0) })
 }
 
 /// The files and directories in `path` ("/" lists the other disks too, as

@@ -673,6 +673,8 @@ struct Desktop {
     calc: Calc,
     /// The selected desktop icon.
     icon: Option<usize>,
+    /// Pointer speed, 1 to 10 (see aero::mouse_speed).
+    mouse_speed: u64,
     /// When and where the last press was, for double-clicks.
     last_press: (u64, i32, i32),
 }
@@ -732,6 +734,15 @@ impl Desktop {
         let l = self.menu_left();
         let s = self.ui;
         Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * 40 * s, l.w - 8 * s, 36 * s)
+    }
+    /// The Start menu's mouse speed buttons: slower (-) and faster (+), with
+    /// ten bars between them.
+    fn speed_button(&self, faster: bool) -> Rect {
+        let l = self.menu_left();
+        let m = self.menu_rect();
+        let s = self.ui;
+        let rx = l.x + l.w + 14 * s;
+        Rect::new(rx + if faster { 152 * s } else { 0 }, m.y + 160 * s, 30 * s, 30 * s)
     }
     fn exit_button(&self) -> Rect {
         let m = self.menu_rect();
@@ -1269,6 +1280,32 @@ impl Desktop {
         c.text(rx, m.y + 16 * s, &self.clock.0, 0xFFFFFF, Font::Large);
         c.text(rx, m.y + 56 * s, &self.clock.1, rgb(210, 230, 250), Font::Normal);
         c.text(rx, m.y + 84 * s, "AeroForge", rgb(210, 230, 250), Font::Normal);
+        // Mouse speed: - and + buttons with ten bars between them.
+        c.text(rx, m.y + 128 * s, &format!("Mouse speed {}", self.mouse_speed), 0xFFFFFF, Font::Normal);
+        for faster in [false, true] {
+            let b = self.speed_button(faster);
+            let live = if faster { self.mouse_speed < 10 } else { self.mouse_speed > 1 };
+            let hover = live && b.contains(self.pointer.x as i32, self.pointer.y as i32);
+            let (top, bottom) = match (live, hover) {
+                (false, _) => (rgb(150, 160, 175), rgb(110, 120, 135)),
+                (true, false) => (rgb(250, 252, 255), rgb(200, 220, 240)),
+                (true, true) => (rgb(235, 248, 255), rgb(150, 205, 250)),
+            };
+            c.rounded(b, 3 * s, false, top, bottom, 250);
+            c.rounded_outline(b, 3 * s, false, rgb(40, 60, 90), 255);
+            let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
+            c.fill(Rect::new(cx - 7 * s, cy - s, 14 * s, 2 * s), rgb(20, 40, 80));
+            if faster {
+                c.fill(Rect::new(cx - s, cy - 7 * s, 2 * s, 14 * s), rgb(20, 40, 80));
+            }
+        }
+        let b = self.speed_button(false);
+        for i in 0..10 {
+            let bar_h = (6 + 2 * i) * s;
+            let bar = Rect::new(b.x + b.w + 6 * s + i * 11 * s, b.y + b.h - bar_h, 8 * s, bar_h);
+            let on = (i as u64) < self.mouse_speed;
+            c.fill(bar, if on { rgb(120, 210, 255) } else { rgb(70, 90, 120) });
+        }
         let e = self.exit_button();
         let hover = e.contains(self.pointer.x as i32, self.pointer.y as i32);
         c.rounded(e, 3 * s, false, if hover { rgb(250, 180, 150) } else { rgb(230, 150, 120) }, rgb(170, 50, 25), 240);
@@ -1345,6 +1382,8 @@ impl Desktop {
         if self.menu {
             spots.extend((0..KINDS.len()).map(|i| self.menu_item(i)));
             spots.push(self.exit_button());
+            spots.push(self.speed_button(false));
+            spots.push(self.speed_button(true));
         }
         let (bx, by, br) = self.start_button();
         spots.push(Rect::new(bx - br - 2 * s, by - br - 2 * s, 2 * br + 4 * s, 2 * br + 4 * s));
@@ -1451,6 +1490,13 @@ impl Desktop {
                 self.quit = true;
                 return dirty;
             }
+            for faster in [false, true] {
+                if self.speed_button(faster).contains(x, y) {
+                    let want = if faster { self.mouse_speed + 1 } else { self.mouse_speed - 1 }.clamp(1, 10);
+                    self.set_mouse_speed(want);
+                    return dirty.union(&self.menu_rect());
+                }
+            }
             if self.menu_rect().contains(x, y) {
                 // A click on the menu's empty parts keeps it open.
                 self.menu = true;
@@ -1547,6 +1593,15 @@ impl Desktop {
             dirty = dirty.union(&self.open(ICONS[i]));
         }
         dirty
+    }
+
+    /// Changes the pointer speed and keeps it in /AeroForge.ini for next time.
+    fn set_mouse_speed(&mut self, speed: u64) {
+        if let Ok(now) = aero::mouse_speed(Some(speed)) {
+            self.mouse_speed = now;
+        }
+        let saved = aero::write_file(SETTINGS, format!("mouse speed = {}\n", self.mouse_speed).as_bytes()).is_ok();
+        println!("[desktop] mouse speed {}{}", self.mouse_speed, if saved { ", saved" } else { "" });
     }
 
     fn calc_key_pressed(&mut self, key: u8) {
@@ -1783,6 +1838,27 @@ fn present(screen: &Screen, canvas: &mut Canvas, desk: &Desktop, area: Rect) {
     let _ = screen.present(&canvas.px, canvas.w as usize, area.x as usize, area.y as usize, area.w as usize, area.h as usize);
 }
 
+/// Where the desktop keeps its settings, on the first disk.
+const SETTINGS: &str = "/AeroForge.ini";
+
+/// The pointer speed saved in the settings file, applied; or the current one.
+fn saved_mouse_speed() -> u64 {
+    let mut buf = [0u8; 256];
+    if let Ok(n) = aero::read_file(SETTINGS, &mut buf) {
+        let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+        for line in text.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "mouse speed" {
+                    if let Ok(speed @ 1..=10) = value.trim().parse::<u64>() {
+                        let _ = aero::mouse_speed(Some(speed));
+                    }
+                }
+            }
+        }
+    }
+    aero::mouse_speed(None).unwrap_or(5)
+}
+
 /// A file size the way Explorer shows it: whole kilobytes, rounded up.
 fn size_text(bytes: u64) -> String {
     if bytes >= 10 * 1024 * 1024 * 1024 {
@@ -1857,6 +1933,7 @@ fn main() -> i64 {
         files: Files { path: String::from("/"), entries: Vec::new(), scroll: 0, selected: None, status: String::new() },
         calc: Calc { display: String::from("0"), ..Default::default() },
         icon: None,
+        mouse_speed: saved_mouse_speed(),
         last_press: (0, 0, 0),
     };
     let mut canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
@@ -1999,6 +2076,7 @@ fn main() -> i64 {
     if moves > 0 {
         println!("[desktop] pointer moves: {}, redraw took {} us on average, {} us at most", moves, move_us / moves, worst_us);
     }
+    println!("[desktop] pointer ended at {},{}", desk.pointer.x, desk.pointer.y);
     println!("[desktop] notes: {}", desk.notes.replace('\n', " / "));
     println!("[desktop] closed, screen given back to the console");
     drop(screen);

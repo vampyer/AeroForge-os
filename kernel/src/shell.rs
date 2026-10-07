@@ -74,6 +74,7 @@ impl Shell {
                 kprintln!("  display     the screen: size, how it is driven, who has it");
                 kprintln!("  lsusb       USB controllers and devices");
                 kprintln!("  mouse       USB mouse pointer position and buttons");
+                kprintln!("  mouse speed <1-10>  pointer speed (5 = one pixel per count, default {})", usb::DEFAULT_MOUSE_SPEED);
                 kprintln!("  ifconfig    network cards, link and address");
                 kprintln!("  ping <ip>   send 4 ICMP echo requests");
                 kprintln!("  bt          Bluetooth adapters");
@@ -177,6 +178,16 @@ impl Shell {
                 }
             }
             "lsusb" => print_usb(),
+            "mouse" if arg.starts_with("speed") => {
+                use core::sync::atomic::Ordering::Relaxed;
+                match arg.trim_start_matches("speed").trim().parse::<u32>() {
+                    Ok(n @ 1..=10) => {
+                        usb::MOUSE_SPEED.store(n, Relaxed);
+                        kprintln!("  pointer speed {} of 10", n);
+                    }
+                    _ => kprintln!("  pointer speed {} of 10 (set with: mouse speed 1-10)", usb::MOUSE_SPEED.load(Relaxed)),
+                }
+            }
             "mouse" => {
                 use core::sync::atomic::Ordering::Relaxed;
                 let b = usb::MOUSE_BUTTONS.load(Relaxed);

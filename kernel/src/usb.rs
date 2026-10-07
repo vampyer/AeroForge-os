@@ -41,6 +41,27 @@ pub fn interrupts_on() -> bool {
 pub static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 pub static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
 pub static MOUSE_BUTTONS: AtomicU32 = AtomicU32::new(0);
+/// Pointer speed, 1 (slowest) to 10; 5 moves one pixel per mouse count.
+pub static MOUSE_SPEED: AtomicU32 = AtomicU32::new(DEFAULT_MOUSE_SPEED);
+pub const DEFAULT_MOUSE_SPEED: u32 = 7;
+
+/// How far the pointer moves for a mouse report of (dx, dy) at the current
+/// speed, in eighths of a pixel per count. Above speed 5, quick movements
+/// go half as far again, like Windows' "enhance pointer precision", so the
+/// pointer crosses the screen fast but still lands precisely.
+fn pointer_step(dx: i32, dy: i32, rest: &mut (i32, i32)) -> (i32, i32) {
+    const EIGHTHS: [i32; 10] = [2, 3, 4, 6, 8, 10, 12, 14, 16, 20];
+    let speed = MOUSE_SPEED.load(Ordering::Relaxed).clamp(1, 10);
+    let mut k = EIGHTHS[speed as usize - 1];
+    if speed > 5 && dx.abs() + dy.abs() > 8 {
+        k = k * 3 / 2;
+    }
+    // Keep the fractions so slow movements are not lost.
+    let (fx, fy) = (dx * k + rest.0, dy * k + rest.1);
+    let (sx, sy) = (fx.div_euclid(8), fy.div_euclid(8));
+    *rest = (fx.rem_euclid(8), fy.rem_euclid(8));
+    (sx, sy)
+}
 pub static MOUSE_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 
@@ -186,6 +207,7 @@ pub fn poll_thread(_: u64) {
         }
     }
     let with_irq = interrupts_on();
+    let mut rest = (0, 0);
     loop {
         for (k, &id) in ids.iter().enumerate() {
             let n = unsafe { dhi::aero_xhci_poll(id, events.as_mut_ptr(), events.len() as i32) };
@@ -199,8 +221,9 @@ pub fn poll_thread(_: u64) {
                     }
                     dhi::INPUT_MOUSE => {
                         MOUSE_EVENTS.fetch_add(1, Ordering::Relaxed);
-                        let x = (MOUSE_X.load(Ordering::Relaxed) + ev.dx as i32).clamp(0, w as i32 - 1);
-                        let y = (MOUSE_Y.load(Ordering::Relaxed) + ev.dy as i32).clamp(0, h as i32 - 1);
+                        let (sx, sy) = pointer_step(ev.dx as i32, ev.dy as i32, &mut rest);
+                        let x = (MOUSE_X.load(Ordering::Relaxed) + sx).clamp(0, w as i32 - 1);
+                        let y = (MOUSE_Y.load(Ordering::Relaxed) + sy).clamp(0, h as i32 - 1);
                         MOUSE_X.store(x, Ordering::Relaxed);
                         MOUSE_Y.store(y, Ordering::Relaxed);
                         let old = MOUSE_BUTTONS.swap(ev.buttons as u32, Ordering::Relaxed);

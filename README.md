@@ -449,6 +449,13 @@ Since 0.46 moving the pointer redraws only the pointer and the one button, row, 
 lights up, each as its own small rectangle, instead of one rectangle joining them (which could span
 whole windows). Under QEMU without KVM that took a pointer move from about 100 ms to about 2 ms; the
 desktop logs the average at exit and the boot test wants it under 30 ms.
+Since 0.47 the pointer has a speed, 1 to 10 (system call 54, `mouse_speed`). Speed 5 moves one pixel
+per mouse count; the default is 7 (1.5 pixels per count). Above 5, quick movements go half as far
+again, so the pointer crosses the screen fast and still lands precisely. The Start menu has Mouse
+speed - and + buttons, and the desktop saves the choice as `mouse speed = N` in `/AeroForge.ini` and
+applies it when it starts. The shell has `mouse speed <1-10>`; the boot test uses speed 5 so its
+pointer moves are exact, then raises it to 6 from the Start menu and checks the saved file and how far
+a quick move goes.
 
 | Area | Status |
 |---|---|
@@ -478,7 +485,7 @@ desktop logs the average at exit and the boot test wants it under 30 ms.
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
 `thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
 `socket_recv`, `socket_listen`, `socket_accept`, `net_info`, `event_create`, `event_set`, `event_reset`,
-`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`.
+`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1

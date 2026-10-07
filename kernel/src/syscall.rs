@@ -177,6 +177,7 @@ pub const SYS_POINTER: u64 = 50;
 pub const SYS_KEYS_READ: u64 = 51;
 pub const SYS_TIME: u64 = 52;
 pub const SYS_DIR_LIST: u64 = 53;
+pub const SYS_MOUSE_SPEED: u64 = 54;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -728,6 +729,19 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         SYS_DISPLAY_RELEASE => Ok(display::release(proc_.pid) as u64),
         // The mouse pointer for the screen's owner: x | y << 16 | buttons << 32 | left presses << 40.
         SYS_POINTER => input::pointer(proc_.pid).ok_or(E_RIGHTS),
+        SYS_MOUSE_SPEED => {
+            // Pointer speed 1-10: a0 = 0 reads it, 1-10 sets it; returns the speed.
+            use core::sync::atomic::Ordering::Relaxed;
+            match a0 {
+                0 => {}
+                1..=10 => {
+                    crate::usb::MOUSE_SPEED.store(a0 as u32, Relaxed);
+                    crate::kprintln!("mouse: pointer speed {} of 10", a0);
+                }
+                _ => return Err(E_INVAL),
+            }
+            Ok(crate::usb::MOUSE_SPEED.load(Relaxed) as u64)
+        }
         SYS_TIME => {
             // Wall clock (local time, from the CMOS clock):
             // year << 40 | month << 32 | day << 24 | hour << 16 | minute << 8 | second.
