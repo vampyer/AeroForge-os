@@ -193,8 +193,8 @@ pub fn poll_thread(_: u64) {
                 match ev.kind {
                     dhi::INPUT_KEY => {
                         KEY_EVENTS.fetch_add(1, Ordering::Relaxed);
-                        if ev.key.pressed == 1 && ev.key.ascii != 0 {
-                            interrupts::push_key(ev.key.ascii);
+                        if ev.key.pressed == 1 && ev.key.typed() != 0 {
+                            interrupts::push_key(ev.key.typed());
                         }
                     }
                     dhi::INPUT_MOUSE => {

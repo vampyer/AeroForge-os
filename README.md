@@ -439,6 +439,10 @@ text is Noto Sans Mono (SIL Open Font License, pre-rendered with smooth edges by
 and bigger. Since 0.43 there is a Calculator (desktop icon and Start menu): click its keys or type
 digits, `+ - * / .`, `=` or Enter, Backspace and C; the number pad works too. The boot test types
 `12+30*2`, clicks `=` and checks for 84.
+Since 0.44 Notes has a Save button (Ctrl+S works too) that writes the text back to the file it
+opened from Computer, or to `/Notes.txt` for a new note, then reads it back to check it. Ctrl with a
+letter now reaches programs as its control code (Ctrl+S is 0x13) from both PS/2 and USB keyboards.
+The boot test saves the opened welcome file with Ctrl+S and checks the NVMe disk image with mtools.
 
 | Area | Status |
 |---|---|
