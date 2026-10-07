@@ -65,6 +65,7 @@ pub mod sys {
     pub const POINTER: u64 = 50;
     pub const KEYS_READ: u64 = 51;
     pub const TIME: u64 = 52;
+    pub const DIR_LIST: u64 = 53;
 }
 
 pub mod rights {
@@ -187,6 +188,37 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<usize, i64> {
 /// Deletes a file or an empty directory.
 pub fn delete_file(path: &str) -> Result<(), i64> {
     check(unsafe { syscall(sys::FILE_DELETE, path.as_ptr() as u64, path.len() as u64, 0, 0) }).map(|_| ())
+}
+
+/// One entry of a directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: alloc::string::String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// The files and directories in `path` ("/" lists the other disks too, as
+/// directories). Very large directories are cut off at about 256 KiB of names.
+pub fn list_dir(path: &str) -> Result<alloc::vec::Vec<DirEntry>, i64> {
+    let mut buf = alloc::vec![0u8; 256 * 1024];
+    let n = check(unsafe {
+        syscall(sys::DIR_LIST, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    })? as usize;
+    let mut out = alloc::vec::Vec::new();
+    let mut at = 0;
+    while at + 10 <= n {
+        let size = u64::from_le_bytes(buf[at + 1..at + 9].try_into().unwrap());
+        let len = buf[at + 9] as usize;
+        let name = &buf[at + 10..(at + 10 + len).min(n)];
+        out.push(DirEntry {
+            name: alloc::string::String::from_utf8_lossy(name).into_owned(),
+            is_dir: buf[at] & 1 != 0,
+            size,
+        });
+        at += 10 + len;
+    }
+    Ok(out)
 }
 
 /// Creates a directory.

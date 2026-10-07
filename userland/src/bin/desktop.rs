@@ -1,10 +1,13 @@
 //! desktop: a first desktop in the style of Windows 7 (all artwork drawn
 //! here, nothing copied), drawn in software.
 //!
-//! It takes the whole screen and draws a blue wallpaper, a dark glass
+//! It takes the whole screen and draws a blue wallpaper with icons down the
+//! left (Computer, Notes, System: double-click to open), a dark glass
 //! taskbar (Start orb, window buttons, a clock with the date and a "show
-//! desktop" strip at the right) and three glass-framed windows: Welcome,
-//! System and Notes. The mouse moves a pointer; a window comes to the front
+//! desktop" strip at the right) and glass-framed windows: Welcome, System,
+//! Notes and Computer, which browses the disks (double-click a folder to go
+//! in, Back or Backspace to go up, a text file to open it in Notes).
+//! The mouse moves a pointer; a window comes to the front
 //! when clicked and moves when dragged by its title bar; its caption
 //! buttons minimize, maximize and close it; taskbar buttons switch between
 //! windows. The Start menu lists the programs and has "Exit to console";
@@ -242,6 +245,50 @@ impl Canvas {
     }
 }
 
+impl Canvas {
+    /// A small yellow folder, 16 x 12 at scale 1.
+    fn folder(&mut self, x: i32, y: i32, s: i32) {
+        self.fill(Rect::new(x, y, 7 * s, 3 * s), rgb(220, 170, 50));
+        self.gradient(Rect::new(x, y + 2 * s, 16 * s, 10 * s), rgb(255, 225, 120), rgb(230, 175, 50), 255);
+        self.frame(Rect::new(x, y + 2 * s, 16 * s, 10 * s), rgb(180, 130, 30));
+    }
+
+    /// A small sheet of paper with a folded corner, 12 x 14 at scale 1.
+    fn page(&mut self, x: i32, y: i32, s: i32) {
+        self.fill(Rect::new(x, y, 12 * s, 14 * s), 0xFFFFFF);
+        self.frame(Rect::new(x, y, 12 * s, 14 * s), rgb(120, 130, 150));
+        self.fill(Rect::new(x + 8 * s, y, 4 * s, 4 * s), rgb(210, 220, 235));
+        for i in 0..3 {
+            self.fill(Rect::new(x + 2 * s, y + (6 + 2 * i) * s, 8 * s, s), rgb(150, 170, 200));
+        }
+    }
+
+    /// The Computer icon: a flat screen on a stand, 40 x 36 at scale 1.
+    fn computer(&mut self, x: i32, y: i32, s: i32) {
+        let body = Rect::new(x, y, 40 * s, 28 * s);
+        self.rounded(body, 2 * s, false, rgb(70, 75, 85), rgb(20, 22, 28), 255);
+        let glass = Rect::new(x + 3 * s, y + 3 * s, 34 * s, 21 * s);
+        self.gradient(glass, rgb(120, 200, 250), rgb(20, 80, 170), 255);
+        self.shade(Rect::new(glass.x, glass.y, glass.w, glass.h / 2), 0xFFFFFF, 50);
+        self.fill(Rect::new(x + 17 * s, y + 28 * s, 6 * s, 4 * s), rgb(60, 60, 70));
+        self.rounded(Rect::new(x + 10 * s, y + 32 * s, 20 * s, 4 * s), 2 * s, false, rgb(110, 110, 120), rgb(40, 40, 50), 255);
+    }
+
+    /// The Notes icon: a spiral notepad, 28 x 36 at scale 1.
+    fn notepad(&mut self, x: i32, y: i32, s: i32) {
+        let pad = Rect::new(x, y + 3 * s, 28 * s, 33 * s);
+        self.fill(pad, 0xFFFFFF);
+        self.frame(pad, rgb(110, 120, 140));
+        self.fill(Rect::new(x, y + 3 * s, 28 * s, 6 * s), rgb(80, 140, 210));
+        for i in 0..5 {
+            self.fill(Rect::new(x + 3 * s + i * 5 * s, y, 2 * s, 7 * s), rgb(90, 90, 100));
+        }
+        for i in 0..6 {
+            self.fill(Rect::new(x + 4 * s, y + (13 + 4 * i) * s, 20 * s, s), rgb(150, 180, 220));
+        }
+    }
+}
+
 // ------------------------------------------------------------------ desktop
 
 const ARROW: [&str; 19] = [
@@ -260,9 +307,26 @@ enum Kind {
     Welcome,
     System,
     Notes,
+    Computer,
 }
 
-const KINDS: [Kind; 3] = [Kind::Welcome, Kind::System, Kind::Notes];
+const KINDS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::System, Kind::Welcome];
+
+/// Desktop icons, top to bottom.
+const ICONS: [Kind; 3] = [Kind::Computer, Kind::Notes, Kind::System];
+
+/// Two presses closer together than this are a double-click.
+const DOUBLE_CLICK_US: u64 = 500_000;
+
+/// What the Computer window shows.
+struct Files {
+    path: String,
+    entries: Vec<aero::DirEntry>,
+    /// The first entry shown.
+    scroll: usize,
+    selected: Option<usize>,
+    status: String,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Caption {
@@ -302,6 +366,11 @@ struct Desktop {
     started_us: u64,
     clock: (String, String),
     quit: bool,
+    files: Files,
+    /// The selected desktop icon.
+    icon: Option<usize>,
+    /// When and where the last press was, for double-clicks.
+    last_press: (u64, i32, i32),
 }
 
 impl Desktop {
@@ -343,12 +412,12 @@ impl Desktop {
     fn task_button(&self, i: usize) -> Rect {
         let t = self.taskbar();
         let s = self.ui;
-        Rect::new(t.x + 58 * s + i as i32 * 164 * s, t.y + 3 * s, 160 * s, t.h - 6 * s)
+        Rect::new(t.x + 58 * s + i as i32 * 154 * s, t.y + 3 * s, 150 * s, t.h - 6 * s)
     }
     fn menu_rect(&self) -> Rect {
         let s = self.ui;
         let t = self.taskbar();
-        Rect::new(2 * s, t.y - 330 * s, 400 * s, 330 * s)
+        Rect::new(2 * s, t.y - 360 * s, 400 * s, 360 * s)
     }
     fn menu_left(&self) -> Rect {
         let m = self.menu_rect();
@@ -367,6 +436,47 @@ impl Desktop {
     }
     fn cursor_rect(&self) -> Rect {
         Rect::new(self.pointer.x as i32, self.pointer.y as i32, 12 * self.ui, 19 * self.ui)
+    }
+    fn icon_rect(&self, i: usize) -> Rect {
+        let s = self.ui;
+        Rect::new(8 * s, 10 * s + i as i32 * 88 * s, 76 * s, 80 * s)
+    }
+
+    // The Computer window, inside its client area: a toolbar (Back, the
+    // address, page up and down), column headings, the rows and a status bar.
+    fn files_toolbar(&self, client: &Rect) -> Rect {
+        Rect::new(client.x, client.y, client.w, 30 * self.ui)
+    }
+    fn files_back(&self, client: &Rect) -> (i32, i32, i32) {
+        let t = self.files_toolbar(client);
+        (t.x + 17 * self.ui, t.y + t.h / 2, 11 * self.ui)
+    }
+    fn files_page(&self, client: &Rect, down: bool) -> Rect {
+        let s = self.ui;
+        let t = self.files_toolbar(client);
+        let x = t.x + t.w - if down { 30 * s } else { 58 * s };
+        Rect::new(x, t.y + 5 * s, 26 * s, t.h - 10 * s)
+    }
+    fn files_address(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let t = self.files_toolbar(client);
+        Rect::new(t.x + 34 * s, t.y + 5 * s, t.w - 34 * s - 64 * s, t.h - 10 * s)
+    }
+    fn files_rows(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let top = client.y + 30 * s + 20 * s;
+        Rect::new(client.x, top, client.w, client.y + client.h - 22 * s - top)
+    }
+    fn files_row_h(&self) -> i32 {
+        18 * self.ui
+    }
+    fn files_visible(&self, client: &Rect) -> usize {
+        (self.files_rows(client).h / self.files_row_h()).max(1) as usize
+    }
+    /// Where entry `i` (counted from the first one shown) is drawn.
+    fn files_row(&self, client: &Rect, i: usize) -> Rect {
+        let rows = self.files_rows(client);
+        Rect::new(rows.x, rows.y + i as i32 * self.files_row_h(), rows.w, self.files_row_h())
     }
     fn index(&self, kind: Kind) -> usize {
         self.windows.iter().position(|w| w.kind == kind).unwrap_or(0)
@@ -471,13 +581,19 @@ impl Desktop {
                 let cols = ((client.w - 20 * s) / (8 * s)).max(1) as usize;
                 let rows = ((client.h - 20 * s) / line).max(1) as usize;
                 let mut lines: Vec<String> = Vec::new();
+                // Word wrap: break at the last space that fits, or mid-word
+                // when a word is longer than the line.
                 for part in self.notes.split('\n') {
-                    let bytes = part.as_bytes();
-                    if bytes.is_empty() {
-                        lines.push(String::new());
-                    }
-                    for chunk in bytes.chunks(cols) {
-                        lines.push(String::from_utf8_lossy(chunk).into_owned());
+                    let mut rest: Vec<char> = part.chars().collect();
+                    loop {
+                        if rest.len() <= cols {
+                            lines.push(rest.iter().collect());
+                            break;
+                        }
+                        let cut = rest[..=cols].iter().rposition(|&ch| ch == ' ').filter(|&i| i > 0).unwrap_or(cols);
+                        lines.push(rest[..cut].iter().collect());
+                        let skip = rest[cut..].iter().take_while(|&&ch| ch == ' ').count();
+                        rest.drain(..cut + skip);
                     }
                 }
                 let caret = active && (aero::clock_us() / 500_000) % 2 == 0;
@@ -491,6 +607,128 @@ impl Desktop {
                     say(c, l, 0x101010);
                 }
             }
+            Kind::Computer => self.files_view(c, &client),
+        }
+    }
+
+    fn files_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        let f = &self.files;
+        // Toolbar: a light glass strip with Back, the address and paging.
+        let t = self.files_toolbar(client);
+        c.gradient(t, rgb(245, 250, 255), rgb(215, 230, 245), 255);
+        c.fill(Rect::new(t.x, t.y + t.h - 1, t.w, 1), rgb(160, 180, 205));
+        let (bx, by, br) = self.files_back(client);
+        let can_go_up = f.path != "/";
+        if can_go_up {
+            c.orb(bx, by, br, rgb(120, 200, 255), rgb(20, 90, 170));
+        } else {
+            c.orb(bx, by, br, rgb(220, 225, 230), rgb(150, 160, 170));
+        }
+        let d = 5 * s;
+        c.line(bx - d, by, bx + d - s, by, 2 * s, 0xFFFFFF);
+        c.line(bx - d, by, bx - s, by - d + s, 2 * s, 0xFFFFFF);
+        c.line(bx - d, by, bx - s, by + d - s, 2 * s, 0xFFFFFF);
+        let a = self.files_address(client);
+        c.fill(a, 0xFFFFFF);
+        c.frame(a, rgb(130, 150, 180));
+        let max = ((a.w - 30 * s) / (8 * s)).max(1) as usize;
+        let skip = f.path.chars().count().saturating_sub(max);
+        let shown: String = f.path.chars().skip(skip).collect();
+        c.folder(a.x + 5 * s, a.y + a.h / 2 - 6 * s, s);
+        c.text(a.x + 24 * s, a.y + a.h / 2 - 4 * s, &shown, 0x101010, s);
+        let more_above = f.scroll > 0;
+        let more_below = f.scroll + self.files_visible(client) < f.entries.len();
+        for (down, live) in [(false, more_above), (true, more_below)] {
+            let b = self.files_page(client, down);
+            let (top, bottom) = if live { (rgb(250, 252, 255), rgb(200, 220, 240)) } else { (rgb(240, 240, 240), rgb(225, 225, 225)) };
+            c.rounded(b, 3 * s, false, top, bottom, 255);
+            c.rounded_outline(b, 3 * s, false, rgb(140, 160, 190), 255);
+            let ink = if live { rgb(30, 60, 110) } else { rgb(170, 170, 170) };
+            let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
+            for i in 0..4 * s {
+                let half = if down { 4 * s - i } else { i };
+                c.fill(Rect::new(cx - half, cy - 2 * s + i, 2 * half + 1, 1), ink);
+            }
+        }
+
+        // Column headings.
+        let size_x = client.x + client.w - 90 * s;
+        let head = Rect::new(client.x, t.y + t.h, client.w, 20 * s);
+        c.fill(head, 0xFFFFFF);
+        c.text(client.x + 30 * s, head.y + 6 * s, "Name", rgb(60, 80, 110), s);
+        c.text(size_x, head.y + 6 * s, "Size", rgb(60, 80, 110), s);
+        c.fill(Rect::new(size_x - 8 * s, head.y + 3 * s, 1, head.h - 6 * s), rgb(220, 225, 235));
+        c.fill(Rect::new(head.x, head.y + head.h - 1, head.w, 1), rgb(225, 230, 240));
+
+        let rows = self.files_rows(client);
+        c.fill(rows, 0xFFFFFF);
+        let name_cols = ((size_x - 16 * s - client.x - 30 * s) / (8 * s)).max(1) as usize;
+        for (i, e) in f.entries.iter().enumerate().skip(f.scroll).take(self.files_visible(client)) {
+            let r = self.files_row(client, i - f.scroll);
+            let hover = r.contains(self.pointer.x as i32, self.pointer.y as i32);
+            if f.selected == Some(i) {
+                c.rounded(Rect::new(r.x + 2 * s, r.y, r.w - 4 * s, r.h), 2 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
+                c.rounded_outline(Rect::new(r.x + 2 * s, r.y, r.w - 4 * s, r.h), 2 * s, false, rgb(125, 162, 206), 255);
+            } else if hover {
+                c.rounded(Rect::new(r.x + 2 * s, r.y, r.w - 4 * s, r.h), 2 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
+            }
+            if e.is_dir {
+                c.folder(r.x + 8 * s, r.y + 3 * s, s);
+            } else {
+                c.page(r.x + 10 * s, r.y + 2 * s, s);
+            }
+            let name: String = if e.name.chars().count() > name_cols {
+                let mut n: String = e.name.chars().take(name_cols.saturating_sub(3)).collect();
+                n.push_str("...");
+                n
+            } else {
+                e.name.clone()
+            };
+            c.text(client.x + 30 * s, r.y + 5 * s, &name, 0x101010, s);
+            if !e.is_dir {
+                c.text(size_x, r.y + 5 * s, &size_text(e.size), rgb(80, 80, 80), s);
+            }
+        }
+
+        // Status bar.
+        let bar = Rect::new(client.x, rows.y + rows.h, client.w, client.y + client.h - rows.y - rows.h);
+        c.gradient(bar, rgb(240, 245, 252), rgb(215, 228, 242), 255);
+        c.fill(Rect::new(bar.x, bar.y, bar.w, 1), rgb(180, 195, 215));
+        c.text(bar.x + 8 * s, bar.y + bar.h / 2 - 4 * s, &f.status, rgb(30, 50, 80), s);
+    }
+
+    /// The desktop icons: a picture over a white label with a dark shadow.
+    fn icons(&self, c: &mut Canvas) {
+        let s = self.ui;
+        for (i, &kind) in ICONS.iter().enumerate() {
+            let r = self.icon_rect(i);
+            if r.intersect(&c.clip).is_empty() {
+                continue;
+            }
+            let hover = r.contains(self.pointer.x as i32, self.pointer.y as i32);
+            if self.icon == Some(i) {
+                c.rounded(r, 3 * s, false, rgb(150, 200, 250), rgb(90, 150, 220), 110);
+                c.rounded_outline(r, 3 * s, false, rgb(200, 230, 255), 170);
+            } else if hover {
+                c.rounded(r, 3 * s, false, rgb(150, 200, 250), rgb(90, 150, 220), 60);
+                c.rounded_outline(r, 3 * s, false, rgb(200, 230, 255), 110);
+            }
+            let (px, py) = (r.x + r.w / 2 - 20 * s, r.y + 6 * s);
+            match kind {
+                Kind::Computer => c.computer(px, py, s),
+                Kind::Notes => c.notepad(px + 6 * s, py, s),
+                _ => {
+                    c.orb(px + 20 * s, py + 19 * s, 17 * s, rgb(140, 210, 255), rgb(20, 90, 170));
+                    c.fill(Rect::new(px + 18 * s, py + 9 * s, 4 * s, 4 * s), 0xFFFFFF);
+                    c.fill(Rect::new(px + 18 * s, py + 16 * s, 4 * s, 13 * s), 0xFFFFFF);
+                }
+            }
+            let label = self.windows[self.index(kind)].title;
+            let lx = r.x + (r.w - label.len() as i32 * 8 * s) / 2;
+            let ly = r.y + r.h - 18 * s;
+            c.text(lx + s, ly + s, label, 0x000000, s);
+            c.text(lx, ly, label, 0xFFFFFF, s);
         }
     }
 
@@ -632,6 +870,7 @@ impl Desktop {
 
     fn draw(&self, c: &mut Canvas) {
         self.background(c);
+        self.icons(c);
         let top = self.top_kind();
         for win in self.windows.iter().filter(|w| w.shown()) {
             self.window(c, win, Some(win.kind) == top);
@@ -658,6 +897,18 @@ impl Desktop {
         }
         if self.taskbar().contains(x, y) {
             area = area.union(&self.taskbar());
+        }
+        for i in 0..ICONS.len() {
+            if self.icon_rect(i).contains(x, y) {
+                area = area.union(&self.icon_rect(i));
+            }
+        }
+        let at = self.index(Kind::Computer);
+        if self.windows[at].shown() {
+            let client = self.client(&self.windows[at].rect);
+            if client.contains(x, y) {
+                area = area.union(&client);
+            }
         }
         if self.menu {
             area = area.union(&self.menu_rect());
@@ -696,6 +947,12 @@ impl Desktop {
 
     /// Left button pressed at (x, y). Returns the area to redraw.
     fn click(&mut self, x: i32, y: i32) -> Rect {
+        let now = aero::clock_us();
+        let (when, px, py) = self.last_press;
+        let near = 4 * self.ui;
+        let double = when != 0 && now - when < DOUBLE_CLICK_US && (x - px).abs() <= near && (y - py).abs() <= near;
+        // A third press starts over rather than making a second double-click.
+        self.last_press = if double { (0, 0, 0) } else { (now, x, y) };
         let mut dirty = Rect::EMPTY;
         let menu_was_open = self.menu;
         if self.menu {
@@ -703,7 +960,7 @@ impl Desktop {
             dirty = dirty.union(&self.menu_rect());
             for (i, &kind) in KINDS.iter().enumerate() {
                 if self.menu_item(i).contains(x, y) {
-                    return dirty.union(&self.bring(kind));
+                    return dirty.union(&self.open(kind));
                 }
             }
             if self.exit_button().contains(x, y) {
@@ -765,11 +1022,145 @@ impl Desktop {
             } else if self.caption(&r, Caption::Maximize).contains(x, y) {
                 self.maximize(i);
                 dirty = dirty.union(&self.window_area(i));
+            } else if double && y < r.y + self.title_h() {
+                self.drag = None;
+                self.maximize(i);
+                dirty = dirty.union(&self.window_area(i));
             } else if y < r.y + self.title_h() && self.windows[i].restore.is_none() {
                 self.drag = Some((i, x - r.x, y - r.y));
+            } else if self.windows[i].kind == Kind::Computer && self.client(&r).contains(x, y) {
+                dirty = dirty.union(&self.files_click(x, y, double));
             }
+            return dirty;
+        }
+        // The desktop itself: icons are picked with a click and opened
+        // with a double-click.
+        let before = self.icon;
+        self.icon = (0..ICONS.len()).find(|&i| self.icon_rect(i).contains(x, y));
+        for i in [before, self.icon].into_iter().flatten() {
+            dirty = dirty.union(&self.icon_rect(i));
+        }
+        if let (true, Some(i)) = (double, self.icon) {
+            dirty = dirty.union(&self.open(ICONS[i]));
         }
         dirty
+    }
+
+    /// Opens a window from its icon or the Start menu.
+    fn open(&mut self, kind: Kind) -> Rect {
+        let at = self.index(kind);
+        if kind == Kind::Computer && !self.windows[at].open {
+            self.open_dir(String::from("/"));
+        }
+        let r = self.windows[at].rect;
+        println!("[desktop] opened {} at {},{}", self.windows[at].title, r.x, r.y);
+        self.bring(kind)
+    }
+
+    /// The Computer window's area, to redraw it.
+    fn files_area(&self) -> Rect {
+        self.window_area(self.index(Kind::Computer))
+    }
+
+    /// Shows the directory `path` in the Computer window.
+    fn open_dir(&mut self, path: String) {
+        match aero::list_dir(&path) {
+            Ok(mut entries) => {
+                // Folders first, then files, each by name, ignoring case.
+                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+                let n = entries.len();
+                let status = format!("{} item{}", n, if n == 1 { "" } else { "s" });
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                let at = self.index(Kind::Computer);
+                let row = self.files_row(&self.client(&self.windows[at].rect), 0);
+                println!("[desktop] Computer: {} = {}; first row at {},{}, rows {} apart",
+                    path, names.join(" | "), row.x + 40 * self.ui, row.y + row.h / 2, row.h);
+                self.files = Files { path, entries, scroll: 0, selected: None, status };
+            }
+            Err(e) => {
+                println!("[desktop] Computer: cannot open {} ({})", path, e);
+                self.files.status = format!("Can't open {}", path);
+            }
+        }
+    }
+
+    /// The folder above the one shown.
+    fn go_up(&mut self) -> Rect {
+        if self.files.path == "/" {
+            return Rect::EMPTY;
+        }
+        let parent = match self.files.path.trim_end_matches('/').rfind('/') {
+            Some(0) | None => String::from("/"),
+            Some(i) => String::from(&self.files.path[..i]),
+        };
+        self.open_dir(parent);
+        self.files_area()
+    }
+
+    /// Opens a text file in Notes.
+    fn open_file(&mut self, path: String) -> Rect {
+        let mut buf = alloc::vec![0u8; 4096];
+        let n = match aero::read_file(&path, &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("[desktop] cannot read {} ({})", path, e);
+                self.files.status = String::from("Can't read that file");
+                return self.files_area();
+            }
+        };
+        let text = &buf[..n];
+        if text.iter().any(|&b| b == 0 || (b < 32 && b != b'\n' && b != b'\r' && b != b'\t')) {
+            self.files.status = String::from("Notes can only open text files");
+            return self.files_area();
+        }
+        self.notes = String::from_utf8_lossy(text).replace('\r', "").replace('\t', "    ");
+        while self.notes.len() > 3000 {
+            self.notes.pop();
+        }
+        println!("[desktop] opened {} in Notes ({} bytes)", path, n);
+        self.files_area().union(&self.bring(Kind::Notes))
+    }
+
+    /// A click inside the Computer window.
+    fn files_click(&mut self, x: i32, y: i32, double: bool) -> Rect {
+        let at = self.index(Kind::Computer);
+        let client = self.client(&self.windows[at].rect);
+        let area = self.files_area();
+        let (bx, by, br) = self.files_back(&client);
+        if (x - bx) * (x - bx) + (y - by) * (y - by) <= br * br {
+            return self.go_up();
+        }
+        let page = self.files_visible(&client);
+        if self.files_page(&client, false).contains(x, y) {
+            self.files.scroll = self.files.scroll.saturating_sub(page);
+            return area;
+        }
+        if self.files_page(&client, true).contains(x, y) {
+            if self.files.scroll + page < self.files.entries.len() {
+                self.files.scroll += page;
+            }
+            return area;
+        }
+        if !self.files_rows(&client).contains(x, y) {
+            return Rect::EMPTY;
+        }
+        let i = self.files.scroll + ((y - self.files_rows(&client).y) / self.files_row_h()) as usize;
+        let Some(entry) = self.files.entries.get(i).cloned() else {
+            self.files.selected = None;
+            return area;
+        };
+        self.files.selected = Some(i);
+        if !double {
+            self.files.status = if entry.is_dir { entry.name.clone() } else { format!("{}  {}", entry.name, size_text(entry.size)) };
+            return area;
+        }
+        let path = if self.files.path == "/" { format!("/{}", entry.name) } else { format!("{}/{}", self.files.path, entry.name) };
+        if entry.is_dir {
+            self.open_dir(path);
+            area
+        } else {
+            self.open_file(path)
+        }
     }
 
     fn typed(&mut self, keys: &[u8]) -> Rect {
@@ -777,6 +1168,10 @@ impl Desktop {
         for &k in keys {
             if k == 27 {
                 self.quit = true;
+                continue;
+            }
+            if self.top_kind() == Some(Kind::Computer) && k == 8 {
+                dirty = dirty.union(&self.go_up());
                 continue;
             }
             if self.top_kind() != Some(Kind::Notes) {
@@ -787,7 +1182,7 @@ impl Desktop {
                     self.notes.pop();
                 }
                 b'\n' | 32..=126 => {
-                    if self.notes.len() < 2000 {
+                    if self.notes.len() < 4000 {
                         self.notes.push(k as char);
                     }
                 }
@@ -807,6 +1202,17 @@ fn present(screen: &Screen, canvas: &mut Canvas, desk: &Desktop, area: Rect) {
     canvas.clip = area;
     desk.draw(canvas);
     let _ = screen.present(&canvas.px, canvas.w as usize, area.x as usize, area.y as usize, area.w as usize, area.h as usize);
+}
+
+/// A file size the way Explorer shows it: whole kilobytes, rounded up.
+fn size_text(bytes: u64) -> String {
+    if bytes >= 10 * 1024 * 1024 * 1024 {
+        format!("{} GB", bytes.div_ceil(1024 * 1024 * 1024))
+    } else if bytes >= 10 * 1024 * 1024 {
+        format!("{} MB", bytes.div_ceil(1024 * 1024))
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 fn uptime(us: u64) -> String {
@@ -846,6 +1252,7 @@ fn main() -> i64 {
         window(Kind::Welcome, "Welcome", Rect::new(w / 12, h / 7, 340 * s, 180 * s)),
         window(Kind::System, "System", Rect::new(w / 12 + 370 * s, h / 7 + 30 * s, 270 * s, 130 * s)),
         window(Kind::Notes, "Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 360 * s, 180 * s)),
+        Window { open: false, ..window(Kind::Computer, "Computer", Rect::new(w - 490 * s, 40 * s, 460 * s, 320 * s)) },
     ];
     let pointer = screen.pointer().unwrap_or_default();
     let started_us = aero::clock_us();
@@ -862,11 +1269,16 @@ fn main() -> i64 {
         started_us,
         clock: clock(started_us),
         quit: false,
+        files: Files { path: String::from("/"), entries: Vec::new(), scroll: 0, selected: None, status: String::new() },
+        icon: None,
+        last_press: (0, 0, 0),
     };
     let mut canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY };
     present(&screen, &mut canvas, &desk, Rect::new(0, 0, w, h));
-    let notes = desk.windows[2].rect;
-    println!("[desktop] up at {}x{}; Notes title bar at {},{}", w, h, notes.x + 60 * s, notes.y + 12 * s);
+    let notes = desk.windows[desk.index(Kind::Notes)].rect;
+    let icon = desk.icon_rect(0);
+    println!("[desktop] up at {}x{}; Notes title bar at {},{}; Computer icon at {},{}", w, h, notes.x + 60 * s,
+        notes.y + 12 * s, icon.x + icon.w / 2, icon.y + icon.h / 2);
 
     let mut keys = [0u8; 64];
     let mut tick = 0u64;
@@ -878,7 +1290,9 @@ fn main() -> i64 {
             dirty = dirty.union(&desk.cursor_rect()).union(&desk.hover_area(old.x as i32, old.y as i32));
             desk.pointer = p;
             dirty = dirty.union(&desk.cursor_rect()).union(&desk.hover_area(p.x as i32, p.y as i32));
-            if p.presses != old.presses {
+            // Both presses of a quick double-click can land between two looks.
+            let presses = p.presses.wrapping_sub(old.presses) & 0xFF_FFFF;
+            for _ in 0..presses.min(3) {
                 dirty = dirty.union(&desk.click(p.x as i32, p.y as i32));
             }
             if let Some((i, gx, gy)) = desk.drag {

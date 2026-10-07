@@ -151,6 +151,29 @@ NTFS_WAIT=('  Café ☕.txt\|  /sata1p1: ' '  IMG_0300.JPG\|  /sata1p1/Photos: '
     '  /sata1p1/sparse.bin' '  /sata1p1/Packed/squeezed.txt: ' '  /sata1p1/new.txt: ')
 NTFS_STEP=0
 monitor() { python3 tools/qemu-monitor.py build/qemu-monitor.sock "$@" >/dev/null; }
+fast_monitor() { python3 tools/qemu-monitor.py --gap 0.08 build/qemu-monitor.sock "$@" >/dev/null; }
+# The mouse is relative: push the pointer into the top-left corner, then
+# move it right and down to $1,$2.
+point_at() {
+    local x=$1 y=$2 moves=()
+    for _ in $(seq 1 30); do moves+=("mouse_move -100 -100"); done
+    while [ "$x" -gt 0 ]; do d=$((x > 100 ? 100 : x)); moves+=("mouse_move $d 0"); x=$((x - d)); done
+    while [ "$y" -gt 0 ]; do d=$((y > 100 ? 100 : y)); moves+=("mouse_move 0 $d"); y=$((y - d)); done
+    fast_monitor "${moves[@]}"; sleep 0.5
+}
+double_click() { fast_monitor "mouse_button 1" "mouse_button 0" "mouse_button 1" "mouse_button 0"; }
+# Where the desktop's Computer window shows the entry named $2 of folder $1,
+# from its "[desktop] Computer: <folder> = a | b; first row at x,y, rows h apart" line.
+row_of() {
+    python3 - "$LOG" "$1" "$2" <<'PY'
+import re, sys
+log = open(sys.argv[1], 'rb').read().decode(errors='replace')
+m = re.search(r'\[desktop\] Computer: ' + re.escape(sys.argv[2]) + r' = (.*); first row at (\d+),(\d+), rows (\d+) apart', log)
+names = [n.lower() for n in m.group(1).split(' | ')]
+i = names.index(sys.argv[3].lower())
+print(m.group(2), int(m.group(3)) + i * int(m.group(4)))
+PY
+}
 STAGE=0
 
 for _ in $(seq "$TIMEOUT"); do
@@ -287,7 +310,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; monitor "mouse_button 1"; sleep 0.5
         monitor "mouse_move 100 50"; sleep 0.3; monitor "mouse_move 100 50"; sleep 0.5
         monitor "mouse_button 0"; sleep 0.5
-        type_keys 'hello aero'
+        # Then open Computer from its desktop icon, go into /docs and open
+        # the welcome text file in Notes.
+        XY=$(grep -ao "Computer icon at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
+        point_at "${XY%,*}" "${XY#*,}"; double_click; STAGE=deskcomp
+    elif [ $STAGE = deskcomp ] && grep -q "\[desktop\] Computer: / = " "$LOG"; then
+        sleep 0.5; point_at $(row_of / docs); double_click; STAGE=deskdocs
+    elif [ $STAGE = deskdocs ] && grep -qi "\[desktop\] Computer: /docs = " "$LOG"; then
+        DOCS=$(grep -aio "\[desktop\] Computer: /docs = " "$LOG" | head -1 | sed 's/.*Computer: //; s/ = //')
+        sleep 0.5; point_at $(row_of "$DOCS" "Welcome to AeroForge.txt"); double_click; STAGE=deskfile
+    elif [ $STAGE = deskfile ] && grep -qi "\[desktop\] \(opened /docs/Welcome to AeroForge.txt in Notes\|cannot\)" "$LOG"; then
+        sleep 0.5; type_keys 'hello aero'
         sleep 1; monitor "screendump build/gop-desktop.ppm"
         monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
@@ -373,8 +406,18 @@ for _ in $(seq "$TIMEOUT"); do
         python3 tools/check-screen.py drawtest build/gop-draw.ppm || { fail "drawtest's picture was not on the screen"; }
         python3 tools/check-screen.py console build/gop-console.ppm || { fail "the console did not come back after drawtest"; }
         grep -q "\[desktop\] moved Notes to 466,414" "$LOG" || { fail "dragging the Notes window with the mouse did not move it to 466,414"; }
-        grep -q "\[desktop\] notes: hello aero" "$LOG" || { fail "keys typed on the desktop did not reach the Notes window"; }
-        python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 || { fail "the desktop screenshot is wrong"; }
+        grep -q "\[desktop\] opened Computer at " "$LOG" || { fail "double-clicking the Computer icon did not open the Computer window"; }
+        grep -q "\[desktop\] Computer: / = .*docs | games | .*README.TXT" "$LOG" \
+            || { fail "the Computer window did not list the disk's root folder (folders first)"; }
+        grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
+            || { fail "double-clicking docs in the Computer window did not list /docs"; }
+        grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \
+            || { fail "double-clicking a text file in the Computer window did not open it in Notes"; }
+        grep -q "\[desktop\] notes: Welcome to AeroForge OS\. / .*hello aero" "$LOG" \
+            || { fail "the opened file plus keys typed on the desktop were not in the Notes window"; }
+        CXY=$(grep -ao "opened Computer at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
+        python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 "${CXY%,*}" "${CXY#*,}" \
+            || { fail "the desktop screenshot is wrong"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }
         grep -q "^  cpu0: [0-5] timer interrupts" "$LOG" \
@@ -447,7 +490,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed folders and opened a text file in Notes, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
