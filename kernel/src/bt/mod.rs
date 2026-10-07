@@ -570,7 +570,7 @@ impl Host {
         };
         let mut r = dhi::BtmtkResult { sections: 0, bytes: 0, error: [0; 48] };
         if unsafe { dhi::aero_btmtk_setup(&dhi::OPS, self.id, fw.as_ptr(), fw.len() as u32, &mut r) } != 0 {
-            return Err(alloc::format!("{} firmware load failed: {}", model, dhi::c_field(&r.error)));
+            return Err(alloc::format!("{} firmware load failed:\n       {}", model, dhi::c_field(&r.error)));
         }
         crate::kok!("{}: {} firmware {} loaded ({} section(s), {} bytes)", self.name, model, file, r.sections, r.bytes);
         Ok(())

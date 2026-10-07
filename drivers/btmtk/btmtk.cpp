@@ -129,6 +129,8 @@ uint32_t le32(const uint8_t* p) {
     return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
 }
 
+char hex_digit(uint32_t v) { return "0123456789abcdef"[v & 0xF]; }
+
 class Setup {
 public:
     Setup(const dhi_ops* ops, int32_t bt) : ops_(ops), bt_(bt) {}
@@ -165,14 +167,24 @@ public:
 
         // The answer does not come on the event endpoint: poll EP0 until the
         // chip has one ready (an empty reply means "not yet"), up to 3 s.
+        // Something else there (a leftover event) is skipped, but the first
+        // one is kept for the error message.
         uint8_t evt[64];
         int n = 0;
-        for (int i = 0; i < 6000 && n <= 0; ++i) {
+        bool odd = false;
+        for (int i = 0; i < 6000; ++i) {
             n = aero_xhci_bt_control(bt_, 0xC0, 0x01, 48, 0, evt, sizeof(evt));
-            if (n <= 0) ops_->delay_us(500);
+            if (n >= 7 && evt[0] == kHciEventWmt && evt[3] == op) break;
+            if (n > 0 && !odd) {
+                odd = true;
+                describe(op, evt, n);
+            }
+            n = 0;
+            ops_->delay_us(500);
         }
-        if (n < 7 || evt[0] != kHciEventWmt || evt[3] != op) {
-            last_error_ = n <= 0 ? "no WMT event" : "unexpected WMT event";
+        if (n == 0) {
+            if (!odd) describe(op, nullptr, 0);
+            last_error_ = detail_;
             return false;
         }
         const uint8_t evt_flag = evt[6];
@@ -200,6 +212,7 @@ public:
             return fail("bad firmware section table");
 
         for (uint32_t i = 0; i < sections; ++i) {
+            section_ = i;
             const uint8_t* map = fw + kRomPatchHeaderSize + kGlobalDescSize + kSectionMapSize * i;
             const uint32_t offset = le32(map + 4);
             uint32_t left = le32(map + kSectionCommonSize + 4);  // bin_info_spec.dlsize
@@ -251,6 +264,34 @@ public:
         return 0;
     }
 
+    // "WMT op 1 section 0: got e4 05 02 01 01 00 02" or "...: no answer".
+    void describe(uint8_t op, const uint8_t* evt, int n) {
+        int k = 0;
+        auto put = [&](const char* str) {
+            while (*str && k < int(sizeof(detail_)) - 1) detail_[k++] = *str++;
+        };
+        auto hex = [&](uint8_t v) {
+            if (k < int(sizeof(detail_)) - 3) {
+                detail_[k++] = hex_digit(v >> 4);
+                detail_[k++] = hex_digit(v);
+            }
+        };
+        put("WMT op ");
+        hex(op);
+        put(op == kWmtFuncCtrl ? " (on)" : " section ");
+        if (op != kWmtFuncCtrl) hex(uint8_t(section_));
+        if (evt == nullptr) {
+            put(": no answer");
+        } else {
+            put(": got");
+            for (int i = 0; i < n && i < 8; ++i) {
+                put(" ");
+                hex(evt[i]);
+            }
+        }
+        detail_[k] = 0;
+    }
+
     int32_t fail(const char* why) {
         last_error_ = why;
         return -1;
@@ -258,13 +299,13 @@ public:
 
     const char* last_error_ = "";
     uint32_t sections_ = 0, bytes_ = 0;
+    uint32_t section_ = 0;  // section being downloaded (for errors)
+    char detail_[48] = {};
 
 private:
     const dhi_ops* ops_;
     int32_t bt_;
 };
-
-char hex_digit(uint32_t v) { return "0123456789abcdef"[v & 0xF]; }
 
 }  // namespace
 
