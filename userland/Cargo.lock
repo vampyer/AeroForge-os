@@ -6,11 +6,11 @@ version = 4
 name = "aero-userland"
 version = "0.1.0"
 dependencies = [
- "font8x8",
+ "noto-sans-mono-bitmap",
 ]
 
 [[package]]
-name = "font8x8"
-version = "0.3.1"
+name = "noto-sans-mono-bitmap"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"

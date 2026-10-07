@@ -98,7 +98,7 @@ python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm
+rm -f "$LOG" build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -315,6 +315,12 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Computer icon at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
         point_at "${XY%,*}" "${XY#*,}"; double_click; STAGE=deskcomp
     elif [ $STAGE = deskcomp ] && grep -q "\[desktop\] Computer: / = " "$LOG"; then
+        # Make Computer 100 narrower and 80 taller by its bottom-right corner.
+        read -r CX CY CW CH <<< "$(grep -ao "opened Computer at [0-9]*,[0-9]* ([0-9]*x[0-9]*)" "$LOG" | head -1 | tr -c '0-9\n' ' ')"
+        sleep 0.5; point_at $((CX + CW - 3)) $((CY + CH - 3))
+        monitor "mouse_button 1"; monitor "mouse_move -50 40"; monitor "mouse_move -50 40"; monitor "mouse_button 0"
+        STAGE=deskresize
+    elif [ $STAGE = deskresize ] && grep -q "\[desktop\] resized Computer to" "$LOG"; then
         sleep 0.5; point_at $(row_of / docs); double_click; STAGE=deskdocs
     elif [ $STAGE = deskdocs ] && grep -qi "\[desktop\] Computer: /docs = " "$LOG"; then
         DOCS=$(grep -aio "\[desktop\] Computer: /docs = " "$LOG" | head -1 | sed 's/.*Computer: //; s/ = //')
@@ -322,6 +328,18 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = deskfile ] && grep -qi "\[desktop\] \(opened /docs/Welcome to AeroForge.txt in Notes\|cannot\)" "$LOG"; then
         sleep 0.5; type_keys 'hello aero'
         sleep 1; monitor "screendump build/gop-desktop.ppm"
+        # Snap Welcome to the left half by dragging its title bar to the edge.
+        point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
+        monitor "mouse_button 0"; STAGE=desksnap
+    elif [ $STAGE = desksnap ] && grep -q "\[desktop\] \(snapped\|moved\) Welcome" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-snap.ppm"
+        # Drag it away again: it gets its old size back.
+        point_at 100 12; monitor "mouse_button 1"; monitor "mouse_move 100 100"; monitor "mouse_move 100 100"
+        monitor "mouse_button 0"; STAGE=deskunsnap
+    elif [ $STAGE = deskunsnap ] && grep -q "\[desktop\] moved Welcome" "$LOG"; then
+        # Open the Start menu for a screenshot of it and the Start button.
+        sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
+        sleep 1; monitor "screendump build/gop-start.ppm"
         monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
         sleep 1; type_keys $'run spreadtest\n'; STAGE=spread
@@ -409,6 +427,11 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] opened Computer at " "$LOG" || { fail "double-clicking the Computer icon did not open the Computer window"; }
         grep -q "\[desktop\] Computer: / = .*docs | games | .*README.TXT" "$LOG" \
             || { fail "the Computer window did not list the disk's root folder (folders first)"; }
+        grep -q "\[desktop\] snapped Welcome to 0,0 640x760" "$LOG" || { fail "dragging Welcome against the left edge did not snap it to the left half"; }
+        grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (400x250)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
+        python3 tools/check-screen.py start build/gop-start.ppm || { fail "the Start button or the Start menu is wrong in the screenshot"; }
+        python3 tools/check-screen.py snap build/gop-snap.ppm || { fail "the snapped window is not on the left half of the screenshot"; }
+        grep -q "\[desktop\] resized Computer to 420x440" "$LOG" || { fail "dragging the Computer window's corner did not resize it to 420x440"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
         grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \
@@ -490,7 +513,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed folders and opened a text file in Notes, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, was resized by its corner, a window snapped to half the screen and back, listed folders and opened a text file in Notes, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
