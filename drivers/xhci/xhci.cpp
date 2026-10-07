@@ -86,6 +86,7 @@ constexpr int kMaxSlots = 16;
 constexpr int kMaxDevices = 16;
 constexpr int kReportTrbs = 16;       // interrupt-IN transfers kept in flight
 constexpr int kReportSize = 16;
+constexpr uint32_t kHidMaxErrors = 100;  // halts of one keyboard or mouse endpoint before it is dropped
 constexpr int kEventQueue = 128;
 constexpr int kBtTrbs = 8;            // Bluetooth event and ACL-in transfers kept in flight
 constexpr int kBtEventBuf = 512;
@@ -193,7 +194,6 @@ public:
         const volatile Trb& t = trbs_[index_of(phys)];
         return t.d0 | uint64_t(t.d1) << 32;
     }
-    int enqueue_index() const { return enqueue_; }
 
 private:
     dhi_dma mem_{};
@@ -248,6 +248,10 @@ struct Device {
     Ring intr{};
     dhi_dma reports{};
     uint8_t last_keys[8] = {};
+    uint32_t report_next = 0;  // report buffer the next queued transfer uses
+    bool reported = false;     // a report has arrived (logged once)
+    uint8_t intr_halt = 0;     // completion code that halted the endpoint, until poll() resets it
+    uint32_t intr_errors = 0;  // failed interrupt transfers
 
     // Result of the last control transfer, filled in by the event handler.
     volatile bool ctrl_done = false;
@@ -347,6 +351,7 @@ public:
         if (!try_lock()) return 0;
         process_events();
         service_ports();
+        recover_hid();
         if (++polls_ % 32 == 0) poll_hubs();
         int32_t n = 0;
         while (n < max && q_tail_ != q_head_) {
@@ -1144,7 +1149,12 @@ private:
 
         if (!d.intr.init(ops_) || ops_->dma_alloc(kReportTrbs * kReportSize, &d.reports) != 0) return false;
         const IntrEp ep{d.dci, hid_mps_, hid_interval_, &d.intr};
-        if (!add_interrupt_endpoints(d, &ep, 1)) return false;
+        const uint32_t code = add_interrupt_endpoints(d, &ep, 1);
+        if (code != kCcSuccess) {
+            ops_->log(Line().s("xhci: slot ").u(d.slot).s(d.hid == HidKind::Keyboard ? " keyboard" : " mouse")
+                          .s(": controller refused its endpoint (code ").u(code).s(")").str());
+            return false;
+        }
 
         report_len_[d.slot] = uint8_t(hid_mps_ < kReportSize ? hid_mps_ : kReportSize);
         for (int i = 0; i < kReportTrbs; ++i) queue_report(d);
@@ -1167,8 +1177,9 @@ private:
         const Ring* ring;
     };
 
-    // Adds interrupt endpoints to the device's running configuration.
-    bool add_interrupt_endpoints(Device& d, const IntrEp* eps, int n) {
+    // Adds interrupt endpoints to the device's running configuration. Returns
+    // the Configure Endpoint completion code (kCcSuccess = done).
+    uint32_t add_interrupt_endpoints(Device& d, const IntrEp* eps, int n) {
         for (int i = 0; i < 64 * 33 / 4; ++i) static_cast<volatile uint32_t*>(d.in_ctx.virt)[i] = 0;
         volatile uint32_t* control_ctx = ctx(d.in_ctx, 0);
         volatile uint32_t* sl = ctx(d.in_ctx, 1);
@@ -1189,7 +1200,7 @@ private:
         }
         sl[0] = (sl[0] & ~(0x1Fu << 27)) | (entries << 27);
         sl[3] = 0;
-        return command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr) == kCcSuccess;
+        return command(d.in_ctx.phys, 0, trb_type(kTrbConfigureEndpoint) | (uint32_t(d.slot) << 24), nullptr);
     }
 
     // ------------------------------------------------------------- gamepads
@@ -1249,7 +1260,7 @@ private:
         if (!d.pad_ring.init(ops_) || (d.pad_out_dci && !d.pad_out_ring.init(ops_))) return false;
         const IntrEp eps[2] = {{d.pad_in_dci, d.pad_mps, d.pad_interval, &d.pad_ring},
                                {d.pad_out_dci, d.pad_out_mps, d.pad_out_interval, &d.pad_out_ring}};
-        if (!add_interrupt_endpoints(d, eps, d.pad_out_dci ? 2 : 1)) return false;
+        if (add_interrupt_endpoints(d, eps, d.pad_out_dci ? 2 : 1) != kCcSuccess) return false;
         for (uint32_t i = 0; i < kPadTrbs; ++i) queue_pad(d, i);
         if (d.pad == PadKind::XInput && d.pad_out_dci) {
             // Light the player 1 quarter of the ring, as Windows does; some
@@ -1729,9 +1740,37 @@ private:
         return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
     }
 
-    // Queues one interrupt-IN transfer; its buffer slot follows the TRB's ring index.
+    // Restarts keyboard and mouse endpoints that an error halted (xHCI 4.6.8):
+    // reset the endpoint, skip the abandoned transfers, clear a STALL on the
+    // device too, and queue the reports again. Gives up after many errors.
+    void recover_hid() {
+        for (int i = 0; i < count_; ++i) {
+            Device& d = devices_[i];
+            if (!d.alive || d.hid == HidKind::None || !d.intr_halt) continue;
+            const uint32_t code = d.intr_halt;
+            ++d.intr_errors;
+            if (d.intr_errors <= 3 || d.intr_errors == kHidMaxErrors)
+                ops_->log(Line().s("xhci: slot ").u(d.slot).s(d.hid == HidKind::Keyboard ? " keyboard" : " mouse")
+                              .s(": transfer error (code ").u(code).s(")")
+                              .s(d.intr_errors >= kHidMaxErrors ? ", giving up" : ", endpoint reset").str());
+            if (d.intr_errors >= kHidMaxErrors) {
+                d.hid = HidKind::None;
+                continue;
+            }
+            command(0, 0, trb_type(kTrbResetEndpoint) | (uint32_t(d.dci) << 16) | (uint32_t(d.slot) << 24), nullptr);
+            command(d.intr.dequeue_for_reset(), 0, trb_type(kTrbSetTrDequeue) | (uint32_t(d.dci) << 16) | (uint32_t(d.slot) << 24), nullptr);
+            if (code == kCcStall) control(d, 0x02, 1, 0, uint16_t(0x80 | (d.dci - 1) / 2), 0, 0);  // CLEAR_FEATURE(ENDPOINT_HALT)
+            d.intr_halt = 0;
+            for (int k = 0; k < kReportTrbs; ++k) queue_report(d);
+        }
+    }
+
+    // Queues one interrupt-IN transfer into the next report buffer. Transfers
+    // finish in order and each is queued again only after its report is read,
+    // so a buffer is never in use twice. (The ring's 255 TRBs are not a
+    // multiple of kReportTrbs, so the ring index can't pick the buffer.)
     void queue_report(Device& d) {
-        const int slot = d.intr.enqueue_index() % kReportTrbs;
+        const int slot = int(d.report_next++ % kReportTrbs);
         const uint64_t phys = d.reports.phys + uint64_t(slot) * kReportSize;
         d.intr.push(uint32_t(phys), uint32_t(phys >> 32), report_len_[d.slot],
                     trb_type(kTrbNormal) | kTrbIoc | kTrbIsp);
@@ -1846,12 +1885,23 @@ private:
             // The player LED command went out.
         } else if (ep == d->dci) {
             if (code == kCcSuccess || code == kCcShortPacket) {
-                const int index = d->intr.index_of(ptr) % kReportTrbs;
-                const auto* report = static_cast<const uint8_t*>(d->reports.virt) + index * kReportSize;
+                const uint64_t buf = d->intr.buffer_of(ptr);
+                if (buf < d->reports.phys || buf >= d->reports.phys + kReportTrbs * kReportSize) return;
+                const auto* report = static_cast<const uint8_t*>(d->reports.virt) + (buf - d->reports.phys);
+                if (!d->reported) {
+                    d->reported = true;
+                    ops_->log(Line().s("xhci: slot ").u(d->slot).s(d->hid == HidKind::Keyboard ? " keyboard" : " mouse")
+                                  .s(": first report received").str());
+                }
                 if (d->hid == HidKind::Keyboard) keyboard_report(*d, report);
                 else mouse_report(report);
+                queue_report(*d);
+            } else if (code != kCcRingUnderrun && code != kCcRingOverrun && !d->intr_halt) {
+                // Any other error (a STALL, or a transaction error through a
+                // hub's transaction translator) halts the endpoint: nothing
+                // more arrives until it is reset, which poll() does.
+                d->intr_halt = uint8_t(code);
             }
-            queue_report(*d);
         }
     }
 
