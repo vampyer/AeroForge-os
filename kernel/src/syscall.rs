@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::interrupts::InterruptFrame;
 use crate::ipc::{Message, Port, MAX_MESSAGE, NAMES};
 use crate::process::{self, rights, Handle, Object};
-use crate::{apic, arch, console, display, futex, gamepad, gdt, net, percpu, sched, security, sound, vfs, wait};
+use crate::{apic, arch, console, display, futex, gamepad, gdt, input, net, percpu, sched, security, sound, vfs, wait};
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -173,6 +173,9 @@ pub const SYS_PROCESS_KILL: u64 = 46;
 pub const SYS_DISPLAY_ACQUIRE: u64 = 47;
 pub const SYS_DISPLAY_PRESENT: u64 = 48;
 pub const SYS_DISPLAY_RELEASE: u64 = 49;
+pub const SYS_POINTER: u64 = 50;
+pub const SYS_KEYS_READ: u64 = 51;
+pub const SYS_TIME: u64 = 52;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -697,6 +700,25 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 .map_err(display_error)
         }
         SYS_DISPLAY_RELEASE => Ok(display::release(proc_.pid) as u64),
+        // The mouse pointer for the screen's owner: x | y << 16 | buttons << 32 | left presses << 40.
+        SYS_POINTER => input::pointer(proc_.pid).ok_or(E_RIGHTS),
+        SYS_TIME => {
+            // Wall clock (local time, from the CMOS clock):
+            // year << 40 | month << 32 | day << 24 | hour << 16 | minute << 8 | second.
+            let t = crate::rtc::now().ok_or(E_NOTFOUND)?;
+            Ok((t.year as u64) << 40 | (t.month as u64) << 32 | (t.day as u64) << 24 | (t.hour as u64) << 16
+                | (t.minute as u64) << 8 | t.second as u64)
+        }
+        SYS_KEYS_READ => {
+            // Up to a1 typed keys (ASCII) into a0 for the screen's owner; returns how many.
+            let mut keys = [0u8; 64];
+            let max = (a1 as usize).min(keys.len());
+            let n = input::read_keys(proc_.pid, &mut keys[..max]).ok_or(E_RIGHTS)?;
+            if n > 0 && !security::copy_to_user(a0, &keys[..n]) {
+                return Err(E_FAULT);
+            }
+            Ok(n as u64)
+        }
         SYS_HANDLE_CLOSE => proc_.handles.lock().take(a0).map(|_| 0).ok_or(E_BADHANDLE),
         SYS_AUDIO_WRITE => {
             // Interleaved 48 kHz 16-bit stereo frames; returns how many were

@@ -21,6 +21,7 @@ mod fpu;
 mod futex;
 mod gamepad;
 mod gdt;
+mod input;
 mod kstack;
 mod interrupts;
 mod ipc;

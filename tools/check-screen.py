@@ -4,6 +4,8 @@
 Usage: check-screen.py drawtest <ppm>   red, green, blue and white quarters
                                         with a yellow 64x64 square at 100,100
        check-screen.py console <ppm>    the console is back on screen
+       check-screen.py desktop <ppm> x y  the desktop with its taskbar and the
+                                        Notes window moved to x,y
 """
 import sys
 
@@ -54,6 +56,13 @@ def main():
         # Inside the console window's padding (see fb::draw_scene).
         x, y = w // 14 + 2, h // 14 + 30 + 2
         want = {(x, y): (0x0c, 0x16, 0x26)}
+    elif mode == 'desktop':
+        x, y = int(sys.argv[3]), int(sys.argv[4])
+        bar = at(w // 2, h - 10)
+        if not (bar[2] > bar[0] and bar[2] < 160 and bar[0] < 80):
+            sys.exit(f'{path}: no dark blue taskbar at the bottom ({w // 2},{h - 10} is {bar})')
+        # Inside the moved Notes window's white client area, away from its text.
+        want = {(x + 300, y + 120): (255, 255, 255), (x + 20, y + 150): (255, 255, 255)}
     else:
         sys.exit(__doc__)
     bad = [f'{xy} is {at(*xy)}, expected {rgb}' for xy, rgb in want.items() if at(*xy) != rgb]

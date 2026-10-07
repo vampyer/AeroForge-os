@@ -208,6 +208,7 @@ pub fn acquire(pid: u64) -> Result<(usize, usize), Error> {
             *program = Some(buf);
         }
         d.owner = Some(pid);
+        crate::input::set_owner(Some(pid));
         Ok((d.width, d.height))
     })
 }
@@ -309,6 +310,7 @@ pub fn release(pid: u64) -> bool {
             return false;
         }
         d.owner = None;
+        crate::input::set_owner(None);
         if let Some(r) = d.radeon.as_mut() {
             // The console lives in buffer 0.
             if r.shown != 0 {
@@ -342,6 +344,7 @@ pub unsafe fn force_console() {
     DISPLAY.force_unlock();
     if let Some(d) = DISPLAY.lock().as_mut() {
         if d.owner.take().is_some() {
+            crate::input::force_release();
             if let Some(r) = d.radeon.as_mut() {
                 if r.shown != 0 {
                     dhi::aero_dcn_flip(r.bufs[0].1);

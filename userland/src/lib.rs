@@ -62,6 +62,9 @@ pub mod sys {
     pub const DISPLAY_ACQUIRE: u64 = 47;
     pub const DISPLAY_PRESENT: u64 = 48;
     pub const DISPLAY_RELEASE: u64 = 49;
+    pub const POINTER: u64 = 50;
+    pub const KEYS_READ: u64 = 51;
+    pub const TIME: u64 = 52;
 }
 
 pub mod rights {
@@ -127,6 +130,30 @@ pub fn sleep_us(us: u64) {
 /// `sleep_us(deadline - clock_us())`.
 pub fn clock_us() -> u64 {
     unsafe { syscall(sys::CLOCK_US, 0, 0, 0, 0) as u64 }
+}
+
+/// Wall clock date and time (local time, as the PC's clock keeps it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DateTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+/// The date and time now, or None if the PC's clock can't be read.
+pub fn now() -> Option<DateTime> {
+    let v = check(unsafe { syscall(sys::TIME, 0, 0, 0, 0) }).ok()?;
+    Some(DateTime {
+        year: (v >> 40) as u16,
+        month: (v >> 32) as u8,
+        day: (v >> 24) as u8,
+        hour: (v >> 16) as u8,
+        minute: (v >> 8) as u8,
+        second: v as u8,
+    })
 }
 
 pub fn cpu_id() -> u64 {
@@ -239,6 +266,35 @@ pub mod display {
         /// Shows the whole of `image` (rows of `width` pixels).
         pub fn present_all(&self, image: &[u32]) -> Result<(), i64> {
             self.present(image, self.width, 0, 0, self.width, self.height)
+        }
+    }
+
+    /// The mouse pointer: position on screen, buttons held (bit 0 = left,
+    /// 1 = right, 2 = middle) and how many times the left button has been
+    /// pressed (24 bits, wraps), so a quick click between reads is seen.
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Pointer {
+        pub x: usize,
+        pub y: usize,
+        pub buttons: u8,
+        pub presses: u32,
+    }
+
+    impl Screen {
+        /// Where the mouse is now.
+        pub fn pointer(&self) -> Result<Pointer, i64> {
+            check(unsafe { syscall(sys::POINTER, 0, 0, 0, 0) }).map(|v| Pointer {
+                x: (v & 0xFFFF) as usize,
+                y: ((v >> 16) & 0xFFFF) as usize,
+                buttons: ((v >> 32) & 0xFF) as u8,
+                presses: (v >> 40) as u32 & 0xFF_FFFF,
+            })
+        }
+
+        /// Keys typed since the last call (ASCII; Enter is 10, Esc 27,
+        /// Backspace 8), into `out`. Returns how many.
+        pub fn keys(&self, out: &mut [u8]) -> Result<usize, i64> {
+            check(unsafe { syscall(sys::KEYS_READ, out.as_mut_ptr() as u64, out.len() as u64, 0, 0) }).map(|n| n as usize)
         }
     }
 
