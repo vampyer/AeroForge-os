@@ -437,7 +437,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] Computer: / = .*docs | games | .*README.TXT" "$LOG" \
             || { fail "the Computer window did not list the disk's root folder (folders first)"; }
         grep -q "\[desktop\] snapped Welcome to 0,0 640x760" "$LOG" || { fail "dragging Welcome against the left edge did not snap it to the left half"; }
-        grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (400x250)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
+        grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (460x290)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
         grep -q "\[desktop\] calculator: 84" "$LOG" || { fail "Calculator did not work out 12+30*2 = 84 from typed keys and a click on ="; }
         python3 tools/check-screen.py start build/gop-start.ppm || { fail "the Start button or the Start menu is wrong in the screenshot"; }
         python3 tools/check-screen.py snap build/gop-snap.ppm || { fail "the snapped window is not on the left half of the screenshot"; }

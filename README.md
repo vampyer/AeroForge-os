@@ -443,6 +443,8 @@ Since 0.44 Notes has a Save button (Ctrl+S works too) that writes the text back 
 opened from Computer, or to `/Notes.txt` for a new note, then reads it back to check it. Ctrl with a
 letter now reaches programs as its control code (Ctrl+S is 0x13) from both PS/2 and USB keyboards.
 The boot test saves the opened welcome file with Ctrl+S and checks the NVMe disk image with mtools.
+Since 0.45 desktop text is bigger (24 pixel Noto Sans Mono instead of 20, the clock 20 instead of 16)
+and drawn with sharper edges, and the windows, icons and Start menu are sized to fit it.
 
 | Area | Status |
 |---|---|

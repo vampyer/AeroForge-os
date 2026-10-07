@@ -105,11 +105,11 @@ fn lerp(a: u32, b: u32, t: i32, n: i32) -> u32 {
 /// pre-rendered with smooth edges by the noto-sans-mono-bitmap crate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Font {
-    /// Window text, labels, menus: 20 pixels tall (32 at UI scale 2).
+    /// Window text, labels, menus: 24 pixels tall (32 at UI scale 2).
     Normal,
     /// Title bars.
     Bold,
-    /// The taskbar clock: 16 pixels tall (24 at UI scale 2).
+    /// The taskbar clock: 20 pixels tall (24 at UI scale 2).
     Small,
     /// The clock in the Start menu: 32 pixels tall.
     Large,
@@ -119,10 +119,10 @@ impl Font {
     fn style(self, ui: i32) -> (FontWeight, RasterHeight) {
         let weight = if self == Font::Bold { FontWeight::Bold } else { FontWeight::Regular };
         let size = match (self, ui >= 2) {
-            (Font::Small, false) => RasterHeight::Size16,
+            (Font::Small, false) => RasterHeight::Size20,
             (Font::Small, true) => RasterHeight::Size24,
             (Font::Large, _) | (_, true) => RasterHeight::Size32,
-            _ => RasterHeight::Size20,
+            _ => RasterHeight::Size24,
         };
         (weight, size)
     }
@@ -137,6 +137,12 @@ impl Font {
     fn width(self, ui: i32, text: &str) -> i32 {
         text.chars().count() as i32 * self.w(ui)
     }
+}
+
+/// Sharpens a glyph's coverage: faint edge pixels drop out and most of the
+/// stroke becomes solid, so text stays clear instead of looking soft.
+fn crisp(ink: u8) -> u32 {
+    (ink as u32).saturating_sub(48).saturating_mul(2).min(255)
 }
 
 /// The frame being built, clipped to the area being redrawn.
@@ -206,7 +212,7 @@ impl Canvas {
                     let px = gx + col as i32;
                     if ink > 0 && px >= box_.x && px < box_.x + box_.w {
                         let p = &mut self.px[(py * self.w + px) as usize];
-                        *p = blend(*p, color, ink as u32);
+                        *p = blend(*p, color, crisp(ink));
                     }
                 }
             }
@@ -715,7 +721,7 @@ impl Desktop {
     fn menu_rect(&self) -> Rect {
         let s = self.ui;
         let t = self.taskbar();
-        Rect::new(2 * s, t.y - 380 * s, 460 * s, 380 * s)
+        Rect::new(2 * s, t.y - 380 * s, 480 * s, 380 * s)
     }
     fn menu_left(&self) -> Rect {
         let m = self.menu_rect();
@@ -730,7 +736,7 @@ impl Desktop {
     fn exit_button(&self) -> Rect {
         let m = self.menu_rect();
         let s = self.ui;
-        Rect::new(m.x + m.w - 170 * s, m.y + m.h - 40 * s, 160 * s, 30 * s)
+        Rect::new(m.x + m.w - 200 * s, m.y + m.h - 42 * s, 190 * s, 34 * s)
     }
     fn cursor_rect(&self) -> Rect {
         // Room for the arrow and for the resize arrows centred on the pointer.
@@ -763,7 +769,7 @@ impl Desktop {
     }
     fn icon_rect(&self, i: usize) -> Rect {
         let s = self.ui;
-        Rect::new(4 * s, 10 * s + i as i32 * 94 * s, 96 * s, 86 * s)
+        Rect::new(4 * s, 10 * s + i as i32 * 94 * s, 116 * s, 86 * s)
     }
 
     // The Computer window, inside its client area: a toolbar (Back, the
@@ -814,11 +820,11 @@ impl Desktop {
     }
     fn files_rows(&self, client: &Rect) -> Rect {
         let s = self.ui;
-        let top = client.y + 36 * s + 26 * s;
+        let top = client.y + 36 * s + 30 * s;
         Rect::new(client.x, top, client.w, client.y + client.h - 28 * s - top)
     }
     fn files_row_h(&self) -> i32 {
-        26 * self.ui
+        30 * self.ui
     }
     fn files_visible(&self, client: &Rect) -> usize {
         (self.files_rows(client).h / self.files_row_h()).max(1) as usize
@@ -1037,7 +1043,7 @@ impl Desktop {
 
         // Column headings.
         let size_x = client.x + client.w - 90 * s;
-        let head = Rect::new(client.x, t.y + t.h, client.w, 26 * s);
+        let head = Rect::new(client.x, t.y + t.h, client.w, 30 * s);
         c.fill(head, 0xFFFFFF);
         let head_y = head.y + (head.h - Font::Normal.h(s)) / 2;
         c.text(client.x + 30 * s, head_y, "Name", rgb(60, 80, 110), Font::Normal);
@@ -1257,7 +1263,7 @@ impl Desktop {
             let title = self.windows[self.index(*kind)].title;
             c.text(item.x + 40 * s, item.y + (item.h - Font::Normal.h(s)) / 2, title, 0x101010, Font::Normal);
         }
-        c.text(l.x + 12 * s, l.y + l.h - Font::Normal.h(s) - 8 * s, "All programs are listed", rgb(90, 90, 90), Font::Normal);
+        c.text(l.x + 12 * s, l.y + l.h - Font::Normal.h(s) - 8 * s, "All programs", rgb(90, 90, 90), Font::Normal);
         // Right: the date in large type, and the exit button.
         let rx = l.x + l.w + 14 * s;
         c.text(rx, m.y + 16 * s, &self.clock.0, 0xFFFFFF, Font::Large);
@@ -1796,9 +1802,9 @@ fn main() -> i64 {
     let s = ui;
     let window = |kind, title, rect| Window { kind, title, rect, open: true, minimized: false, restore: None };
     let windows = alloc::vec![
-        window(Kind::Welcome, "Welcome", Rect::new(w / 12, h / 7, 400 * s, 250 * s)),
-        window(Kind::System, "System", Rect::new(w / 12 + 420 * s, h / 7 + 30 * s, 260 * s, 160 * s)),
-        window(Kind::Notes, "Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 420 * s, 240 * s)),
+        window(Kind::Welcome, "Welcome", Rect::new(w / 12, h / 7, 460 * s, 290 * s)),
+        window(Kind::System, "System", Rect::new(w / 12 + 480 * s, h / 7 + 30 * s, 300 * s, 190 * s)),
+        window(Kind::Notes, "Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 500 * s, 290 * s)),
         Window { open: false, ..window(Kind::Computer, "Computer", Rect::new(w - 540 * s, 40 * s, 520 * s, 360 * s)) },
         Window { open: false, ..window(Kind::Calculator, "Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s)) },
     ];

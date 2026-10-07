@@ -70,7 +70,7 @@ def main():
         if not (bar[2] > bar[0] and bar[2] < 160 and bar[0] < 80):
             sys.exit(f'{path}: no dark blue taskbar at the bottom ({w // 2},{h - 10} is {bar})')
         # Inside the moved Notes window's white client area, away from its text.
-        want = {(x + 400, y + 120): (255, 255, 255), (x + 20, y + 225): (255, 255, 255),
+        want = {(x + 486, y + 120): (255, 255, 255), (x + 486, y + 240): (255, 255, 255),
                 # Below the last row of the Computer window's list.
                 (cx + 300, cy + 200): (255, 255, 255)}
         # The Computer window was made 420 wide: wallpaper just right of it.
