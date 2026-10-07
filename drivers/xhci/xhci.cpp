@@ -202,7 +202,7 @@ private:
     uint32_t cycle_ = 1;
 };
 
-enum class HidKind : uint8_t { None, Keyboard, Mouse };
+enum class HidKind : uint8_t { None, Keyboard, Mouse, Tablet };
 enum class PadKind : uint8_t { None, Hid, XInput };
 
 // The report the driver turns each Xbox 360 (XInput) input report into, so
@@ -242,9 +242,16 @@ struct Device {
     Ring ep0{};
     dhi_dma in_ctx{}, out_ctx{};
 
-    // Boot-protocol HID interface, if any.
+    // Boot-protocol HID interface, or an absolute pointer (tablet), if any.
     HidKind hid = HidKind::None;
     uint8_t dci = 0;
+    // Where a tablet's report keeps its fields (from its report descriptor).
+    struct {
+        uint8_t report_id;                 // 0 = reports have no ID byte
+        uint16_t x_bit, y_bit, button_bit; // bit offsets after the ID byte
+        uint8_t x_size, y_size, buttons;   // field sizes in bits; button count
+        uint32_t x_max, y_max;             // logical maximum of X and Y
+    } tab{};
     Ring intr{};
     dhi_dma reports{};
     uint8_t last_keys[8] = {};
@@ -686,6 +693,7 @@ private:
         d.alive = true;
         if (index == count_) ++count_;
         ++generation_;
+        if (d.hid == HidKind::None && candidates_ > 0) find_tablet(d);
         if (d.hid != HidKind::None && !start_hid(d)) d.hid = HidKind::None;
         if (d.storage && !start_storage(d)) d.storage = false;
         if ((d.pad != PadKind::None || candidates_ > 0) && !start_pad(d)) d.pad = PadKind::None;
@@ -698,6 +706,7 @@ private:
          .s(" \"").s(d.info.name).s("\", ").s(speed < 7 ? kSpeed[speed] : "?");
         if (d.hid == HidKind::Keyboard) l.s(", HID boot keyboard");
         if (d.hid == HidKind::Mouse) l.s(", HID boot mouse");
+        if (d.hid == HidKind::Tablet) l.s(", HID tablet (absolute pointer)");
         if (d.disk_ok) {
             l.s(", disk ").s(d.disk.model).s(", ").u(d.disk.block_count * d.disk.block_size / (1024 * 1024)).s(" MiB");
         } else if (d.info.iface_class == 8) {
@@ -1146,14 +1155,14 @@ private:
 
     bool start_hid(Device& d) {
         const uint8_t iface = hid_iface_of_device_;
-        control(d, 0x21, 0x0B, 0, iface, 0, 0);  // SET_PROTOCOL(boot)
+        if (d.hid != HidKind::Tablet) control(d, 0x21, 0x0B, 0, iface, 0, 0);  // SET_PROTOCOL(boot)
         control(d, 0x21, 0x0A, 0, iface, 0, 0);  // SET_IDLE(0): report only on change
 
         if (!d.intr.init(ops_) || ops_->dma_alloc(kReportTrbs * kReportSize, &d.reports) != 0) return false;
         const IntrEp ep{d.dci, hid_mps_, hid_interval_, &d.intr};
         const uint32_t code = add_interrupt_endpoints(d, &ep, 1);
         if (code != kCcSuccess) {
-            ops_->log(Line().s("xhci: slot ").u(d.slot).s(d.hid == HidKind::Keyboard ? " keyboard" : " mouse")
+            ops_->log(Line().s("xhci: slot ").u(d.slot).s(d.hid == HidKind::Keyboard ? " keyboard" : " pointer")
                           .s(": controller refused its endpoint (code ").u(code).s(")").str());
             return false;
         }
@@ -1229,6 +1238,101 @@ private:
             i += 1 + size;
         }
         return false;
+    }
+
+    // Reads a HID report descriptor for an absolute pointer: absolute X and Y
+    // (Generic Desktop) and buttons (Button page) in one input report, the
+    // way tablets and touchscreens (and QEMU's usb-tablet) describe
+    // themselves. Fills `d.tab` and returns true if it found one.
+    static bool parse_tablet(Device& d, const uint8_t* desc, int len) {
+        uint32_t page = 0, size = 0, count = 0, max = 0, id = 0;
+        uint32_t usages[16], n_usages = 0, umin = 0, umax = 0;
+        uint32_t offset = 0;  // bits into the current report
+        bool have_x = false, have_y = false;
+        auto& t = d.tab;
+        t = {};
+        for (int i = 0; i < len;) {
+            const uint8_t b = desc[i];
+            if (b == 0xFE) {  // long item
+                i += 3 + (i + 1 < len ? desc[i + 1] : 0);
+                continue;
+            }
+            const int bytes = (b & 3) == 3 ? 4 : (b & 3);
+            if (i + 1 + bytes > len) break;
+            uint32_t v = 0;
+            for (int k = bytes - 1; k >= 0; --k) v = v << 8 | desc[i + 1 + k];
+            switch (b & 0xFC) {
+                case 0x04: page = v; break;                 // usage page
+                case 0x24: max = v; break;                  // logical maximum
+                case 0x74: size = v; break;                 // report size
+                case 0x94: count = v; break;                // report count
+                case 0x84:                                   // report ID
+                    if (have_x && have_y) return true;      // the pointer's report is complete
+                    id = v;
+                    offset = 0;
+                    have_x = have_y = false;
+                    t = {};
+                    break;
+                case 0x08:                                   // usage
+                    if (n_usages < 16) usages[n_usages++] = bytes == 4 ? v : page << 16 | v;
+                    break;
+                case 0x18: umin = page << 16 | v; break;     // usage minimum
+                case 0x28: umax = page << 16 | v; break;     // usage maximum
+                case 0x80: {                                 // input
+                    const bool absolute = (v & 4) == 0, constant = (v & 1) != 0;
+                    for (uint32_t k = 0; k < count && !constant; ++k) {
+                        uint32_t u = 0;
+                        if (k < n_usages) u = usages[k];
+                        else if (n_usages) u = usages[n_usages - 1];
+                        else if (umin && umin + k <= umax) u = umin + k;
+                        const uint32_t at = offset + k * size;
+                        if (u == 0x10030 && absolute && max && size <= 32) {
+                            t.x_bit = uint16_t(at), t.x_size = uint8_t(size), t.x_max = max, have_x = true;
+                        } else if (u == 0x10031 && absolute && max && size <= 32) {
+                            t.y_bit = uint16_t(at), t.y_size = uint8_t(size), t.y_max = max, have_y = true;
+                        } else if ((u >> 16) == 9 && size == 1 && t.buttons == 0) {
+                            t.button_bit = uint16_t(at);
+                            t.buttons = uint8_t(count - k < 8 ? count - k : 8);
+                        }
+                    }
+                    offset += size * count;
+                    n_usages = umin = umax = 0;
+                    break;
+                }
+                case 0x90: case 0xB0:                        // output, feature
+                    n_usages = umin = umax = 0;
+                    break;
+                default:
+                    break;
+            }
+            i += 1 + bytes;
+        }
+        if (!(have_x && have_y)) return false;
+        t.report_id = uint8_t(id);
+        return true;
+    }
+
+    // Looks among the device's other HID interfaces for an absolute pointer
+    // (not a gamepad) and makes it the device's HID interface if there is one.
+    void find_tablet(Device& d) {
+        dhi_dma buf{};
+        if (ops_->dma_alloc(kPadDesc, &buf) != 0) return;
+        auto* desc = static_cast<const uint8_t*>(buf.virt);
+        for (int i = 0; i < candidates_ && d.hid == HidKind::None; ++i) {
+            const PadCandidate& c = candidate_[i];
+            const uint16_t want = c.desc_len < kPadDesc ? c.desc_len : uint16_t(kPadDesc);
+            const int n = control(d, 0x81, 6, 0x2200, c.iface, want, buf.phys);  // GET_DESCRIPTOR(report)
+            if (n <= 0 || describes_gamepad(desc, n) || !parse_tablet(d, desc, n)) continue;
+            // The report must fit the transfer buffer.
+            const uint32_t bits_needed = (d.tab.report_id ? 8u : 0u) + d.tab.y_bit + d.tab.y_size;
+            if (bits_needed > uint32_t(kReportSize) * 8 || d.tab.x_bit + d.tab.x_size > uint32_t(kReportSize - 1) * 8) continue;
+            d.hid = HidKind::Tablet;
+            d.dci = c.dci;
+            hid_mps_ = c.mps;
+            hid_interval_ = c.interval;
+            hid_iface_of_device_ = c.iface;
+        }
+        ops_->dma_free(&buf);
     }
 
     // Starts the device's gamepad interface: the XInput one parse_config
@@ -1891,6 +1995,7 @@ private:
                 if (buf < d->reports.phys || buf >= d->reports.phys + kReportTrbs * kReportSize) return;
                 const auto* report = static_cast<const uint8_t*>(d->reports.virt) + (buf - d->reports.phys);
                 if (d->hid == HidKind::Keyboard) keyboard_report(*d, report);
+                else if (d->hid == HidKind::Tablet) tablet_report(*d, report);
                 else mouse_report(report);
                 queue_report(*d);
             } else if (code != kCcRingUnderrun && code != kCcRingOverrun && !d->intr_halt) {
@@ -1948,6 +2053,25 @@ private:
         ev.dx = int8_t(r[1]);
         ev.dy = int8_t(r[2]);
         enqueue(ev);
+    }
+
+    // A tablet's report: absolute X and Y, scaled to 0..32767, and buttons.
+    void tablet_report(const Device& d, const uint8_t* r) {
+        if (d.tab.report_id && r[0] != d.tab.report_id) return;
+        const uint8_t* f = d.tab.report_id ? r + 1 : r;
+        dhi_input_event ev{};
+        ev.kind = DHI_INPUT_TABLET;
+        for (int i = 0; i < d.tab.buttons && i < 3; ++i) ev.buttons |= uint8_t(bits(f, d.tab.button_bit + i, 1) << i);
+        ev.dx = int16_t(uint64_t(bits(f, d.tab.x_bit, d.tab.x_size)) * 32767 / d.tab.x_max);
+        ev.dy = int16_t(uint64_t(bits(f, d.tab.y_bit, d.tab.y_size)) * 32767 / d.tab.y_max);
+        enqueue(ev);
+    }
+
+    // `size` bits (up to 32) starting at bit `at` of a little-endian report.
+    static uint32_t bits(const uint8_t* r, uint32_t at, uint32_t size) {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < size && i < 32; ++i) v |= uint32_t((r[(at + i) / 8] >> ((at + i) % 8)) & 1) << i;
+        return v;
     }
 
     void enqueue(const dhi_input_event& ev) {

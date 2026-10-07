@@ -456,6 +456,11 @@ speed - and + buttons, and the desktop saves the choice as `mouse speed = N` in 
 applies it when it starts. The shell has `mouse speed <1-10>`; the boot test uses speed 5 so its
 pointer moves are exact, then raises it to 6 from the Start menu and checks the saved file and how far
 a quick move goes.
+Since 0.48 the xHCI driver also takes absolute pointers: a HID interface whose report descriptor has
+absolute X and Y (tablets, touchscreens, QEMU's `usb-tablet`) puts the pointer exactly where it points,
+whatever the mouse speed. A virtual PC can use one so the AeroForge pointer sits under the host's own.
+The desktop now draws every changed piece of a frame first and presents them once. The boot test plugs
+in a `usb-tablet`, points it through QMP (`tools/qemu-qmp.py`) and checks the shell's `mouse` reading.
 
 | Area | Status |
 |---|---|

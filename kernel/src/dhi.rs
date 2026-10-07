@@ -77,6 +77,8 @@ pub fn c_field(bytes: &[u8]) -> &str {
 
 pub const INPUT_KEY: u8 = 1;
 pub const INPUT_MOUSE: u8 = 2;
+/// An absolute pointer (tablet): dx, dy hold X and Y scaled to 0..32767.
+pub const INPUT_TABLET: u8 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
