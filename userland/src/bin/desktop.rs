@@ -581,13 +581,19 @@ impl Desktop {
                 let cols = ((client.w - 20 * s) / (8 * s)).max(1) as usize;
                 let rows = ((client.h - 20 * s) / line).max(1) as usize;
                 let mut lines: Vec<String> = Vec::new();
+                // Word wrap: break at the last space that fits, or mid-word
+                // when a word is longer than the line.
                 for part in self.notes.split('\n') {
-                    let bytes = part.as_bytes();
-                    if bytes.is_empty() {
-                        lines.push(String::new());
-                    }
-                    for chunk in bytes.chunks(cols) {
-                        lines.push(String::from_utf8_lossy(chunk).into_owned());
+                    let mut rest: Vec<char> = part.chars().collect();
+                    loop {
+                        if rest.len() <= cols {
+                            lines.push(rest.iter().collect());
+                            break;
+                        }
+                        let cut = rest[..=cols].iter().rposition(|&ch| ch == ' ').filter(|&i| i > 0).unwrap_or(cols);
+                        lines.push(rest[..cut].iter().collect());
+                        let skip = rest[cut..].iter().take_while(|&&ch| ch == ' ').count();
+                        rest.drain(..cut + skip);
                     }
                 }
                 let caret = active && (aero::clock_us() / 500_000) % 2 == 0;
