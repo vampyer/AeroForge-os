@@ -6,7 +6,8 @@
 //! taskbar (Start orb, window buttons, a clock with the date and a "show
 //! desktop" strip at the right) and glass-framed windows: Welcome, System,
 //! Notes and Computer, which browses the disks (double-click a folder to go
-//! in, Back or Backspace to go up, a text file to open it in Notes).
+//! in, Back or Backspace to go up, a text file to open it in Notes) and
+//! Calculator (click its keys or type 0-9 + - * / . = Enter Backspace C).
 //! The mouse moves a pointer; a window comes to the front
 //! when clicked, moves when dragged by its title bar and changes size when
 //! dragged by an edge or corner. Dragged against the top of the screen it
@@ -406,6 +407,19 @@ impl Canvas {
         self.rounded(Rect::new(x + 10 * s, y + 32 * s, 20 * s, 4 * s), 2 * s, false, rgb(110, 110, 120), rgb(40, 40, 50), 255);
     }
 
+    /// The Calculator icon: a grey body, a green display and keys, 24 x 36.
+    fn calculator(&mut self, x: i32, y: i32, s: i32) {
+        let body = Rect::new(x, y, 24 * s, 36 * s);
+        self.rounded(body, 3 * s, false, rgb(120, 130, 145), rgb(50, 55, 65), 255);
+        self.fill(Rect::new(x + 3 * s, y + 3 * s, 18 * s, 8 * s), rgb(190, 225, 190));
+        for row in 0..4 {
+            for col in 0..3 {
+                let color = if row == 3 && col == 2 { rgb(240, 160, 60) } else { rgb(235, 238, 242) };
+                self.fill(Rect::new(x + (3 + col * 6) * s, y + (14 + row * 5) * s, 4 * s, 3 * s), color);
+            }
+        }
+    }
+
     /// The Notes icon: a spiral notepad, 28 x 36 at scale 1.
     fn notepad(&mut self, x: i32, y: i32, s: i32) {
         let pad = Rect::new(x, y + 3 * s, 28 * s, 33 * s);
@@ -440,12 +454,136 @@ enum Kind {
     System,
     Notes,
     Computer,
+    Calculator,
 }
 
-const KINDS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::System, Kind::Welcome];
+const KINDS: [Kind; 5] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System, Kind::Welcome];
 
 /// Desktop icons, top to bottom.
-const ICONS: [Kind; 3] = [Kind::Computer, Kind::Notes, Kind::System];
+const ICONS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System];
+
+/// Calculator keys, row by row; "=" fills two rows at the bottom right.
+const CALC_KEYS: [[&str; 4]; 5] = [
+    ["C", "<-", "/", "*"],
+    ["7", "8", "9", "-"],
+    ["4", "5", "6", "+"],
+    ["1", "2", "3", "="],
+    ["+/-", "0", ".", "="],
+];
+
+/// Calculator: what the display shows and the sum so far.
+#[derive(Default)]
+struct Calc {
+    /// The number being typed or the last result, as shown.
+    display: String,
+    /// The left side and operator waiting for the right side.
+    pending: Option<(f64, u8)>,
+    /// The next digit starts a new number.
+    fresh: bool,
+}
+
+impl Calc {
+    fn value(&self) -> f64 {
+        parse_number(&self.display)
+    }
+
+    fn show(&mut self, v: f64) {
+        self.display = if v.is_finite() { number_text(v) } else { String::from("Cannot divide by zero") };
+        self.fresh = true;
+    }
+
+    /// One key: a digit, ".", an operator, "=", "C", Backspace (8) or
+    /// '~' (change sign). Returns the result when "=" finished a sum.
+    fn key(&mut self, k: u8) -> Option<String> {
+        match k {
+            b'0'..=b'9' | b'.' => {
+                if self.fresh || self.display == "0" || !self.display.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-') {
+                    self.display = String::from(if k == b'.' { "0" } else { "" });
+                    self.fresh = false;
+                }
+                if (k != b'.' || !self.display.contains('.')) && self.display.len() < 16 {
+                    self.display.push(k as char);
+                }
+            }
+            8 => {
+                if !self.fresh {
+                    self.display.pop();
+                    if self.display.is_empty() || self.display == "-" {
+                        self.display = String::from("0");
+                    }
+                }
+            }
+            b'~' => {
+                let v = -self.value();
+                self.display = number_text(v);
+            }
+            b'c' | b'C' => *self = Calc { display: String::from("0"), ..Default::default() },
+            b'+' | b'-' | b'*' | b'/' => {
+                let v = match self.pending {
+                    Some((left, op)) if !self.fresh => apply(left, op, self.value()),
+                    _ => self.value(),
+                };
+                self.show(v);
+                self.pending = Some((v, k));
+            }
+            b'=' | b'\n' => {
+                let (left, op) = self.pending.take()?;
+                let v = apply(left, op, self.value());
+                self.show(v);
+                return Some(self.display.clone());
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+fn apply(a: f64, op: u8, b: f64) -> f64 {
+    match op {
+        b'+' => a + b,
+        b'-' => a - b,
+        b'*' => a * b,
+        _ if b == 0.0 => f64::INFINITY,
+        _ => a / b,
+    }
+}
+
+fn parse_number(s: &str) -> f64 {
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let mut v = 0.0;
+    for b in whole.bytes().filter(u8::is_ascii_digit) {
+        v = v * 10.0 + (b - b'0') as f64;
+    }
+    let mut scale = 0.1;
+    for b in frac.bytes().filter(u8::is_ascii_digit) {
+        v += (b - b'0') as f64 * scale;
+        scale /= 10.0;
+    }
+    if neg { -v } else { v }
+}
+
+/// A result the way a pocket calculator shows it: up to 10 decimals,
+/// without trailing zeros.
+fn number_text(v: f64) -> String {
+    if v.abs() >= 1e15 {
+        return format!("{:e}", v);
+    }
+    let mut t = format!("{:.10}", v);
+    while t.ends_with('0') {
+        t.pop();
+    }
+    if t.ends_with('.') {
+        t.pop();
+    }
+    if t == "-0" {
+        t = String::from("0");
+    }
+    t
+}
 
 /// Which edges of a window a resize drag moves.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -519,6 +657,7 @@ struct Desktop {
     clock: (String, String),
     quit: bool,
     files: Files,
+    calc: Calc,
     /// The selected desktop icon.
     icon: Option<usize>,
     /// When and where the last press was, for double-clicks.
@@ -617,11 +756,29 @@ impl Desktop {
     }
     fn icon_rect(&self, i: usize) -> Rect {
         let s = self.ui;
-        Rect::new(6 * s, 10 * s + i as i32 * 94 * s, 86 * s, 86 * s)
+        Rect::new(4 * s, 10 * s + i as i32 * 94 * s, 96 * s, 86 * s)
     }
 
     // The Computer window, inside its client area: a toolbar (Back, the
     // address, page up and down), column headings, the rows and a status bar.
+    /// The calculator's display and key `(row, col)` inside its client area.
+    fn calc_display(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x + 10 * s, client.y + 10 * s, client.w - 20 * s, 52 * s)
+    }
+    fn calc_key(&self, client: &Rect, row: usize, col: usize) -> Rect {
+        let s = self.ui;
+        let top = client.y + 72 * s;
+        let (kw, kh) = ((client.w - 20 * s - 3 * 6 * s) / 4, (client.y + client.h - 10 * s - top - 4 * 6 * s) / 5);
+        let x = client.x + 10 * s + col as i32 * (kw + 6 * s);
+        let y = top + row as i32 * (kh + 6 * s);
+        // "=" covers the last two rows of the last column.
+        if CALC_KEYS[row][col] == "=" {
+            return Rect::new(x, top + 3 * (kh + 6 * s), kw, 2 * kh + 6 * s);
+        }
+        Rect::new(x, y, kw, kh)
+    }
+
     fn files_toolbar(&self, client: &Rect) -> Rect {
         Rect::new(client.x, client.y, client.w, 36 * self.ui)
     }
@@ -786,6 +943,7 @@ impl Desktop {
                 }
             }
             Kind::Computer => self.files_view(c, &client),
+            Kind::Calculator => self.calc_view(c, &client),
         }
     }
 
@@ -878,6 +1036,40 @@ impl Desktop {
         c.text(bar.x + 8 * s, bar.y + (bar.h - Font::Normal.h(s)) / 2, &f.status, rgb(30, 50, 80), Font::Normal);
     }
 
+    fn calc_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        c.gradient(*client, rgb(225, 235, 248), rgb(200, 215, 235), 255);
+        let d = self.calc_display(client);
+        c.gradient(d, rgb(250, 252, 255), rgb(228, 238, 250), 255);
+        c.frame(d, rgb(130, 150, 180));
+        if let Some((_, op)) = self.calc.pending {
+            c.text(d.x + 8 * s, d.y + 6 * s, &format!("{}", op as char), rgb(90, 100, 120), Font::Normal);
+        }
+        let shown = &self.calc.display;
+        let font = if Font::Large.width(s, shown) <= d.w - 16 * s { Font::Large } else { Font::Normal };
+        c.text(d.x + d.w - 8 * s - font.width(s, shown), d.y + d.h - font.h(s) - 6 * s, shown, 0x101010, font);
+        for row in 0..5 {
+            for col in 0..4 {
+                let label = CALC_KEYS[row][col];
+                if label == "=" && row == 4 {
+                    continue;
+                }
+                let k = self.calc_key(client, row, col);
+                let hover = k.contains(self.pointer.x as i32, self.pointer.y as i32);
+                let (top, bottom) = match (label, hover) {
+                    ("=", false) => (rgb(255, 225, 170), rgb(240, 170, 80)),
+                    ("=", true) => (rgb(255, 240, 200), rgb(250, 190, 110)),
+                    (_, false) => (rgb(252, 253, 255), rgb(215, 225, 240)),
+                    (_, true) => (rgb(235, 248, 255), rgb(170, 215, 250)),
+                };
+                c.rounded(k, 3 * s, false, top, bottom, 255);
+                c.rounded_outline(k, 3 * s, false, rgb(120, 140, 170), 255);
+                let (tw, th) = (Font::Normal.width(s, label), Font::Normal.h(s));
+                c.text(k.x + (k.w - tw) / 2, k.y + (k.h - th) / 2, label, 0x101010, Font::Normal);
+            }
+        }
+    }
+
     /// The desktop icons: a picture over a white label with a dark shadow.
     fn icons(&self, c: &mut Canvas) {
         let s = self.ui;
@@ -898,6 +1090,7 @@ impl Desktop {
             match kind {
                 Kind::Computer => c.computer(px, py, s),
                 Kind::Notes => c.notepad(px + 6 * s, py, s),
+                Kind::Calculator => c.calculator(px + 8 * s, py, s),
                 _ => {
                     c.orb(px + 20 * s, py + 19 * s, 17 * s, rgb(140, 210, 255), rgb(20, 90, 170));
                     c.fill(Rect::new(px + 18 * s, py + 9 * s, 4 * s, 4 * s), 0xFFFFFF);
@@ -1260,6 +1453,21 @@ impl Desktop {
                 self.drag = Some((i, x - r.x, y - r.y));
             } else if self.windows[i].kind == Kind::Computer && self.client(&r).contains(x, y) {
                 dirty = dirty.union(&self.files_click(x, y, double));
+            } else if self.windows[i].kind == Kind::Calculator {
+                let client = self.client(&r);
+                for row in 0..5 {
+                    for col in 0..4 {
+                        if self.calc_key(&client, row, col).contains(x, y) {
+                            let key = match CALC_KEYS[row][col] {
+                                "<-" => 8,
+                                "+/-" => b'~',
+                                label => label.as_bytes()[0],
+                            };
+                            self.calc_key_pressed(key);
+                            return dirty.union(&self.window_area(i));
+                        }
+                    }
+                }
             }
             return dirty;
         }
@@ -1276,6 +1484,12 @@ impl Desktop {
         dirty
     }
 
+    fn calc_key_pressed(&mut self, key: u8) {
+        if let Some(result) = self.calc.key(key) {
+            println!("[desktop] calculator: {}", result);
+        }
+    }
+
     /// Opens a window from its icon or the Start menu.
     fn open(&mut self, kind: Kind) -> Rect {
         let at = self.index(kind);
@@ -1284,6 +1498,10 @@ impl Desktop {
         }
         let r = self.windows[at].rect;
         println!("[desktop] opened {} at {},{} ({}x{})", self.windows[at].title, r.x, r.y, r.w, r.h);
+        if kind == Kind::Calculator {
+            let k = self.calc_key(&self.client(&r), 3, 3);
+            println!("[desktop] Calculator = key at {},{}", k.x + k.w / 2, k.y + k.h / 2);
+        }
         self.bring(kind)
     }
 
@@ -1404,6 +1622,11 @@ impl Desktop {
                 dirty = dirty.union(&self.go_up());
                 continue;
             }
+            if self.top_kind() == Some(Kind::Calculator) {
+                self.calc_key_pressed(k);
+                dirty = dirty.union(&self.window_area(self.windows.len() - 1));
+                continue;
+            }
             if self.top_kind() != Some(Kind::Notes) {
                 continue;
             }
@@ -1483,6 +1706,7 @@ fn main() -> i64 {
         window(Kind::System, "System", Rect::new(w / 12 + 420 * s, h / 7 + 30 * s, 260 * s, 160 * s)),
         window(Kind::Notes, "Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 420 * s, 240 * s)),
         Window { open: false, ..window(Kind::Computer, "Computer", Rect::new(w - 540 * s, 40 * s, 520 * s, 360 * s)) },
+        Window { open: false, ..window(Kind::Calculator, "Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s)) },
     ];
     let pointer = screen.pointer().unwrap_or_default();
     let started_us = aero::clock_us();
@@ -1502,6 +1726,7 @@ fn main() -> i64 {
         clock: clock(started_us),
         quit: false,
         files: Files { path: String::from("/"), entries: Vec::new(), scroll: 0, selected: None, status: String::new() },
+        calc: Calc { display: String::from("0"), ..Default::default() },
         icon: None,
         last_press: (0, 0, 0),
     };
@@ -1509,8 +1734,9 @@ fn main() -> i64 {
     present(&screen, &mut canvas, &desk, Rect::new(0, 0, w, h));
     let notes = desk.windows[desk.index(Kind::Notes)].rect;
     let icon = desk.icon_rect(0);
-    println!("[desktop] up at {}x{}; Notes title bar at {},{}; Computer icon at {},{}", w, h, notes.x + 60 * s,
-        notes.y + 12 * s, icon.x + icon.w / 2, icon.y + icon.h / 2);
+    let calc = desk.icon_rect(2);
+    println!("[desktop] up at {}x{}; Notes title bar at {},{}; Computer icon at {},{}; Calculator icon at {},{}", w, h,
+        notes.x + 60 * s, notes.y + 12 * s, icon.x + icon.w / 2, icon.y + icon.h / 2, calc.x + calc.w / 2, calc.y + calc.h / 2);
 
     let mut keys = [0u8; 64];
     let mut tick = 0u64;

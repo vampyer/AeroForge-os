@@ -7,7 +7,7 @@ import socket
 import sys
 import time
 
-KEYS = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', ':': 'shift-semicolon', '"': 'shift-apostrophe', '=': 'equal'}
+KEYS = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', ':': 'shift-semicolon', '"': 'shift-apostrophe', '=': 'equal', '+': 'shift-equal', '*': 'shift-8'}
 
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])

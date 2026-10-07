@@ -311,6 +311,9 @@ constexpr char kHidShifted[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\n\x1b\b\t _+{}|~:\"~<>?";
 static_assert(sizeof(kHidNormal) == 0x38 - 0x04 + 2);
 constexpr uint8_t kHidCapsLock = 0x39;
+// The number pad, 0x54..0x63, read as if Num Lock were on.
+constexpr char kHidKeypad[] = "/*-+\n1234567890.";
+static_assert(sizeof(kHidKeypad) == 0x63 - 0x54 + 2);
 
 class Controller {
 public:
@@ -1923,6 +1926,7 @@ private:
             }
             char c = 0;
             if (usage >= 0x04 && usage <= 0x38) c = (shift ? kHidShifted : kHidNormal)[usage - 0x04];
+            else if (usage >= 0x54 && usage <= 0x63) c = kHidKeypad[usage - 0x54];
             if (caps_ && c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
             else if (caps_ && c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
             dhi_input_event ev{};
