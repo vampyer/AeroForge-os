@@ -353,7 +353,15 @@ extern "C" fn dhi_irq_wait(source: u32) {
         Some(e) if sched::can_block() => {
             e.wait(1);
         }
-        _ => apic::delay_us(1),
+        // Early boot (the disks are mounted from the boot thread, which
+        // cannot sleep): spin on the same event for up to one tick. Drivers
+        // count every wait as 10 ms toward their command timeouts, so a wait
+        // that returned at once let a slow read time out after well under a
+        // millisecond and the volume silently failed to mount.
+        Some(e) => {
+            e.spin_wait(10_000);
+        }
+        None => apic::delay_us(1),
     }
 }
 
