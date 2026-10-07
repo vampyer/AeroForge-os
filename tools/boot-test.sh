@@ -98,7 +98,7 @@ python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm
+rm -f "$LOG" build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -337,7 +337,10 @@ for _ in $(seq "$TIMEOUT"); do
         point_at 100 12; monitor "mouse_button 1"; monitor "mouse_move 100 100"; monitor "mouse_move 100 100"
         monitor "mouse_button 0"; STAGE=deskunsnap
     elif [ $STAGE = deskunsnap ] && grep -q "\[desktop\] moved Welcome" "$LOG"; then
-        sleep 0.5; monitor "sendkey esc"; STAGE=deskdone
+        # Open the Start menu for a screenshot of it and the Start button.
+        sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
+        sleep 1; monitor "screendump build/gop-start.ppm"
+        monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
         sleep 1; type_keys $'run spreadtest\n'; STAGE=spread
     elif [ $STAGE = spread ] && grep -q "\[spreadtest\] .*\(: OK\|FAILED\)" "$LOG"; then
@@ -425,9 +428,10 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] Computer: / = .*docs | games | .*README.TXT" "$LOG" \
             || { fail "the Computer window did not list the disk's root folder (folders first)"; }
         grep -q "\[desktop\] snapped Welcome to 0,0 640x760" "$LOG" || { fail "dragging Welcome against the left edge did not snap it to the left half"; }
-        grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (340x180)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
+        grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (400x250)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
+        python3 tools/check-screen.py start build/gop-start.ppm || { fail "the Start button or the Start menu is wrong in the screenshot"; }
         python3 tools/check-screen.py snap build/gop-snap.ppm || { fail "the snapped window is not on the left half of the screenshot"; }
-        grep -q "\[desktop\] resized Computer to 360x400" "$LOG" || { fail "dragging the Computer window's corner did not resize it to 360x400"; }
+        grep -q "\[desktop\] resized Computer to 420x440" "$LOG" || { fail "dragging the Computer window's corner did not resize it to 420x440"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
         grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \

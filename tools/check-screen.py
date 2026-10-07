@@ -8,6 +8,8 @@ Usage: check-screen.py drawtest <ppm>   red, green, blue and white quarters
                                         the Notes window moved to x,y and the
                                         Computer window at cx,cy
        check-screen.py snap <ppm>       a window snapped to the left half
+       check-screen.py start <ppm>      the Start button (red, white and blue
+                                        with a black star) and the open menu
 """
 import sys
 
@@ -61,20 +63,34 @@ def main():
     elif mode == 'desktop':
         x, y = int(sys.argv[3]), int(sys.argv[4])
         cx, cy = int(sys.argv[5]), int(sys.argv[6])
-        folder = at(cx + 55, cy + 46)
+        folder = at(cx + 57, cy + 49)
         if not (folder[0] > 200 and folder[1] > 140 and folder[2] < 140):
-            sys.exit(f'{path}: no yellow folder in the Computer window\'s address bar ({cx + 55},{cy + 46} is {folder})')
+            sys.exit(f'{path}: no yellow folder in the Computer window\'s address bar ({cx + 57},{cy + 49} is {folder})')
         bar = at(w // 2, h - 10)
         if not (bar[2] > bar[0] and bar[2] < 160 and bar[0] < 80):
             sys.exit(f'{path}: no dark blue taskbar at the bottom ({w // 2},{h - 10} is {bar})')
         # Inside the moved Notes window's white client area, away from its text.
-        want = {(x + 300, y + 120): (255, 255, 255), (x + 20, y + 150): (255, 255, 255),
+        want = {(x + 400, y + 50): (255, 255, 255), (x + 20, y + 225): (255, 255, 255),
                 # Below the last row of the Computer window's list.
                 (cx + 300, cy + 200): (255, 255, 255)}
-        # The Computer window was made 360 wide: wallpaper just right of it.
-        paper = at(cx + 380, cy + 200)
+        # The Computer window was made 420 wide: wallpaper just right of it.
+        paper = at(cx + 440, cy + 200)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
-            sys.exit(f'{path}: the Computer window was not resized ({cx + 380},{cy + 200} is {paper})')
+            sys.exit(f'{path}: the Computer window was not resized ({cx + 440},{cy + 200} is {paper})')
+    elif mode == 'start':
+        ox, oy = 27, h - 20
+        red, white, star = at(ox - 16, oy), at(ox, oy + 12), at(ox, oy + 1)
+        if not (red[0] > 150 and red[1] < 90 and red[2] < 90):
+            sys.exit(f'{path}: the Start button has no red outer ring ({ox - 16},{oy} is {red})')
+        if not min(white) > 160:
+            sys.exit(f'{path}: the Start button has no white ring ({ox},{oy + 12} is {white})')
+        if not max(star) < 80:
+            sys.exit(f'{path}: the Start button has no black star in the middle ({ox},{oy + 1} is {star})')
+        # The menu's near-white program list, below its four entries.
+        menu = at(60, h - 40 - 380 + 8 + 200)
+        if not min(menu) > 225:
+            sys.exit(f'{path}: the Start menu is not open (60,{h - 212} is {menu})')
+        want = {}
     elif mode == 'snap':
         # Welcome's white client area fills the left half below its text;
         # the right half still shows wallpaper below the other windows.
