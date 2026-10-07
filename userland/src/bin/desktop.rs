@@ -8,7 +8,8 @@
 //! Notes and Computer, which browses the disks (double-click a folder to go
 //! in, Back or Backspace to go up, a text file to open it in Notes).
 //! The mouse moves a pointer; a window comes to the front
-//! when clicked and moves when dragged by its title bar; its caption
+//! when clicked, moves when dragged by its title bar and changes size when
+//! dragged by an edge or corner; its caption
 //! buttons minimize, maximize and close it; taskbar buttons switch between
 //! windows. The Start menu lists the programs and has "Exit to console";
 //! Esc also gives the screen back to the shell. Keys typed while Notes is
@@ -315,6 +316,21 @@ const KINDS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::System, Kind::Welco
 /// Desktop icons, top to bottom.
 const ICONS: [Kind; 3] = [Kind::Computer, Kind::Notes, Kind::System];
 
+/// Which edges of a window a resize drag moves.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Edges {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl Edges {
+    fn any(&self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
+}
+
 /// Two presses closer together than this are a double-click.
 const DOUBLE_CLICK_US: u64 = 500_000;
 
@@ -360,6 +376,9 @@ struct Desktop {
     notes: String,
     pointer: Pointer,
     drag: Option<(usize, i32, i32)>, // window, grab offset
+    /// The window being resized, which edges move, and where it and the
+    /// pointer were when the drag began.
+    resize: Option<(usize, Edges, Rect, i32, i32)>,
     menu: bool,
     /// Windows hidden by "Show desktop", to bring back on the next click.
     peeked: Vec<Kind>,
@@ -435,7 +454,33 @@ impl Desktop {
         Rect::new(m.x + m.w - 140 * s, m.y + m.h - 36 * s, 130 * s, 26 * s)
     }
     fn cursor_rect(&self) -> Rect {
-        Rect::new(self.pointer.x as i32, self.pointer.y as i32, 12 * self.ui, 19 * self.ui)
+        // Room for the arrow and for the resize arrows centred on the pointer.
+        let s = self.ui;
+        Rect::new(self.pointer.x as i32 - 10 * s, self.pointer.y as i32 - 10 * s, 23 * s, 30 * s)
+    }
+    /// The edges of the front-most window under (x, y) that a drag from
+    /// there would move: the outer few pixels of its frame and its corners.
+    fn edges_at(&self, x: i32, y: i32) -> Option<(usize, Edges)> {
+        let i = (0..self.windows.len()).rev().find(|&i| self.windows[i].shown() && self.windows[i].rect.contains(x, y))?;
+        let win = &self.windows[i];
+        if win.restore.is_some() {
+            return None;
+        }
+        let r = win.rect;
+        let band = 5 * self.ui;
+        let corner = 14 * self.ui;
+        let near_left = x < r.x + band;
+        let near_right = x >= r.x + r.w - band;
+        let near_top = y < r.y + band;
+        let near_bottom = y >= r.y + r.h - band;
+        // Close to a corner, along either edge, moves both.
+        let e = Edges {
+            left: near_left || ((near_top || near_bottom) && x < r.x + corner),
+            right: near_right || ((near_top || near_bottom) && x >= r.x + r.w - corner),
+            top: near_top || ((near_left || near_right) && y < r.y + corner),
+            bottom: near_bottom || ((near_left || near_right) && y >= r.y + r.h - corner),
+        };
+        e.any().then_some((i, e))
     }
     fn icon_rect(&self, i: usize) -> Rect {
         let s = self.ui;
@@ -856,6 +901,32 @@ impl Desktop {
 
     fn cursor(&self, c: &mut Canvas) {
         let (x0, y0, s) = (self.pointer.x as i32, self.pointer.y as i32, self.ui);
+        let edges = match self.resize {
+            Some((_, e, ..)) => Some(e),
+            None if self.drag.is_none() => self.edges_at(x0, y0).map(|(_, e)| e),
+            None => None,
+        };
+        if let Some(e) = edges {
+            // A double-headed arrow along the direction the edge moves.
+            let ux = if e.left || e.right { 1 } else { 0 };
+            let uy = if e.top || e.bottom { 1 } else { 0 };
+            let uy = if (e.left && e.bottom) || (e.right && e.top) { -uy } else { uy };
+            let len = if ux != 0 && uy != 0 { 6 * s } else { 8 * s };
+            for (size, color) in [(3 * s, 0xFFFFFF), (s, 0x000000)] {
+                let o = (size - s) / 2;
+                c.line(x0 - ux * len - o, y0 - uy * len - o, x0 + ux * len - o, y0 + uy * len - o, size, color);
+                for sign in [1, -1] {
+                    // At each tip, two short strokes back towards the middle,
+                    // turned 45 degrees either way.
+                    let (tx, ty) = (x0 + sign * ux * len, y0 + sign * uy * len);
+                    let (bx, by) = (-sign * ux, -sign * uy);
+                    for (hx, hy) in [(bx + by, by - bx), (bx - by, by + bx)] {
+                        c.line(tx - o, ty - o, tx + hx * 3 * s - o, ty + hy * 3 * s - o, size, color);
+                    }
+                }
+            }
+            return;
+        }
         for (row, line) in ARROW.iter().enumerate() {
             for (col, ch) in line.bytes().enumerate() {
                 let color = match ch {
@@ -1022,6 +1093,8 @@ impl Desktop {
             } else if self.caption(&r, Caption::Maximize).contains(x, y) {
                 self.maximize(i);
                 dirty = dirty.union(&self.window_area(i));
+            } else if let Some((_, edges)) = self.edges_at(x, y) {
+                self.resize = Some((i, edges, r, x, y));
             } else if double && y < r.y + self.title_h() {
                 self.drag = None;
                 self.maximize(i);
@@ -1053,7 +1126,7 @@ impl Desktop {
             self.open_dir(String::from("/"));
         }
         let r = self.windows[at].rect;
-        println!("[desktop] opened {} at {},{}", self.windows[at].title, r.x, r.y);
+        println!("[desktop] opened {} at {},{} ({}x{})", self.windows[at].title, r.x, r.y, r.w, r.h);
         self.bring(kind)
     }
 
@@ -1264,6 +1337,7 @@ fn main() -> i64 {
         notes: String::new(),
         pointer,
         drag: None,
+        resize: None,
         menu: false,
         peeked: Vec::new(),
         started_us,
@@ -1306,6 +1380,35 @@ fn main() -> i64 {
                     let r = desk.windows[i].rect;
                     println!("[desktop] moved {} to {},{}", desk.windows[i].title, r.x, r.y);
                     desk.drag = None;
+                }
+            }
+            if let Some((i, edges, start, x0, y0)) = desk.resize {
+                if p.buttons & 1 != 0 {
+                    let before = desk.window_area(i);
+                    let (dx, dy) = (p.x as i32 - x0, p.y as i32 - y0);
+                    let (min_w, min_h) = (240 * s, 150 * s);
+                    let r = &mut desk.windows[i].rect;
+                    if edges.right {
+                        r.w = (start.w + dx).max(min_w);
+                    }
+                    if edges.left {
+                        r.w = (start.w - dx).max(min_w);
+                        r.x = start.x + start.w - r.w;
+                    }
+                    if edges.bottom {
+                        r.h = (start.h + dy).max(min_h);
+                    }
+                    if edges.top {
+                        // The title bar may not go above the screen.
+                        r.h = (start.h - dy).max(min_h).min(start.y + start.h);
+                        r.y = start.y + start.h - r.h;
+                    }
+                    dirty = dirty.union(&before).union(&desk.window_area(i));
+                } else {
+                    let r = desk.windows[i].rect;
+                    println!("[desktop] resized {} to {}x{}", desk.windows[i].title, r.w, r.h);
+                    desk.resize = None;
+                    dirty = dirty.union(&desk.window_area(i));
                 }
             }
             if desk.top_kind() == Some(Kind::System) {

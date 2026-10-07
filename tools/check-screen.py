@@ -70,6 +70,10 @@ def main():
         want = {(x + 300, y + 120): (255, 255, 255), (x + 20, y + 150): (255, 255, 255),
                 # Below the last row of the Computer window's list.
                 (cx + 300, cy + 200): (255, 255, 255)}
+        # The Computer window was made 360 wide: wallpaper just right of it.
+        paper = at(cx + 380, cy + 200)
+        if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
+            sys.exit(f'{path}: the Computer window was not resized ({cx + 380},{cy + 200} is {paper})')
     else:
         sys.exit(__doc__)
     bad = [f'{xy} is {at(*xy)}, expected {rgb}' for xy, rgb in want.items() if at(*xy) != rgb]

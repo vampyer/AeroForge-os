@@ -425,6 +425,9 @@ title bar maximizes the window. A new system call, `dir_list` (53), gives progra
 entries (`aero::list_dir`). The boot test opens Computer from its icon, goes into `/docs` and opens
 the welcome file in Notes.
 
+Since 0.40 windows change size when dragged by an edge or a corner, with a double-headed arrow
+pointer over the edges; the boot test makes the Computer window narrower and taller by its corner.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
