@@ -203,7 +203,8 @@ pub fn poll_thread(_: u64) {
                         let y = (MOUSE_Y.load(Ordering::Relaxed) + ev.dy as i32).clamp(0, h as i32 - 1);
                         MOUSE_X.store(x, Ordering::Relaxed);
                         MOUSE_Y.store(y, Ordering::Relaxed);
-                        MOUSE_BUTTONS.store(ev.buttons as u32, Ordering::Relaxed);
+                        let old = MOUSE_BUTTONS.swap(ev.buttons as u32, Ordering::Relaxed);
+                        crate::input::buttons(old, ev.buttons as u32);
                     }
                     _ => {}
                 }

@@ -106,6 +106,10 @@ static KEYS: KeyQueue = KeyQueue {
 };
 
 pub fn push_key(c: u8) {
+    // A program that owns the screen gets the keys instead of the shell.
+    if crate::input::push_key(c) {
+        return;
+    }
     let head = KEYS.head.load(Ordering::Relaxed);
     let next = (head + 1) % 256;
     if next != KEYS.tail.load(Ordering::Acquire) {

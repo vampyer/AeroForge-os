@@ -98,7 +98,7 @@ python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm
+rm -f "$LOG" build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -273,6 +273,24 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-draw.ppm"; STAGE=drawn
     elif [ $STAGE = drawn ] && grep -q "\[drawtest\] .*\(: OK\|FAILED\)" "$LOG"; then
         sleep 1; monitor "screendump build/gop-console.ppm"
+        # The desktop: drag the Notes window with the mouse, type into it,
+        # take a screenshot, and leave with Esc.
+        sleep 1; type_keys $'run desktop\n'; STAGE=desk
+    elif [ $STAGE = desk ] && grep -q "\[desktop\] \(up at\|could not\)" "$LOG"; then
+        sleep 1
+        # Pointer to the top-left corner, then onto Notes' title bar.
+        for i in $(seq 1 30); do monitor "mouse_move -100 -100"; done
+        XY=$(grep -ao "Notes title bar at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
+        X=${XY%,*}; Y=${XY#*,}
+        while [ "${X:-0}" -gt 0 ]; do d=$((X > 100 ? 100 : X)); monitor "mouse_move $d 0"; X=$((X - d)); done
+        while [ "${Y:-0}" -gt 0 ]; do d=$((Y > 100 ? 100 : Y)); monitor "mouse_move 0 $d"; Y=$((Y - d)); done
+        sleep 0.5; monitor "mouse_button 1"; sleep 0.5
+        monitor "mouse_move 100 50"; sleep 0.3; monitor "mouse_move 100 50"; sleep 0.5
+        monitor "mouse_button 0"; sleep 0.5
+        type_keys 'hello aero'
+        sleep 1; monitor "screendump build/gop-desktop.ppm"
+        monitor "sendkey esc"; STAGE=deskdone
+    elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
         sleep 1; type_keys $'run spreadtest\n'; STAGE=spread
     elif [ $STAGE = spread ] && grep -q "\[spreadtest\] .*\(: OK\|FAILED\)" "$LOG"; then
         # Tickless idle: timer interrupts per CPU over one second.
@@ -354,6 +372,9 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "a program could not take the screen, draw on it and give it back"; }
         python3 tools/check-screen.py drawtest build/gop-draw.ppm || { fail "drawtest's picture was not on the screen"; }
         python3 tools/check-screen.py console build/gop-console.ppm || { fail "the console did not come back after drawtest"; }
+        grep -q "\[desktop\] moved Notes to 466,414" "$LOG" || { fail "dragging the Notes window with the mouse did not move it to 466,414"; }
+        grep -q "\[desktop\] notes: hello aero" "$LOG" || { fail "keys typed on the desktop did not reach the Notes window"; }
+        python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 || { fail "the desktop screenshot is wrong"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }
         grep -q "^  cpu0: [0-5] timer interrupts" "$LOG" \
@@ -426,7 +447,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

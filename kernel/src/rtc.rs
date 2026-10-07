@@ -4,6 +4,8 @@
 
 use crate::arch;
 
+static CMOS: spin::Mutex<()> = spin::Mutex::new(());
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DateTime {
     pub year: u16,
@@ -35,6 +37,8 @@ fn read_raw() -> [u8; 7] {
 /// The current date and time, or None if the clock reads as nonsense.
 pub fn now() -> Option<DateTime> {
     let (raw, status_b) = arch::without_interrupts(|| {
+        // One CPU at a time: the index and data ports are a pair.
+        let _cmos = CMOS.lock();
         // Read until two reads agree, in case an update slipped in between.
         let mut a = read_raw();
         for _ in 0..5 {

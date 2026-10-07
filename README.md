@@ -403,6 +403,19 @@ so frames never tear. Tested on a Minisforum UM590 (Vega 8, 4K screen at 30 Hz):
 landed at a vertical blank. The boot also prints each graphics device and the USB devices just before
 the prompt, so a photo of the screen tells what was found on real hardware.
 
+Since 0.38 there is a first desktop, in the style of Windows 7 with artwork of our own: `run desktop`
+at the prompt. The `desktop` program takes the screen and draws, in software, a blue wallpaper, a
+dark glass taskbar (Start orb, window buttons, clock and date, a "show desktop" strip) and three
+glass-framed windows (Welcome, System and Notes). Click a window to bring it to the front, drag it by
+its title bar, and use its minimize, maximize and close buttons; taskbar buttons switch windows and
+the Start menu reopens closed ones. Keys typed while Notes is in front go into it. Start > Exit to
+console, or Esc, gives the screen back. A `time` system call (52) gives programs the PC's clock.
+It only redraws and presents what changed. Two new system calls give the program that owns the
+screen the mouse pointer (`pointer`, 50: position, buttons and a count of left-button presses, so a
+quick click between two reads is not lost) and the typed keys (`keys_read`, 51); while a program
+owns the screen, keys go to it instead of the shell. The boot test drags the Notes window with
+QEMU's mouse, types into it and checks a screenshot.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -431,7 +444,7 @@ the prompt, so a photo of the screen tells what was found on real hardware.
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
 `thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
 `socket_recv`, `socket_listen`, `socket_accept`, `net_info`, `event_create`, `event_set`, `event_reset`,
-`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`.
+`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1

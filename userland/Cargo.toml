@@ -10,6 +10,9 @@ name = "aero"
 path = "src/lib.rs"
 test = false
 
+[dependencies]
+font8x8 = { version = "0.3", default-features = false }
+
 [profile.dev]
 panic = "abort"
 
