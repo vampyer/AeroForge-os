@@ -433,6 +433,13 @@ screen to fill it, or against the left or right side to fill that half (a glass 
 first). Dragging a snapped or maximized window away gives back its old size. The boot test snaps
 Welcome to the left half, checks a screenshot, and drags it back.
 
+Since 0.42 the Start button is a red, white and blue circle with a black star, and the desktop's
+text is Noto Sans Mono (SIL Open Font License, pre-rendered with smooth edges by the
+`noto-sans-mono-bitmap` crate), 20 pixels tall instead of the old 8 x 8 bitmap font, so it is clearer
+and bigger. Since 0.43 there is a Calculator (desktop icon and Start menu): click its keys or type
+digits, `+ - * / .`, `=` or Enter, Backspace and C; the number pad works too. The boot test types
+`12+30*2`, clicks `=` and checks for 84.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

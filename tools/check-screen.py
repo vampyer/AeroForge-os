@@ -86,10 +86,10 @@ def main():
             sys.exit(f'{path}: the Start button has no white ring ({ox},{oy + 12} is {white})')
         if not max(star) < 80:
             sys.exit(f'{path}: the Start button has no black star in the middle ({ox},{oy + 1} is {star})')
-        # The menu's near-white program list, below its four entries.
-        menu = at(60, h - 40 - 380 + 8 + 200)
+        # The menu's near-white program list, below its five entries.
+        menu = at(60, h - 40 - 380 + 8 + 250)
         if not min(menu) > 225:
-            sys.exit(f'{path}: the Start menu is not open (60,{h - 212} is {menu})')
+            sys.exit(f'{path}: the Start menu is not open (60,{h - 162} is {menu})')
         want = {}
     elif mode == 'snap':
         # Welcome's white client area fills the left half below its text;
