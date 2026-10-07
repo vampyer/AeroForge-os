@@ -249,7 +249,6 @@ struct Device {
     dhi_dma reports{};
     uint8_t last_keys[8] = {};
     uint32_t report_next = 0;  // report buffer the next queued transfer uses
-    bool reported = false;     // a report has arrived (logged once)
     uint8_t intr_halt = 0;     // completion code that halted the endpoint, until poll() resets it
     uint32_t intr_errors = 0;  // failed interrupt transfers
 
@@ -1888,11 +1887,6 @@ private:
                 const uint64_t buf = d->intr.buffer_of(ptr);
                 if (buf < d->reports.phys || buf >= d->reports.phys + kReportTrbs * kReportSize) return;
                 const auto* report = static_cast<const uint8_t*>(d->reports.virt) + (buf - d->reports.phys);
-                if (!d->reported) {
-                    d->reported = true;
-                    ops_->log(Line().s("xhci: slot ").u(d->slot).s(d->hid == HidKind::Keyboard ? " keyboard" : " mouse")
-                                  .s(": first report received").str());
-                }
                 if (d->hid == HidKind::Keyboard) keyboard_report(*d, report);
                 else mouse_report(report);
                 queue_report(*d);

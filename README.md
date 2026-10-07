@@ -531,6 +531,8 @@ the QEMU window through WSLg. OVMF paths can be overridden with
 
 The ISO also boots on real UEFI PCs from a USB stick (write it with Rufus in DD mode or
 `dd`), with CSM/legacy boot off and Secure Boot off. USB keyboards work through the xHCI
-driver, also behind USB hubs (including hubs built into monitors). Devices plugged in after
-boot are not picked up yet. Booting and the IPC demo
+driver, also behind USB hubs (including hubs built into monitors). A keyboard or mouse whose
+endpoint halts on a transfer error (more likely through several hubs) is reset and keeps
+working; since 0.37.1 this lets a Logitech Unifying wireless receiver behind three hubs type on
+a Minisforum UM590. Booting and the IPC demo
 don't need a keyboard.
