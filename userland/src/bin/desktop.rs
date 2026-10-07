@@ -1336,39 +1336,44 @@ impl Desktop {
         Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m)
     }
 
-    /// What the pointer lights up: caption buttons, taskbar buttons, menu items.
+    /// What the pointer lights up at (x, y): the one caption button, taskbar
+    /// button, icon, file row, key or menu item under it, so that moving the
+    /// pointer redraws only that and not whole windows.
     fn hover_area(&self, x: i32, y: i32) -> Rect {
-        let mut area = Rect::EMPTY;
+        let s = self.ui;
+        let mut spots: Vec<Rect> = Vec::new();
+        if self.menu {
+            spots.extend((0..KINDS.len()).map(|i| self.menu_item(i)));
+            spots.push(self.exit_button());
+        }
+        let (bx, by, br) = self.start_button();
+        spots.push(Rect::new(bx - br - 2 * s, by - br - 2 * s, 2 * br + 4 * s, 2 * br + 4 * s));
+        spots.extend((0..self.task_order().len()).map(|i| self.task_button(i)));
+        spots.push(self.show_desktop());
+        spots.extend((0..ICONS.len()).map(|i| self.icon_rect(i)));
         if let Some(top) = self.windows.iter().rposition(|w| w.shown() && w.rect.contains(x, y)) {
             let r = self.windows[top].rect;
             for which in [Caption::Minimize, Caption::Maximize, Caption::Close] {
-                area = area.union(&self.caption(&r, which));
+                spots.push(self.caption(&r, which));
+            }
+            let client = self.client(&r);
+            match self.windows[top].kind {
+                Kind::Computer => {
+                    spots.push(self.files_toolbar(&client));
+                    spots.extend((0..self.files_visible(&client)).map(|i| self.files_row(&client, i)));
+                }
+                Kind::Notes => spots.push(self.notes_save(&client)),
+                Kind::Calculator => {
+                    for row in 0..5 {
+                        for col in 0..4 {
+                            spots.push(self.calc_key(&client, row, col));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        if self.taskbar().contains(x, y) {
-            area = area.union(&self.taskbar());
-        }
-        for i in 0..ICONS.len() {
-            if self.icon_rect(i).contains(x, y) {
-                area = area.union(&self.icon_rect(i));
-            }
-        }
-        let at = self.index(Kind::Computer);
-        if self.windows[at].shown() {
-            let client = self.client(&self.windows[at].rect);
-            if client.contains(x, y) {
-                area = area.union(&client);
-            }
-        }
-        let at = self.index(Kind::Notes);
-        if self.windows[at].shown() {
-            let save = self.notes_save(&self.client(&self.windows[at].rect));
-            area = area.union(&save);
-        }
-        if self.menu {
-            area = area.union(&self.menu_rect());
-        }
-        area
+        spots.into_iter().find(|r| r.contains(x, y)).unwrap_or(Rect::EMPTY)
     }
 
     // ---------------------------------------------------------------- input
@@ -1747,6 +1752,27 @@ impl Desktop {
     }
 }
 
+/// The parts of the screen to redraw this time round: rectangles that touch
+/// are joined, ones far apart are drawn separately.
+#[derive(Default)]
+struct Damage {
+    rects: Vec<Rect>,
+}
+
+impl Damage {
+    fn add(&mut self, r: Rect) {
+        if r.is_empty() {
+            return;
+        }
+        let mut r = r;
+        // Joining can make a rectangle reach others, so repeat until none do.
+        while let Some(i) = self.rects.iter().position(|o| !o.intersect(&Rect::new(r.x - 8, r.y - 8, r.w + 16, r.h + 16)).is_empty()) {
+            r = r.union(&self.rects.swap_remove(i));
+        }
+        self.rects.push(r);
+    }
+}
+
 fn present(screen: &Screen, canvas: &mut Canvas, desk: &Desktop, area: Rect) {
     let area = area.intersect(&Rect::new(0, 0, canvas.w, canvas.h));
     if area.is_empty() {
@@ -1843,14 +1869,21 @@ fn main() -> i64 {
 
     let mut keys = [0u8; 64];
     let mut tick = 0u64;
+    // How long redraws take after the pointer moves, for the log.
+    let (mut moves, mut move_us, mut worst_us) = (0u64, 0u64, 0u64);
     while !desk.quit {
         let mut dirty = Rect::EMPTY;
+        // The pointer and what it lights up are small; they are redrawn on
+        // their own instead of joined into one big rectangle with the rest.
+        let mut spots = Damage::default();
         let p = screen.pointer().unwrap_or(desk.pointer);
         if p != desk.pointer {
             let old = desk.pointer;
-            dirty = dirty.union(&desk.cursor_rect()).union(&desk.hover_area(old.x as i32, old.y as i32));
+            spots.add(desk.cursor_rect());
+            spots.add(desk.hover_area(old.x as i32, old.y as i32));
             desk.pointer = p;
-            dirty = dirty.union(&desk.cursor_rect()).union(&desk.hover_area(p.x as i32, p.y as i32));
+            spots.add(desk.cursor_rect());
+            spots.add(desk.hover_area(p.x as i32, p.y as i32));
             // Both presses of a quick double-click can land between two looks.
             let presses = p.presses.wrapping_sub(old.presses) & 0xFF_FFFF;
             for _ in 0..presses.min(3) {
@@ -1949,8 +1982,22 @@ fn main() -> i64 {
                 }
             }
         }
-        present(&screen, &mut canvas, &desk, dirty);
+        let moved = !spots.rects.is_empty() && dirty.is_empty();
+        spots.add(dirty);
+        let t0 = aero::clock_us();
+        for area in spots.rects {
+            present(&screen, &mut canvas, &desk, area);
+        }
+        if moved && desk.drag.is_none() && desk.resize.is_none() {
+            let took = aero::clock_us() - t0;
+            moves += 1;
+            move_us += took;
+            worst_us = worst_us.max(took);
+        }
         aero::sleep_ms(10);
+    }
+    if moves > 0 {
+        println!("[desktop] pointer moves: {}, redraw took {} us on average, {} us at most", moves, move_us / moves, worst_us);
     }
     println!("[desktop] notes: {}", desk.notes.replace('\n', " / "));
     println!("[desktop] closed, screen given back to the console");

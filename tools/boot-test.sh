@@ -448,6 +448,10 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "double-clicking a text file in the Computer window did not open it in Notes"; }
         grep -q "\[desktop\] notes: Welcome to AeroForge OS\. / .*hello aero" "$LOG" \
             || { fail "the opened file plus keys typed on the desktop were not in the Notes window"; }
+        # Moving the pointer redraws only the pointer and what it lights up
+        # (it used to redraw big areas, about 100 ms per move under QEMU).
+        MOVE_US=$(grep -ao "\[desktop\] pointer moves: [0-9]*, redraw took [0-9]* us on average" "$LOG" | grep -o "took [0-9]*" | grep -o "[0-9]*")
+        [ -n "$MOVE_US" ] && [ "$MOVE_US" -lt 30000 ] || { fail "redrawing after a pointer move took ${MOVE_US:-?} us on average (want under 30000)"; }
         grep -q "\[desktop\] saved /docs/Welcome to AeroForge.txt ([0-9]* bytes, read back the same)" "$LOG" \
             || { fail "Ctrl+S in Notes did not save the file back to the NVMe disk"; }
         mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge.txt" | tail -n 1 | grep -q "hello aero$" \

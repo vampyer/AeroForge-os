@@ -445,6 +445,10 @@ letter now reaches programs as its control code (Ctrl+S is 0x13) from both PS/2 
 The boot test saves the opened welcome file with Ctrl+S and checks the NVMe disk image with mtools.
 Since 0.45 desktop text is bigger (24 pixel Noto Sans Mono instead of 20, the clock 20 instead of 16)
 and drawn with sharper edges, and the windows, icons and Start menu are sized to fit it.
+Since 0.46 moving the pointer redraws only the pointer and the one button, row, key or menu item it
+lights up, each as its own small rectangle, instead of one rectangle joining them (which could span
+whole windows). Under QEMU without KVM that took a pointer move from about 100 ms to about 2 ms; the
+desktop logs the average at exit and the boot test wants it under 30 ms.
 
 | Area | Status |
 |---|---|
