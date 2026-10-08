@@ -501,6 +501,11 @@ closes it, and Ctrl+Tab goes to the next one. "Two panes" splits the window into
 each with its place along its top; Tab or a click moves between them. "Copy >" and "Move >" (or "< Copy"
 and "< Move") send what is selected to the folder on the other side, and files can be dragged across too.
 
+Since 0.53 the file manager has a preview pane ("Preview" or Alt+P). It shows the file selected with its type
+and exact size, then its first lines if it reads as text, or its bytes as a hex dump (offset, bytes and the
+characters they make) if it doesn't; Text and Hex switch between the two. It reads up to the first 64 KB, and
+for a folder it shows how many things are in it.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

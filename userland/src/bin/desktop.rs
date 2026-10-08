@@ -119,6 +119,8 @@ enum Font {
     Small,
     /// The clock in the Start menu: 32 pixels tall.
     Large,
+    /// The preview pane's text and bytes: 16 pixels tall (20 at UI scale 2).
+    Tiny,
 }
 
 impl Font {
@@ -127,6 +129,8 @@ impl Font {
         let size = match (self, ui >= 2) {
             (Font::Small, false) => RasterHeight::Size20,
             (Font::Small, true) => RasterHeight::Size24,
+            (Font::Tiny, false) => RasterHeight::Size16,
+            (Font::Tiny, true) => RasterHeight::Size20,
             (Font::Large, _) | (_, true) => RasterHeight::Size32,
             _ => RasterHeight::Size24,
         };
@@ -832,6 +836,26 @@ impl Default for Tab {
     }
 }
 
+/// The preview pane's copy of what is selected.
+struct Preview {
+    path: String,
+    entry: aero::DirEntry,
+    /// The first PREVIEW_BYTES of a file.
+    data: Vec<u8>,
+    /// Its lines, when it reads as text.
+    lines: Vec<String>,
+    /// Shown as bytes (hex) rather than text.
+    hex: bool,
+    /// What a folder holds.
+    items: Option<usize>,
+    error: Option<String>,
+    /// The first line (of text or of hex) shown.
+    scroll: usize,
+}
+
+/// How much of a file the preview pane reads.
+const PREVIEW_BYTES: usize = 64 * 1024;
+
 /// The Properties box: what is selected, in more detail.
 struct Props {
     title: String,
@@ -955,6 +979,9 @@ struct Desktop {
     /// `tabs` is empty: it is `files`, `other` and `right`).
     tabs: Vec<Tab>,
     tab: usize,
+    /// The preview pane at the right of the Computer window, and what it shows.
+    preview_on: bool,
+    preview: Option<Preview>,
     /// What Copy or Cut picked up, for any tab or side.
     clip: Option<Clip>,
 }
@@ -1753,6 +1780,7 @@ impl Desktop {
                 dirty = dirty.union(&self.save_notes());
             } else if self.windows[i].kind == Kind::Computer && self.client(&r).contains(x, y) {
                 dirty = dirty.union(&self.files_click(x, y, double));
+                dirty = dirty.union(&self.sync_preview());
             } else if self.windows[i].kind == Kind::Calculator {
                 let client = self.client(&r);
                 for row in 0..5 {
@@ -1896,6 +1924,7 @@ impl Desktop {
                 || self.files.props.is_some();
             if self.top_kind() == Some(Kind::Computer) && (k != 27 || files_busy) {
                 dirty = dirty.union(&self.files_key(k));
+                dirty = dirty.union(&self.sync_preview());
                 continue;
             }
             if k == 27 {
@@ -2296,7 +2325,7 @@ impl Desktop {
     fn tab_rect(&self, c: &Rect, i: usize) -> Rect {
         let s = self.ui;
         let strip = self.files_tabs(c);
-        let room = strip.w - 8 * s - self.new_tab_button(c).w - self.panes_button(c).w - 16 * s;
+        let room = strip.w - 8 * s - self.new_tab_button(c).w - self.panes_button(c).w - self.preview_button(c).w - 22 * s;
         let w = (room / self.tabs.len().max(1) as i32).min(190 * s);
         Rect::new(strip.x + 6 * s + i as i32 * w, strip.y + 4 * s, w - 4 * s, strip.h - 4 * s)
     }
@@ -2312,7 +2341,7 @@ impl Desktop {
         let n = self.tabs.len() as i32;
         let w = 26 * s;
         // Placed after the tabs; their width depends on the strip, not on this.
-        let room = strip.w - 8 * s - w - self.panes_button(c).w - 16 * s;
+        let room = strip.w - 8 * s - w - self.panes_button(c).w - self.preview_button(c).w - 22 * s;
         let tab_w = (room / n.max(1)).min(190 * s);
         Rect::new(strip.x + 6 * s + n * tab_w, strip.y + 5 * s, w, strip.h - 8 * s)
     }
@@ -2322,6 +2351,13 @@ impl Desktop {
         let strip = self.files_tabs(c);
         let w = Font::Normal.width(s, "Two panes") + 34 * s;
         Rect::new(strip.x + strip.w - w - 8 * s, strip.y + 4 * s, w, strip.h - 7 * s)
+    }
+    /// "Preview", left of "Two panes".
+    fn preview_button(&self, c: &Rect) -> Rect {
+        let s = self.ui;
+        let p = self.panes_button(c);
+        let w = Font::Normal.width(s, "Preview") + 34 * s;
+        Rect::new(p.x - 6 * s - w, p.y, w, p.h)
     }
     fn files_commands(&self, c: &Rect) -> Rect {
         Rect::new(c.x, c.y + 70 * self.ui, c.w, 34 * self.ui)
@@ -2337,11 +2373,68 @@ impl Desktop {
         let b = self.files_body(c);
         Rect::new(b.x, b.y, (200 * self.ui).min(b.w / 3), b.h)
     }
-    /// Right of the navigation pane: the folder shown, or both sides.
-    fn files_main(&self, c: &Rect) -> Rect {
+    /// Right of the navigation pane: the folder shown, or both sides,
+    /// then the preview pane if it is on.
+    fn files_right(&self, c: &Rect) -> Rect {
         let b = self.files_body(c);
         let p = self.files_pane(c);
         Rect::new(p.x + p.w + 1, b.y, b.w - p.w - 1, b.h)
+    }
+    fn files_main(&self, c: &Rect) -> Rect {
+        let m = self.files_right(c);
+        let p = self.preview_rect(c);
+        if p.is_empty() { m } else { Rect::new(m.x, m.y, p.x - 1 - m.x, m.h) }
+    }
+    fn preview_rect(&self, c: &Rect) -> Rect {
+        if !self.preview_on {
+            return Rect::EMPTY;
+        }
+        let s = self.ui;
+        let m = self.files_right(c);
+        let w = (m.w * 9 / 20).clamp(270 * s, 460 * s).min(m.w / 2);
+        Rect::new(m.x + m.w - w, m.y, w, m.h)
+    }
+    /// Its Text and Hex buttons, at the top right.
+    fn preview_mode(&self, c: &Rect, hex: bool) -> Rect {
+        let s = self.ui;
+        let p = self.preview_rect(c);
+        let w = Font::Normal.width(s, "Text") + 14 * s;
+        let x = p.x + p.w - 8 * s - 2 * w;
+        Rect::new(if hex { x + w } else { x }, p.y + 4 * s, w, 22 * s)
+    }
+    /// Where the text or bytes go, under the name, type and size.
+    fn preview_body(&self, c: &Rect) -> Rect {
+        let s = self.ui;
+        let p = self.preview_rect(c);
+        let top = 30 * s + 3 * (Font::Normal.h(s) + 4 * s) + 8 * s;
+        Rect::new(p.x + 8 * s, p.y + top, p.w - 8 * s - 16 * s, (p.h - top - 4 * s).max(0))
+    }
+    fn preview_bar(&self, c: &Rect) -> Rect {
+        let b = self.preview_body(c);
+        Rect::new(b.x + b.w, b.y, 16 * self.ui, b.h)
+    }
+    fn preview_line_h(&self) -> i32 {
+        Font::Tiny.h(self.ui) + 2 * self.ui
+    }
+    fn preview_lines_shown(&self, c: &Rect) -> usize {
+        (self.preview_body(c).h / self.preview_line_h()).max(1) as usize
+    }
+    /// Bytes per hex row (16, 8 or 4, as many as fit), and whether the
+    /// characters fit after them too.
+    fn hex_layout(&self, c: &Rect) -> (usize, bool) {
+        let cols = (self.preview_body(c).w / Font::Tiny.w(self.ui).max(1)) as usize;
+        [(16, true), (8, true), (8, false), (4, true)].into_iter().find(|&(n, chars)| 5 + 3 * n + if chars { 2 + n } else { 0 } <= cols).unwrap_or((4, false))
+    }
+    fn hex_width(&self, c: &Rect) -> usize {
+        self.hex_layout(c).0
+    }
+    /// How many lines the preview has, as shown now.
+    fn preview_total(&self, c: &Rect) -> usize {
+        match &self.preview {
+            Some(p) if p.hex => p.data.len().div_ceil(self.hex_width(c)),
+            Some(p) => p.lines.len(),
+            None => 0,
+        }
     }
     /// In two-pane mode, the left (false) or right (true) side, with its
     /// path along the top.
@@ -2882,6 +2975,20 @@ impl Desktop {
             c.frame(Rect::new(px0, iy, 8 * s, 12 * s), rgb(50, 70, 110));
         }
         c.text(pb.x + 26 * s, pb.y + (pb.h - Font::Normal.h(s)) / 2, "Two panes", rgb(20, 40, 80), Font::Normal);
+        let vb = self.preview_button(client);
+        if self.preview_on {
+            c.rounded(vb, 3 * s, false, rgb(205, 225, 248), rgb(180, 208, 242), 255);
+            c.rounded_outline(vb, 3 * s, false, rgb(110, 140, 185), 255);
+        } else if vb.contains(px, py) {
+            c.rounded(vb, 3 * s, false, rgb(250, 252, 255), rgb(205, 225, 248), 255);
+            c.rounded_outline(vb, 3 * s, false, rgb(130, 155, 190), 255);
+        }
+        // Its icon: a window with a panel at the right.
+        let (ix, iy) = (vb.x + 8 * s, vb.y + (vb.h - 12 * s) / 2);
+        c.fill(Rect::new(ix, iy, 17 * s, 12 * s), 0xFFFFFF);
+        c.fill(Rect::new(ix + 11 * s, iy, 6 * s, 12 * s), rgb(150, 190, 235));
+        c.frame(Rect::new(ix, iy, 17 * s, 12 * s), rgb(50, 70, 110));
+        c.text(vb.x + 26 * s, vb.y + (vb.h - Font::Normal.h(s)) / 2, "Preview", rgb(20, 40, 80), Font::Normal);
 
         // Navigation pane: Computer and the drives.
         let pane = self.files_pane(client);
@@ -2955,6 +3062,7 @@ impl Desktop {
         } else {
             self.drives_view(c, client, &self.files, self.files_content(client), true);
         }
+        self.preview_view(c, client);
         self.props_view(c, client);
 
         // Status bar: what is selected, and the drive's free space at the right.
@@ -2971,6 +3079,92 @@ impl Desktop {
         let room = ((right_x - sb.x - 20 * s) / Font::Normal.w(s)).max(0) as usize;
         let status: String = f.status.chars().take(room).collect();
         c.text(sb.x + 8 * s, sy, &status, rgb(30, 50, 80), Font::Normal);
+    }
+
+    /// The preview pane: what is selected, its first lines or its bytes.
+    fn preview_view(&self, c: &mut Canvas, client: &Rect) {
+        let r = self.preview_rect(client);
+        if r.is_empty() {
+            return;
+        }
+        let s = self.ui;
+        c.fill(Rect::new(r.x - 1, r.y, 1, r.h), rgb(190, 200, 215));
+        c.fill(r, rgb(250, 251, 253));
+        let head = Rect::new(r.x, r.y, r.w, 30 * s);
+        c.gradient(head, rgb(246, 248, 251), rgb(232, 237, 244), 255);
+        c.fill(Rect::new(r.x, head.y + head.h - 1, r.w, 1), rgb(205, 213, 225));
+        c.text(r.x + 8 * s, head.y + (head.h - Font::Normal.h(s)) / 2, "Preview", rgb(60, 80, 110), Font::Normal);
+        let Some(p) = &self.preview else {
+            let msg = "Select a file to see it here.";
+            let room = ((r.w - 16 * s) / Font::Normal.w(s)).max(1) as usize;
+            let shown: String = msg.chars().take(room).collect();
+            c.text(r.x + 8 * s, r.y + 44 * s, &shown, rgb(120, 125, 135), Font::Normal);
+            return;
+        };
+        // Text and Hex, the one shown pressed.
+        if !p.entry.is_dir {
+            for hex in [false, true] {
+                let b = self.preview_mode(client, hex);
+                let usable = hex || !p.lines.is_empty() || p.data.is_empty();
+                if p.hex == hex {
+                    c.rounded(b, 3 * s, false, rgb(205, 225, 248), rgb(180, 208, 242), 255);
+                    c.rounded_outline(b, 3 * s, false, rgb(110, 140, 185), 255);
+                } else {
+                    c.rounded_outline(b, 3 * s, false, rgb(180, 190, 205), 255);
+                }
+                let ink = if usable { rgb(20, 40, 80) } else { rgb(170, 175, 185) };
+                let label = if hex { "Hex" } else { "Text" };
+                c.text(b.x + (b.w - Font::Normal.width(s, label)) / 2, b.y + (b.h - Font::Normal.h(s)) / 2, label, ink, Font::Normal);
+            }
+        }
+        // Name, type and size.
+        let line = Font::Normal.h(s) + 4 * s;
+        let room = ((r.w - 46 * s) / Font::Normal.w(s)).max(1) as usize;
+        let mut y = head.y + head.h + 6 * s;
+        if p.entry.is_dir {
+            c.folder(r.x + 10 * s, y + 2 * s, s);
+        } else {
+            c.page(r.x + 12 * s, y, s);
+        }
+        let name: String = p.entry.name.chars().take(room).collect();
+        c.text(r.x + 34 * s, y, &name, 0x101010, Font::Normal);
+        y += line;
+        let kind: String = type_text(&p.entry).chars().take(room).collect();
+        c.text(r.x + 34 * s, y, &kind, rgb(90, 95, 105), Font::Normal);
+        y += line;
+        let detail = match (&p.error, p.items) {
+            (Some(e), _) => format!("Can't read it: {}", e),
+            (None, Some(n)) => format!("{} item{}", n, if n == 1 { "" } else { "s" }),
+            (None, None) if p.entry.size as usize > p.data.len() => format!("{} (first {} shown)", size_text(p.entry.size), size_text(p.data.len() as u64)),
+            (None, None) => format!("{} bytes", group(p.entry.size)),
+        };
+        let detail: String = detail.chars().take(room).collect();
+        c.text(r.x + 34 * s, y, &detail, rgb(90, 95, 105), Font::Normal);
+        if p.entry.is_dir || p.error.is_some() {
+            return;
+        }
+        // The text, or the bytes.
+        let body = self.preview_body(client);
+        c.fill(Rect::new(body.x - 2 * s, body.y - 4 * s, body.w + 2 * s + self.preview_bar(client).w, 1), rgb(220, 225, 235));
+        let shown = self.preview_lines_shown(client);
+        let total = self.preview_total(client);
+        let cols = (body.w / Font::Tiny.w(s).max(1)).max(1) as usize;
+        let (width, chars) = self.hex_layout(client);
+        for n in 0..shown.min(total.saturating_sub(p.scroll)) {
+            let row = p.scroll + n;
+            let text = if p.hex { hex_row(&p.data, row, width, chars) } else { p.lines[row].clone() };
+            let text: String = text.chars().take(cols).collect();
+            let ink = if p.hex { rgb(30, 40, 60) } else { 0x101010 };
+            c.text(body.x, body.y + n as i32 * self.preview_line_h(), &text, ink, Font::Tiny);
+        }
+        if total > shown {
+            // A plain scrollbar: click above or below the thumb to page.
+            let bar = self.preview_bar(client);
+            c.fill(bar, rgb(236, 238, 242));
+            let th = (bar.h as usize * shown / total).max(12 * s as usize) as i32;
+            let ty = bar.y + ((bar.h - th) as usize * p.scroll / (total - shown).max(1)) as i32;
+            c.rounded(Rect::new(bar.x + 3 * s, ty, bar.w - 6 * s, th), 3 * s, false, rgb(205, 210, 220), rgb(180, 188, 200), 255);
+        }
     }
 
     /// Computer: the drives as tiles, with how full each one is.
@@ -3387,6 +3581,7 @@ impl Desktop {
         spots.extend((0..self.tabs.len()).flat_map(|i| [self.tab_rect(c, i), self.tab_close(c, i)]));
         spots.push(self.new_tab_button(c));
         spots.push(self.panes_button(c));
+        spots.push(self.preview_button(c));
         if self.files.form.is_some() {
             spots.push(self.form_button(c, true));
             spots.push(self.form_button(c, false));
@@ -3695,6 +3890,75 @@ impl Desktop {
             self.tab -= 1;
         }
         self.log_tabs();
+        self.files_area()
+    }
+
+    /// The preview pane on or off.
+    fn toggle_preview(&mut self) -> Rect {
+        self.preview_on = !self.preview_on;
+        self.preview = None;
+        if self.preview_on {
+            let c = self.files_client();
+            let (t, h) = (self.preview_mode(&c, false), self.preview_mode(&c, true));
+            println!("[desktop] preview pane on; Text at {},{}, Hex at {},{}", t.x + t.w / 2, t.y + t.h / 2, h.x + h.w / 2, h.y + h.h / 2);
+            self.sync_preview();
+        } else {
+            println!("[desktop] preview pane off");
+        }
+        self.files_area()
+    }
+
+    /// Reads what is selected into the preview pane, if that changed.
+    fn sync_preview(&mut self) -> Rect {
+        if !self.preview_on {
+            return Rect::EMPTY;
+        }
+        let one = self.files.selected.filter(|&i| {
+            (self.files.in_folder() || self.files.path == SEARCH) && i < self.files.entries.len() && self.picked().len() <= 1
+        });
+        let Some(i) = one else {
+            return if self.preview.take().is_some() { self.files_area() } else { Rect::EMPTY };
+        };
+        let path = self.entry_path(i);
+        if self.preview.as_ref().is_some_and(|p| p.path == path) {
+            return Rect::EMPTY;
+        }
+        let entry = self.files.entries[i].clone();
+        let mut p = Preview { path: path.clone(), entry, data: Vec::new(), lines: Vec::new(), hex: false, items: None, error: None, scroll: 0 };
+        if p.entry.is_dir {
+            match fs_list(&path) {
+                Ok(list) => p.items = Some(list.len()),
+                Err(e) => p.error = Some(String::from(fs_error_text(e))),
+            }
+            println!("[desktop] preview of {}: folder, {} items", path, p.items.unwrap_or(0));
+        } else {
+            match fs_read(&path, PREVIEW_BYTES) {
+                Ok(data) => p.data = data,
+                Err(e) => p.error = Some(String::from(fs_error_text(e))),
+            }
+            match text_lines(&p.data) {
+                Some(lines) => p.lines = lines,
+                None => p.hex = true,
+            }
+            let first = if p.hex { hex_row(&p.data, 0, 16, true) } else { p.lines.first().cloned().unwrap_or_default() };
+            println!("[desktop] preview of {}: {} bytes read, as {}: {}", path, p.data.len(), if p.hex { "hex" } else { "text" }, first);
+        }
+        self.preview = Some(p);
+        self.files_area()
+    }
+
+    /// Text or Hex, for a file that reads as text.
+    fn preview_as(&mut self, hex: bool) -> Rect {
+        let c = self.files_client();
+        let (width, chars) = self.hex_layout(&c);
+        let Some(p) = self.preview.as_mut() else { return Rect::EMPTY };
+        if p.entry.is_dir || p.hex == hex || (!hex && p.lines.is_empty() && !p.data.is_empty()) {
+            return Rect::EMPTY;
+        }
+        p.hex = hex;
+        p.scroll = 0;
+        let first = if hex { hex_row(&p.data, 0, width, chars) } else { p.lines.first().cloned().unwrap_or_default() };
+        println!("[desktop] preview of {} as {}: {}", p.path, if hex { "hex" } else { "text" }, first);
         self.files_area()
     }
 
@@ -4837,6 +5101,9 @@ impl Desktop {
             if self.panes_button(&c).contains(x, y) {
                 return self.toggle_panes();
             }
+            if self.preview_button(&c).contains(x, y) {
+                return self.toggle_preview();
+            }
             if self.new_tab_button(&c).contains(x, y) {
                 return self.new_tab();
             }
@@ -4847,6 +5114,21 @@ impl Desktop {
                 if self.tab_rect(&c, i).contains(x, y) {
                     return self.switch_tab(i);
                 }
+            }
+            return Rect::EMPTY;
+        }
+        if self.preview_rect(&c).contains(x, y) {
+            for hex in [false, true] {
+                if self.preview_mode(&c, hex).contains(x, y) {
+                    return self.preview_as(hex);
+                }
+            }
+            let bar = self.preview_bar(&c);
+            let (shown, total) = (self.preview_lines_shown(&c), self.preview_total(&c));
+            if let Some(p) = self.preview.as_mut().filter(|_| bar.contains(x, y) && total > shown) {
+                let thumb = bar.y + (bar.h as usize * p.scroll / total) as i32;
+                p.scroll = if y < thumb { p.scroll.saturating_sub(shown) } else { (p.scroll + shown).min(total - shown) };
+                return self.preview_rect(&c);
             }
             return Rect::EMPTY;
         }
@@ -5021,6 +5303,10 @@ impl Desktop {
             // Alt+Enter.
             return self.command(Command::Properties);
         }
+        if (k == b'p' || k == b'P') && self.key_mods & aero::display::MOD_ALT != 0 {
+            // Alt+P, as in Windows.
+            return self.toggle_preview();
+        }
         if k == 0x06 || k == 0x05 {
             // Ctrl+F or Ctrl+E: to the search box.
             self.files.query_focus = true;
@@ -5109,6 +5395,50 @@ impl Desktop {
         }
         area
     }
+}
+
+/// A file's lines if it reads as text (no NUL bytes, and nearly all of
+/// it printable), with tabs as spaces and anything else unusual as '.'.
+fn text_lines(data: &[u8]) -> Option<Vec<String>> {
+    let head = &data[..data.len().min(4096)];
+    let odd = head.iter().filter(|&&b| b < 32 && !matches!(b, b'\n' | b'\r' | b'\t' | 0x0C)).count();
+    if head.contains(&0) || odd * 20 > head.len().max(1) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(data);
+    let mut lines = Vec::new();
+    for line in text.split('\n').take(5000) {
+        let shown: String = line
+            .trim_end_matches('\r')
+            .replace('\t', "    ")
+            .chars()
+            .take(400)
+            .map(|ch| if (' '..='~').contains(&ch) { ch } else { '.' })
+            .collect();
+        lines.push(shown);
+    }
+    Some(lines)
+}
+
+/// Row `row` of a hex dump, `width` bytes to a row:
+/// "0010  48 65 6C 6C 6F ...  Hello..." (the preview reads at most 64 KB,
+/// so four digits number every byte).
+fn hex_row(data: &[u8], row: usize, width: usize, chars: bool) -> String {
+    let start = row * width;
+    let bytes = &data[start.min(data.len())..(start + width).min(data.len())];
+    let mut out = format!("{:04X} ", start);
+    for i in 0..width {
+        match bytes.get(i) {
+            Some(b) => out.push_str(&format!(" {:02X}", b)),
+            None => out.push_str("   "),
+        }
+    }
+    if !chars {
+        return out;
+    }
+    out.push_str("  ");
+    out.extend(bytes.iter().map(|&b| if (32..127).contains(&b) { b as char } else { '.' }));
+    out
 }
 
 /// A selected drive tile; grey on the side of two panes not in use.
@@ -5372,6 +5702,8 @@ fn main() -> i64 {
         other: None,
         right: false,
         tabs: alloc::vec![Tab::default()],
+        preview_on: false,
+        preview: None,
         tab: 0,
         clip: None,
         calc: Calc { display: String::from("0"), ..Default::default() },
@@ -5480,6 +5812,7 @@ fn main() -> i64 {
             }
             if desk.file_drag.is_some() {
                 dirty = dirty.union(&desk.file_drag_step(p));
+                dirty = dirty.union(&desk.sync_preview());
             }
             if desk.top_kind() == Some(Kind::System) {
                 dirty = dirty.union(&desk.window_area(desk.windows.len() - 1));
