@@ -5,7 +5,7 @@
 //! queued; the pointer is a snapshot (position and buttons) plus a count
 //! of left-button presses, so a click between two reads is not lost.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::sync::IrqMutex;
 use crate::usb;
@@ -17,9 +17,18 @@ const KEY_QUEUE: usize = 64;
 static OWNER: AtomicU64 = AtomicU64::new(NOBODY);
 /// Left-button presses since boot (wraps at 24 bits for the syscall).
 static PRESSES: AtomicU32 = AtomicU32::new(0);
+/// The modifier keys held now (DHI_MOD_*: Shift 1, Ctrl 2, Alt 4, Caps Lock 8),
+/// from the last key event of any keyboard.
+static MODIFIERS: AtomicU8 = AtomicU8::new(0);
+
+/// A keyboard reported its modifier keys (with every key event).
+pub fn modifiers(m: u8) {
+    MODIFIERS.store(m & 0xF, Ordering::Relaxed);
+}
 
 struct Keys {
-    buf: [u8; KEY_QUEUE],
+    /// Each key: its character, and the modifier keys held as it was pressed (<< 8).
+    buf: [u16; KEY_QUEUE],
     head: usize,
     len: usize,
 }
@@ -52,7 +61,7 @@ pub fn push_key(c: u8) -> bool {
     let mut k = KEYS.lock();
     if k.len < KEY_QUEUE {
         let at = (k.head + k.len) % KEY_QUEUE;
-        k.buf[at] = c;
+        k.buf[at] = c as u16 | (MODIFIERS.load(Ordering::Relaxed) as u16) << 8;
         k.len += 1;
     }
     true
@@ -65,9 +74,9 @@ pub fn buttons(old: u32, new: u32) {
     }
 }
 
-/// Keys typed for `pid` into `out`; returns how many. None if `pid` does
-/// not own the screen.
-pub fn read_keys(pid: u64, out: &mut [u8]) -> Option<usize> {
+/// Keys typed for `pid` into `out` (character | modifiers << 8); returns how
+/// many. None if `pid` does not own the screen.
+pub fn read_keys(pid: u64, out: &mut [u16]) -> Option<usize> {
     if OWNER.load(Ordering::Acquire) != pid {
         return None;
     }
@@ -81,7 +90,9 @@ pub fn read_keys(pid: u64, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// The pointer for `pid`: x | y << 16 | buttons << 32 | presses << 40.
+/// The pointer for `pid`: x | y << 16 | buttons << 32 | modifier keys << 36
+/// | presses << 40. The modifiers ride along so a click can be told apart
+/// from a Ctrl+click or Shift+click.
 /// None if `pid` does not own the screen.
 pub fn pointer(pid: u64) -> Option<u64> {
     if OWNER.load(Ordering::Acquire) != pid {
@@ -89,7 +100,8 @@ pub fn pointer(pid: u64) -> Option<u64> {
     }
     let x = usb::MOUSE_X.load(Ordering::Relaxed).max(0) as u64 & 0xFFFF;
     let y = usb::MOUSE_Y.load(Ordering::Relaxed).max(0) as u64 & 0xFFFF;
-    let b = usb::MOUSE_BUTTONS.load(Ordering::Relaxed) as u64 & 0xFF;
+    let b = usb::MOUSE_BUTTONS.load(Ordering::Relaxed) as u64 & 0xF;
+    let m = MODIFIERS.load(Ordering::Relaxed) as u64 & 0xF;
     let p = PRESSES.load(Ordering::Relaxed) as u64 & 0xFF_FFFF;
-    Some(x | y << 16 | b << 32 | p << 40)
+    Some(x | y << 16 | b << 32 | m << 36 | p << 40)
 }

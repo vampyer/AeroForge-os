@@ -101,7 +101,7 @@ SMBD_PID=$(./tools/smb-server.sh) || { echo "FAIL: could not start the Samba ser
 SUDO=$([ "$(id -u)" = 0 ] && echo "" || echo sudo)
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm
+rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -166,12 +166,12 @@ point_at() {
 }
 double_click() { fast_monitor "mouse_button 1" "mouse_button 0" "mouse_button 1" "mouse_button 0"; }
 # Where the desktop's Computer window shows the entry named $2 of folder $1,
-# from its "[desktop] Computer: <folder> = a | b; first row at x,y, rows h apart" line.
+# from its latest "[desktop] Computer: <folder> = a | b; first row at x,y, rows h apart" line.
 row_of() {
     python3 - "$LOG" "$1" "$2" <<'PY'
 import re, sys
 log = open(sys.argv[1], 'rb').read().decode(errors='replace')
-m = re.search(r'\[desktop\] Computer: ' + re.escape(sys.argv[2]) + r' = (.*); first row at (\d+),(\d+), rows (\d+) apart', log)
+m = list(re.finditer(r'\[desktop\] Computer: ' + re.escape(sys.argv[2]) + r' = (.*); first row at (\d+),(\d+), rows (\d+) apart', log))[-1]
 names = [n.lower() for n in m.group(1).split(' | ')]
 i = names.index(sys.argv[3].lower())
 print(m.group(2), int(m.group(3)) + i * int(m.group(4)))
@@ -387,6 +387,42 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; type_keys $'From AeroForge\n'; STAGE=netrenamed
     elif [ $STAGE = netrenamed ] && grep -q "\[desktop\] \(renamed //10.0.2.2:4450/aero/New folder to\|rename failed\)" "$LOG"; then
         sleep 1; monitor "screendump build/gop-network.ppm"
+        # Back to Computer, then open C: (the first drive) with Home and Enter.
+        N=$(grep -c "\[desktop\] Computer: / = " "$LOG")
+        type_keys $'\x08'; sleep 1.5
+        monitor "sendkey home"; sleep 0.3; type_keys $'\n'; STAGE=advroot
+    elif [ $STAGE = advroot ] && [ "$(grep -c "\[desktop\] Computer: / = " "$LOG")" -gt "$N" ]; then
+        N=$(grep -c "\[desktop\] Computer: /docs = " "$LOG")
+        sleep 0.5; point_at $(row_of / docs); double_click; STAGE=advdocs
+    elif [ $STAGE = advdocs ] && [ "$(grep -c "\[desktop\] Computer: /docs = " "$LOG")" -gt "$N" ]; then
+        # Select everything with Ctrl+A, then take the folder out with Ctrl+click.
+        sleep 0.5; type_keys $'\x01'; STAGE=advall
+    elif [ $STAGE = advall ] && grep -q "\[desktop\] selected 3 items" "$LOG"; then
+        python3 tools/qemu-qmp.py build/qmp.sock down ctrl; sleep 0.3
+        point_at $(row_of /docs Stuff); monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        python3 tools/qemu-qmp.py build/qmp.sock up ctrl; STAGE=advtoggle
+    elif [ $STAGE = advtoggle ] && grep -q "\[desktop\] selected 2 items" "$LOG"; then
+        # Search the folder (Ctrl+F), then Properties of a result (Alt+Enter).
+        sleep 0.5; type_keys $'\x06'; sleep 0.3; type_keys $'welcome\n'; STAGE=advsearch
+    elif [ $STAGE = advsearch ] && grep -q "\[desktop\] search for \"welcome\"" "$LOG"; then
+        sleep 1; monitor "sendkey home"; sleep 0.3; monitor "sendkey alt-ret"; STAGE=advprops
+    elif [ $STAGE = advprops ] && grep -q "\[desktop\] properties of /docs/" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-search.ppm"
+        N=$(grep -c "\[desktop\] Computer: /docs = " "$LOG")
+        monitor "sendkey ret"; sleep 0.5; type_keys $'\x08'; STAGE=advback
+    elif [ $STAGE = advback ] && [ "$(grep -c "\[desktop\] Computer: /docs = " "$LOG")" -gt "$N" ]; then
+        # Drag AeroForge-OS-Design.md into the Stuff folder: a move, on the same drive.
+        sleep 0.5; point_at $(row_of /docs AeroForge-OS-Design.md); sleep 0.3
+        read -r FX FY < <(row_of /docs AeroForge-OS-Design.md); read -r TX TY < <(row_of /docs Stuff)
+        STEPS=()
+        for _ in 1 2 3 4 5 6; do STEPS+=("mouse_move $(((TX - FX) / 6)) $(((TY - FY) / 6))"); done
+        fast_monitor "mouse_button 1" "${STEPS[@]}"; sleep 0.5; monitor "mouse_button 0"; STAGE=advdrag
+    elif [ $STAGE = advdrag ] && grep -q "\[desktop\] \(moved /docs/AeroForge-OS-Design.md to\|move failed\|Drop them\)" "$LOG"; then
+        # Up to Computer and the Properties of C:, with its used and free space.
+        sleep 0.5; type_keys $'\x08'; sleep 1; type_keys $'\x08'; sleep 1
+        monitor "sendkey home"; sleep 0.3; monitor "sendkey alt-ret"; STAGE=advdrive
+    elif [ $STAGE = advdrive ] && grep -q "\[desktop\] properties of .* (C:)" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-props.ppm"; monitor "sendkey ret"; sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
         monitor "mouse_button 0"; STAGE=desksnap
@@ -550,6 +586,20 @@ for _ in $(seq "$TIMEOUT"); do
         [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
             || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
         python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
+        grep -q "\[desktop\] selected 3 items: Stuff | AeroForge-OS-Design.md | Welcome to AeroForge.txt" "$LOG" \
+            && grep -q "\[desktop\] selected 2 items: AeroForge-OS-Design.md | Welcome to AeroForge.txt" "$LOG" \
+            || { fail "Ctrl+A and Ctrl+click did not select the right entries in /docs"; }
+        grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Stuff/Welcome to AeroForge.txt | /docs/Welcome to AeroForge.txt)" "$LOG" \
+            || grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Welcome to AeroForge.txt | /docs/Stuff/Welcome to AeroForge.txt)" "$LOG" \
+            || { fail "searching /docs for \"welcome\" did not find its two copies"; }
+        grep -q "\[desktop\] properties of /docs/.*Welcome to AeroForge.txt: [0-9]* bytes" "$LOG" || { fail "Alt+Enter did not show a search result's properties"; }
+        grep -q "\[desktop\] dropped 1 item on /docs/Stuff: move" "$LOG" \
+            && grep -q "\[desktop\] moved /docs/AeroForge-OS-Design.md to /docs/Stuff/AeroForge-OS-Design.md" "$LOG" \
+            && mdir -i build/disk.img@@1M "::/docs/Stuff/AeroForge-OS-Design.md" >/dev/null 2>&1 \
+            && ! mdir -i build/disk.img@@1M "::/docs/AeroForge-OS-Design.md" >/dev/null 2>&1 \
+            || { fail "dragging a file onto a folder did not move it there"; }
+        grep -q "\[desktop\] properties of .* (C:): Local Disk FAT32, [0-9]* bytes, [0-9]* bytes free" "$LOG" \
+            || { fail "the Properties of drive C: did not show its size and free space"; }
         python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
@@ -639,7 +689,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
