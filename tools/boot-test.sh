@@ -507,7 +507,6 @@ for _ in $(seq "$TIMEOUT"); do
         mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -qF 'network drive = \\10.0.2.2:4450\aero|aerotest|Z' \
             && ! mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -q "Forge-pass" \
             || { fail "the network drive was not saved to /AeroForge.ini, or its password was"; }
-        python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
         grep -q "\[waittest\] events, ports, sockets and child processes in one wait: OK" "$LOG" \
             || { fail "waiting on several handles at once failed (events, a port, a socket or a child process)"; }
         grep -q "Display: console drawn off-screen and presented to the firmware framebuffer" "$LOG" || { fail "the console was not moved off-screen"; }
@@ -551,6 +550,7 @@ for _ in $(seq "$TIMEOUT"); do
         [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
             || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
         python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
+        python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
         grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \
