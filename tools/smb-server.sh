@@ -15,7 +15,9 @@ mkdir -p "$D"/{private,lock,state,cache,pid} build/smbshare/Music
 printf 'Hello from the Samba share.\n' > build/smbshare/hello.txt
 printf 'track one' > build/smbshare/Music/track1.txt
 id aerotest >/dev/null 2>&1 || $SUDO useradd -M -s /usr/sbin/nologin aerotest
-$SUDO chown -R aerotest build/smbshare
+# Files on the share are read and written as whoever ran this script (it
+# owns build/smbshare, and aerotest may not even get into its home folder).
+OWNER=$(id -un)
 cat > "$D/smb.conf" <<CONF
 [global]
     server role = standalone server
@@ -42,6 +44,7 @@ cat > "$D/smb.conf" <<CONF
     path = $PWD/build/smbshare
     read only = no
     valid users = aerotest
+    force user = $OWNER
 CONF
 printf 'Forge-pass-7\nForge-pass-7\n' | $SUDO smbpasswd -c "$D/smb.conf" -s -a aerotest >/dev/null 2>&1
 $SUDO smbd -s "$D/smb.conf" -D
