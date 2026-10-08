@@ -163,15 +163,36 @@ pub fn probe_virtio() -> Result<Option<(usize, usize)>, &'static str> {
     if rc != 0 {
         return Err("device did not start");
     }
+    // The size the host asks for can be one the screen image can't have
+    // (too big, or changing while it is read): then fall back to sizes
+    // every host shows, rather than leave no screen at all.
+    let mut made = None;
+    let asked = (w, h);
+    for (i, (w, h)) in [asked, (1280, 800), (1024, 768)].into_iter().enumerate() {
+        if i > 0 && (w, h) == asked {
+            continue;
+        }
+        let Some(console) = PageBuffer::new(w as usize * h as usize * 4) else {
+            crate::console::print_colored(crate::console::YELLOW, format_args!("[WARN] virtio-gpu: no memory for a {}x{} screen image\n", w, h));
+            continue;
+        };
+        let rc = unsafe { dhi::aero_vgpu_create(CONSOLE_RESOURCE, w, h, console.pages.as_ptr(), console.pages.len() as u32) };
+        if rc != 0 {
+            crate::console::print_colored(crate::console::YELLOW, format_args!("[WARN] virtio-gpu: could not create a {}x{} screen resource ({})\n", w, h, rc));
+            // It may exist without its backing: start again from nothing.
+            unsafe { dhi::aero_vgpu_destroy(CONSOLE_RESOURCE) };
+            continue;
+        }
+        if unsafe { dhi::aero_vgpu_scanout(CONSOLE_RESOURCE, w, h) } != 0 {
+            crate::console::print_colored(crate::console::YELLOW, format_args!("[WARN] virtio-gpu: could not show a {}x{} screen resource\n", w, h));
+            unsafe { dhi::aero_vgpu_destroy(CONSOLE_RESOURCE) };
+            continue;
+        }
+        made = Some((console, w, h));
+        break;
+    }
+    let (console, w, h) = made.ok_or("could not create the screen resource")?;
     let (width, height) = (w as usize, h as usize);
-    let console = PageBuffer::new(width * height * 4).ok_or("out of memory for the screen image")?;
-    let rc = unsafe { dhi::aero_vgpu_create(CONSOLE_RESOURCE, w, h, console.pages.as_ptr(), console.pages.len() as u32) };
-    if rc != 0 {
-        return Err("could not create the screen resource");
-    }
-    if unsafe { dhi::aero_vgpu_scanout(CONSOLE_RESOURCE, w, h) } != 0 {
-        return Err("could not show the screen resource");
-    }
     let image = unsafe { Fb::new(console.ptr(), width, height, width * 4) };
     arch::without_interrupts(|| {
         *DISPLAY.lock() = Some(Display { front: Front::Virtio { program: None }, width, height, console, owner: None, radeon: None });

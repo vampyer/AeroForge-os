@@ -6,6 +6,9 @@
 # screen, and screenshots taken through QEMU's monitor must show its
 # picture and then the console again. The main boot test runs drawtest on
 # the firmware framebuffer path.
+#
+# HUGE=1 asks for a 4096x2160 screen, more than the screen image can be
+# backed by: the driver must fall back to 1280x800 instead of showing nothing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,6 +17,8 @@ OVMF_VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}
 TIMEOUT=${TIMEOUT:-120}
 LOG=build/display-test.log
 MON=build/display-monitor.sock
+GPU=virtio-gpu-pci
+[ -n "${HUGE:-}" ] && GPU="virtio-gpu-pci,xres=4096,yres=2160"
 
 fail() {
     echo "FAIL: $1"
@@ -29,7 +34,7 @@ rm -f "$LOG" "$MON" build/virtio-boot.ppm build/virtio-draw.ppm build/virtio-con
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 2 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file=build/display-vars.fd \
-    -cdrom build/aeroforge.iso -vga none -device virtio-gpu-pci \
+    -cdrom build/aeroforge.iso -vga none -device "$GPU" \
     -serial file:"$LOG" -display none -monitor unix:"$MON",server,nowait &
 QEMU_PID=$!
 trap 'kill $QEMU_PID 2>/dev/null || true' EXIT
@@ -62,8 +67,13 @@ done
 sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a "virtio-gpu\|drawtest\|through the\|whole screen\|showing the console"
 grep -q "C++ virtio-gpu driver attached through DHI v[0-9]*: console on screen at [0-9]*x[0-9]*" "$LOG" || fail "the virtio-gpu driver did not start"
 grep -q "  [0-9]*x[0-9]* through the virtio-gpu" "$LOG" || fail "'display' did not report the virtio-gpu"
+if [ -n "${HUGE:-}" ]; then
+    grep -q "\[WARN\] virtio-gpu: could not create a 4096x2160 screen resource" "$LOG" \
+        && grep -q "console on screen at 1280x800" "$LOG" \
+        || fail "a 4096x2160 screen did not fall back to 1280x800"
+fi
 grep -q "\[drawtest\] full-screen frame, partial update, bad frame refused, screen given back: OK" "$LOG" || fail "drawtest failed"
 python3 tools/check-screen.py console build/virtio-boot.ppm || fail "the console was not on screen after boot"
 python3 tools/check-screen.py drawtest build/virtio-draw.ppm || fail "drawtest's picture was not on screen"
 python3 tools/check-screen.py console build/virtio-console.ppm || fail "the console did not come back after drawtest"
-echo "PASS: with no firmware framebuffer, the C++ virtio-gpu driver put the console on screen, a program drew the whole screen and a partial update, and the console came back"
+echo "PASS: with no firmware framebuffer${HUGE:+ and a 4096x2160 screen asked for (fell back to 1280x800)}, the C++ virtio-gpu driver put the console on screen, a program drew the whole screen and a partial update, and the console came back"
