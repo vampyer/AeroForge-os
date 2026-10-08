@@ -74,7 +74,7 @@ def main():
         # Inside the moved Notes window's white client area, away from its text.
         want = {(x + 486, y + 120): (255, 255, 255), (x + 486, y + 240): (255, 255, 255),
                 # Below the last row of the Computer window's list.
-                (cx + 300, cy + 200): (255, 255, 255)}
+                (cx + 300, cy + 290): (255, 255, 255)}
         # The Computer window was made 700 wide: wallpaper just right of it.
         paper = at(cx + 720, cy + 200)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):

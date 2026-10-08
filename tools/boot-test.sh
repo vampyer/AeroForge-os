@@ -101,7 +101,7 @@ SMBD_PID=$(./tools/smb-server.sh) || { echo "FAIL: could not start the Samba ser
 SUDO=$([ "$(id -u)" = 0 ] && echo "" || echo sudo)
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm
+rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm build/gop-panes.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -423,6 +423,33 @@ for _ in $(seq "$TIMEOUT"); do
         monitor "sendkey home"; sleep 0.3; monitor "sendkey alt-ret"; STAGE=advdrive
     elif [ $STAGE = advdrive ] && grep -q "\[desktop\] properties of .* (C:)" "$LOG"; then
         sleep 1; monitor "screendump build/gop-props.ppm"; monitor "sendkey ret"; sleep 0.5
+        # A new tab (Ctrl+T), split into two panes.
+        type_keys $'\x14'; STAGE=panestab
+    elif [ $STAGE = panestab ] && grep -q "\[desktop\] tabs: .*; tab 2 in front" "$LOG"; then
+        XY=$(grep -ao "Two panes at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=panesplit
+    elif [ $STAGE = panesplit ] && grep -q "\[desktop\] two panes: left = Computer, right = Computer" "$LOG"; then
+        # C: on the left; then (Tab) C:/docs on the right.
+        N=$(grep -c "\[desktop\] Computer: / = " "$LOG")
+        sleep 0.5; monitor "sendkey home"; sleep 0.3; type_keys $'\n'; STAGE=panesleft
+    elif [ $STAGE = panesleft ] && [ "$(grep -c "\[desktop\] Computer: / = " "$LOG")" -gt "$N" ]; then
+        sleep 0.5; monitor "sendkey tab"; sleep 0.5
+        N=$(grep -c "\[desktop\] Computer: / = " "$LOG")
+        monitor "sendkey home"; sleep 0.3; type_keys $'\n'; STAGE=panesright
+    elif [ $STAGE = panesright ] && [ "$(grep -c "\[desktop\] Computer: / = " "$LOG")" -gt "$N" ]; then
+        N=$(grep -c "\[desktop\] Computer: /docs = " "$LOG")
+        sleep 0.5; point_at $(row_of / docs); double_click; STAGE=panesdocs
+    elif [ $STAGE = panesdocs ] && [ "$(grep -c "\[desktop\] Computer: /docs = " "$LOG")" -gt "$N" ]; then
+        # Back to the left (Tab), select README.TXT (the last row) and copy it over.
+        sleep 0.5; monitor "sendkey tab"; sleep 0.5; monitor "sendkey end"; sleep 0.5
+        XY=$(grep -ao "Copy > at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=panescopy
+    elif [ $STAGE = panescopy ] && grep -q "\[desktop\] \(pasted /README.TXT as /docs/\|copy failed\|Can't\)" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-panes.ppm"
+        # Close the tab (Ctrl+W).
+        type_keys $'\x17'; STAGE=panesclose
+    elif [ $STAGE = panesclose ] && grep -q "\[desktop\] tabs: [^|]*; tab 1 in front" "$LOG"; then
+        sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
         monitor "mouse_button 0"; STAGE=desksnap
@@ -600,6 +627,17 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "dragging a file onto a folder did not move it there"; }
         grep -q "\[desktop\] properties of .* (C:): Local Disk FAT32, [0-9]* bytes, [0-9]* bytes free" "$LOG" \
             || { fail "the Properties of drive C: did not show its size and free space"; }
+        grep -q "\[desktop\] tabs: Computer at [0-9,]* | Computer at [0-9,]*; tab 2 in front" "$LOG" \
+            && grep -q "\[desktop\] two panes: left = Computer, right = Computer, left in use" "$LOG" \
+            && grep -q "\[desktop\] two panes: left = C:/, right = C:/docs, left in use" "$LOG" \
+            || { fail "Ctrl+T did not open a second tab, or it did not split into C:/ and C:/docs"; }
+        grep -q "\[desktop\] copying 1 item to the other side, /docs" "$LOG" \
+            && grep -q "\[desktop\] pasted /README.TXT as /docs/README.TXT (1 file)" "$LOG" \
+            && grep -q "\[desktop\] Computer: /docs = .*README.TXT.*; first row at" "$LOG" \
+            && mdir -i build/disk.img@@1M "::/docs/README.TXT" >/dev/null 2>&1 \
+            || { fail "Copy > did not copy README.TXT to the folder on the other side"; }
+        grep -q "\[desktop\] tabs: [^|]*; tab 1 in front" "$LOG" || { fail "Ctrl+W did not close the second tab"; }
+        python3 tools/check-screen.py explorer build/gop-panes.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the two-pane screenshot is wrong"; }
         python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
@@ -689,7 +727,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
