@@ -186,6 +186,11 @@ fn with_user_access<T>(f: impl FnOnce() -> T) -> T {
 
 /// Copies `len` bytes from user memory into a kernel buffer.
 pub fn copy_from_user(ptr: u64, len: u64) -> Option<Vec<u8>> {
+    // Nothing to copy: an empty slice's pointer need not point anywhere
+    // (Rust uses a dangling one), so it is not checked.
+    if len == 0 {
+        return Some(Vec::new());
+    }
     if !check_user(ptr, len, false) {
         return None;
     }

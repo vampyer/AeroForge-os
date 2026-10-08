@@ -61,6 +61,20 @@ typedef struct dhi_key_event {
 #define DHI_MOD_ALT   0x04u
 #define DHI_MOD_CAPS  0x08u
 
+/* Keys with no character get these codes in `ascii`, above the ASCII range.
+ * The shell ignores them; a program that owns the screen gets them. */
+#define DHI_KEY_UP     0x80u
+#define DHI_KEY_DOWN   0x81u
+#define DHI_KEY_LEFT   0x82u
+#define DHI_KEY_RIGHT  0x83u
+#define DHI_KEY_HOME   0x84u
+#define DHI_KEY_END    0x85u
+#define DHI_KEY_PGUP   0x86u
+#define DHI_KEY_PGDN   0x87u
+#define DHI_KEY_DELETE 0x88u
+#define DHI_KEY_F2     0x89u
+#define DHI_KEY_F5     0x8Au
+
 /* ---- PS/2 keyboard driver (drivers/ps2kbd) ---- */
 
 /* Returns 0 on success, negative on error. `ops` must outlive the driver. */

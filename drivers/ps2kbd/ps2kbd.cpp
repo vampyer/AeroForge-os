@@ -63,6 +63,9 @@ public:
         out->pressed   = pressed ? 1 : 0;
         out->modifiers = modifiers();
         out->ascii     = was_extended ? 0 : translate(code);
+        // Arrows, Home/End, Page Up/Down and Delete (the grey keys, or the
+        // keypad's with Num Lock off), F2 and F5.
+        if (out->ascii == 0) out->ascii = special(code);
         return 1;
     }
 
@@ -70,6 +73,23 @@ private:
     uint8_t modifiers() const {
         return (shift_ ? DHI_MOD_SHIFT : 0) | (ctrl_ ? DHI_MOD_CTRL : 0) |
                (alt_ ? DHI_MOD_ALT : 0) | (caps_ ? DHI_MOD_CAPS : 0);
+    }
+
+    static uint8_t special(uint8_t code) {
+        switch (code) {
+            case 0x48: return DHI_KEY_UP;
+            case 0x50: return DHI_KEY_DOWN;
+            case 0x4B: return DHI_KEY_LEFT;
+            case 0x4D: return DHI_KEY_RIGHT;
+            case 0x47: return DHI_KEY_HOME;
+            case 0x4F: return DHI_KEY_END;
+            case 0x49: return DHI_KEY_PGUP;
+            case 0x51: return DHI_KEY_PGDN;
+            case 0x53: return DHI_KEY_DELETE;
+            case 0x3C: return DHI_KEY_F2;
+            case 0x3F: return DHI_KEY_F5;
+            default: return 0;
+        }
     }
 
     uint8_t translate(uint8_t code) const {

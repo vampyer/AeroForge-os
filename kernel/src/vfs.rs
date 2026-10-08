@@ -40,6 +40,11 @@ pub trait Volume: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    /// The volume's size and how much of it is free, in bytes (free is None
+    /// when the volume does not keep count).
+    fn space(&self) -> (u64, Option<u64>) {
+        (self.dev().block_count() * self.dev().block_size() as u64, None)
+    }
     fn list(&self, path: &str) -> Result<Vec<DirEntry>, &'static str>;
     /// Reads up to `limit` bytes of a file.
     fn read_file(&self, path: &str, limit: usize) -> Result<Vec<u8>, &'static str>;
@@ -110,6 +115,11 @@ pub fn unmount_disk(disk: &str) -> Vec<String> {
         keep
     });
     gone
+}
+
+/// Every mounted volume, root first.
+pub fn volumes() -> Vec<Arc<Mount>> {
+    MOUNTS.lock().clone()
 }
 
 fn mounts() -> Result<Vec<Arc<Mount>>, &'static str> {

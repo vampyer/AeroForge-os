@@ -67,6 +67,7 @@ pub mod sys {
     pub const TIME: u64 = 52;
     pub const DIR_LIST: u64 = 53;
     pub const MOUSE_SPEED: u64 = 54;
+    pub const VOLUMES: u64 = 55;
 }
 
 pub mod rights {
@@ -224,6 +225,47 @@ pub fn list_dir(path: &str) -> Result<alloc::vec::Vec<DirEntry>, i64> {
             size,
         });
         at += 10 + len;
+    }
+    Ok(out)
+}
+
+/// A mounted volume (a disk partition AeroForge can read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    /// Where its files are: "/" for the first writable volume, "/<device>" for the others.
+    pub path: alloc::string::String,
+    /// The disk or partition it is on, such as "nvme0n1", "sata0p1" or "usb1p1".
+    pub device: alloc::string::String,
+    /// "FAT32", "exFAT" or "NTFS".
+    pub kind: alloc::string::String,
+    pub label: alloc::string::String,
+    pub read_only: bool,
+    pub size: u64,
+    /// Free bytes, when the volume keeps count.
+    pub free: Option<u64>,
+}
+
+/// The mounted volumes, root first.
+pub fn volumes() -> Result<alloc::vec::Vec<Volume>, i64> {
+    let mut buf = alloc::vec![0u8; 16 * 1024];
+    let n = check(unsafe { syscall(sys::VOLUMES, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) })? as usize;
+    let buf = &buf[..n];
+    let mut out = alloc::vec::Vec::new();
+    let mut at = 0;
+    while at + 17 <= n {
+        let read_only = buf[at] & 1 != 0;
+        let size = u64::from_le_bytes(buf[at + 1..at + 9].try_into().unwrap());
+        let free = u64::from_le_bytes(buf[at + 9..at + 17].try_into().unwrap());
+        at += 17;
+        let mut texts: [alloc::string::String; 4] = Default::default();
+        for t in texts.iter_mut() {
+            let len = *buf.get(at).unwrap_or(&0) as usize;
+            let end = (at + 1 + len).min(n);
+            *t = alloc::string::String::from_utf8_lossy(&buf[(at + 1).min(end)..end]).into_owned();
+            at = end;
+        }
+        let [path, device, kind, label] = texts;
+        out.push(Volume { path, device, kind, label, read_only, size, free: if free == u64::MAX { None } else { Some(free) } });
     }
     Ok(out)
 }

@@ -7,6 +7,8 @@ Usage: check-screen.py drawtest <ppm>   red, green, blue and white quarters
        check-screen.py desktop <ppm> x y cx cy  the desktop with its taskbar,
                                         the Notes window moved to x,y and the
                                         Computer window at cx,cy
+       check-screen.py explorer <ppm> cx cy  the Computer window at cx,cy
+                                        showing the drives
        check-screen.py snap <ppm>       a window snapped to the left half
        check-screen.py start <ppm>      the Start button (red, white and blue
                                         with a black star) and the open menu
@@ -63,9 +65,9 @@ def main():
     elif mode == 'desktop':
         x, y = int(sys.argv[3]), int(sys.argv[4])
         cx, cy = int(sys.argv[5]), int(sys.argv[6])
-        folder = at(cx + 57, cy + 49)
+        folder = at(cx + 132, cy + 50)
         if not (folder[0] > 200 and folder[1] > 140 and folder[2] < 140):
-            sys.exit(f'{path}: no yellow folder in the Computer window\'s address bar ({cx + 57},{cy + 49} is {folder})')
+            sys.exit(f'{path}: no yellow folder in the Computer window\'s address bar ({cx + 132},{cy + 50} is {folder})')
         bar = at(w // 2, h - 10)
         if not (bar[2] > bar[0] and bar[2] < 160 and bar[0] < 80):
             sys.exit(f'{path}: no dark blue taskbar at the bottom ({w // 2},{h - 10} is {bar})')
@@ -73,10 +75,16 @@ def main():
         want = {(x + 486, y + 120): (255, 255, 255), (x + 486, y + 240): (255, 255, 255),
                 # Below the last row of the Computer window's list.
                 (cx + 300, cy + 200): (255, 255, 255)}
-        # The Computer window was made 420 wide: wallpaper just right of it.
-        paper = at(cx + 440, cy + 200)
+        # The Computer window was made 700 wide: wallpaper just right of it.
+        paper = at(cx + 720, cy + 200)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
-            sys.exit(f'{path}: the Computer window was not resized ({cx + 440},{cy + 200} is {paper})')
+            sys.exit(f'{path}: the Computer window was not resized ({cx + 720},{cy + 200} is {paper})')
+    elif mode == 'explorer':
+        # The Computer window at cx,cy showing the drives: the light blue
+        # navigation pane at the left, white tiles area, the first tile's
+        # grey drive icon.
+        cx, cy = int(sys.argv[3]), int(sys.argv[4])
+        want = {(cx + 20, cy + 400): (241, 245, 251), (cx + 400, cy + 500): (255, 255, 255)}
     elif mode == 'start':
         ox, oy = 27, h - 20
         red, white, star = at(ox - 16, oy), at(ox, oy + 12), at(ox, oy + 1)

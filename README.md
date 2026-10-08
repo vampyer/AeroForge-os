@@ -462,6 +462,19 @@ whatever the mouse speed. A virtual PC can use one so the AeroForge pointer sits
 The desktop now draws every changed piece of a frame first and presents them once. The boot test plugs
 in a `usb-tablet`, points it through QMP (`tools/qemu-qmp.py`) and checks the shell's `mouse` reading.
 
+Since 0.49 the desktop's Computer window is a file manager in the style of Windows Explorer. It opens on
+the drives, every FAT32, exFAT and NTFS volume on NVMe, SATA and USB disks, as tiles showing how full
+each is (system call 55, `volumes`). It has Back, Forward and Up, an address whose parts can be clicked,
+a pane listing Computer, the drives and the Recycle Bin, and folders in Name, Type and Size columns that
+sort with a click. New folder, Cut, Copy, Paste, Rename and Delete are on its command bar and on the keys
+(Ctrl+N, Ctrl+X, Ctrl+C, Ctrl+V, F2, Delete; arrows, Home, End, Page Up and Down, Enter, Backspace and F5
+work too). Deleting moves things to the drive's Recycle Bin (a "Recycle Bin" folder at its root, with an
+`info.txt` saying where each one came from), where they can be restored or deleted for good; Ctrl+Z puts
+back the last thing deleted. NTFS drives stay read-only. Copies are limited to 8 MB a file for now. Keys
+with no character (arrows, Delete, F2, F5) now reach programs that own the screen, and an empty file can
+be saved. The boot test makes, renames and fills a folder, deletes to the Recycle Bin, undoes it and
+deletes for good, then checks the disk image with mtools.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -490,7 +503,7 @@ in a `usb-tablet`, points it through QMP (`tools/qemu-qmp.py`) and checks the sh
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
 `thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
 `socket_recv`, `socket_listen`, `socket_accept`, `net_info`, `event_create`, `event_set`, `event_reset`,
-`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`.
+`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`, `volumes`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1

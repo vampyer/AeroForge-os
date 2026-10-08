@@ -110,6 +110,10 @@ pub fn push_key(c: u8) {
     if crate::input::push_key(c) {
         return;
     }
+    // Arrows, Delete, F2 and the like (codes 0x80 and up) mean nothing to the shell.
+    if c >= 0x80 {
+        return;
+    }
     let head = KEYS.head.load(Ordering::Relaxed);
     let next = (head + 1) % 256;
     if next != KEYS.tail.load(Ordering::Acquire) {
