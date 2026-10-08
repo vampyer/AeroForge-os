@@ -96,9 +96,12 @@ HIDPAD_PID=$!
 # Appending: the host client below writes to the same log.
 python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
+# A Samba share for the network drive checks (smbtest and the desktop).
+SMBD_PID=$(./tools/smb-server.sh) || { echo "FAIL: could not start the Samba server (tools/smb-server.sh)"; exit 1; }
+SUDO=$([ "$(id -u)" = 0 ] && echo "" || echo sudo)
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm
+rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -117,7 +120,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
     -monitor unix:build/qemu-monitor.sock,server,nowait -qmp unix:build/qmp.sock,server,nowait &
 QEMU_PID=$!
-trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null; $SUDO kill $SMBD_PID 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
 fail() {
@@ -287,6 +290,10 @@ for _ in $(seq "$TIMEOUT"); do
         # Its sockets must be closed and removed once it has exited.
         sleep 3; type_keys $'ifconfig\n'; STAGE=netsockets
     elif [ $STAGE = netsockets ] && grep -q "program socket(s) open" "$LOG"; then
+        # An SMB 2 client against the Samba share: sign in, list, read,
+        # write, folders, rename and delete.
+        sleep 1; type_keys $'run smbtest\n'; STAGE=smb
+    elif [ $STAGE = smb ] && grep -q "\[smbtest\] \(sign-in, list.*: OK\|FAILED\)" "$LOG"; then
         # One wait on events, a port, a socket and a child process.
         sleep 1; type_keys $'run waittest\n'; STAGE=wait
     elif [ $STAGE = wait ] && grep -q "\[waittest\] .*\(: OK\|FAILED\)" "$LOG"; then
@@ -368,6 +375,18 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = expurged ] && grep -q "\[desktop\] \(removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Can't\)" "$LOG"; then
         # Up from the Recycle Bin is Computer: screenshot the drives.
         sleep 0.5; type_keys $'\x08'; sleep 1.5; monitor "screendump build/gop-explorer.ppm"
+        # Map the Samba share as a network drive: the form, then sign in.
+        XY=$(grep -ao "Map network drive at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=netform
+    elif [ $STAGE = netform ] && grep -q "\[desktop\] map form: fields" "$LOG"; then
+        sleep 0.5; type_keys $'//10.0.2.2:4450/aero\taerotest\tForge-pass-7\n'; STAGE=netmapped
+    elif [ $STAGE = netmapped ] && grep -q "\[desktop\] \(Computer: //10.0.2.2:4450/aero = \|could not map\)" "$LOG"; then
+        # A new folder on the share, named straight away.
+        sleep 0.5; type_keys $'\x0e'; STAGE=netnew
+    elif [ $STAGE = netnew ] && grep -q "\[desktop\] \(new folder //10.0.2.2:4450/aero/New folder\|Can't\)" "$LOG"; then
+        sleep 0.5; type_keys $'From AeroForge\n'; STAGE=netrenamed
+    elif [ $STAGE = netrenamed ] && grep -q "\[desktop\] \(renamed //10.0.2.2:4450/aero/New folder to\|rename failed\)" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-network.ppm"
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
         monitor "mouse_button 0"; STAGE=desksnap
@@ -476,6 +495,19 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "network info, DNS lookups or the TCP server did not work" build/echo-server.log; }
         grep -q "host client: got .*: OK" build/echo-server.log || { fail "the host's client did not get nettest's server's answer" build/echo-server.log; }
         grep -q "^  0 program socket(s) open" "$LOG" || { fail "nettest's sockets were not closed after it exited"; }
+        grep -q "\[smbtest\] sign-in, list, read, write, folders, rename and delete on an SMB share: OK" "$LOG" \
+            || { fail "the SMB client could not use the Samba share" build/samba/smbd.log; }
+        grep -q "\[desktop\] mapped \\\\\\\\10.0.2.2:4450\\\\aero as Z: signed in as aerotest" "$LOG" \
+            || { fail "Map network drive did not sign in to the Samba share" build/samba/smbd.log; }
+        grep -q "\[desktop\] Computer: //10.0.2.2:4450/aero = Music | hello.txt;" "$LOG" \
+            || { fail "the mapped network drive was not listed"; }
+        grep -q "\[desktop\] renamed //10.0.2.2:4450/aero/New folder to //10.0.2.2:4450/aero/From AeroForge" "$LOG" \
+            && [ -d "build/smbshare/From AeroForge" ] && [ ! -e "build/smbshare/New folder" ] \
+            || { fail "a new folder made on the network drive is not on the Samba share as From AeroForge"; }
+        mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -qF 'network drive = \\10.0.2.2:4450\aero|aerotest|Z' \
+            && ! mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -q "Forge-pass" \
+            || { fail "the network drive was not saved to /AeroForge.ini, or its password was"; }
+        python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
         grep -q "\[waittest\] events, ports, sockets and child processes in one wait: OK" "$LOG" \
             || { fail "waiting on several handles at once failed (events, a port, a socket or a child process)"; }
         grep -q "Display: console drawn off-screen and presented to the firmware framebuffer" "$LOG" || { fail "the console was not moved off-screen"; }
@@ -607,7 +639,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

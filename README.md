@@ -475,6 +475,16 @@ with no character (arrows, Delete, F2, F5) now reach programs that own the scree
 be saved. The boot test makes, renames and fills a folder, deletes to the Recycle Bin, undoes it and
 deletes for good, then checks the disk image with mtools.
 
+Since 0.50 the file manager reaches network drives: shared folders on Windows PCs, NAS boxes and Samba
+servers. "Map network drive" asks for the folder (`\\computer\share`), a user name and a password, then
+signs in over SMB 2 (dialects 2.0.2 and 2.1, NTLMv2 sign-in, every message signed with HMAC-SHA256, so it
+works with servers that require signing, as Windows 11 does). The share gets a letter from Z: down, a tile
+and a place in the pane, and can be browsed, read in Notes and changed the same way as a local drive (new
+folder, copy, move, rename, delete; deleting on a share is for good, after asking). The share and user name
+are saved to `/AeroForge.ini`; the password never is, so after a restart the drive asks for it when first
+opened. The client is `userland/src/smb.rs` (with its own MD4, MD5 and SHA-256); `smbtest` and the boot test
+use a Samba server started by `tools/smb-server.sh`.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
