@@ -21,6 +21,11 @@ truncate -s $((SECTORS * 512)) "$PART"
 mkfs.fat -F 32 -s 1 -n AEROFORGE "$PART" >/dev/null
 mcopy -s -i "$PART" tools/disk-files/* ::/
 mcopy -i "$PART" docs/AeroForge-OS-Design.md ::/docs/
+# A file deleted for good (as another system would), for the file
+# manager's "Show deleted files" to bring back: three clusters of text.
+for i in $(seq 1 40); do echo "Line $i of a list that was deleted and should come back."; done > build/undelete-me.txt
+mcopy -i "$PART" build/undelete-me.txt "::/games/Old shopping list.txt"
+mdel -i "$PART" "::/games/Old shopping list.txt"
 dd if="$PART" of="$IMG.tmp" bs=512 seek=2048 conv=notrunc status=none
 rm -f "$PART"
 mv "$IMG.tmp" "$IMG"

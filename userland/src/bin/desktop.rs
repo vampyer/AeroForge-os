@@ -750,12 +750,27 @@ const BIN_COMMANDS: [(Command, &str); 4] = [
 const BIN: &str = "::bin";
 /// Its path for search results.
 const SEARCH: &str = "::search";
+/// The view of what was deleted for good from a folder (FAT32 drives):
+/// what can still be brought back.
+const DELETED: &str = "::deleted";
+const DELETED_COMMANDS: [(Command, &str); 1] = [(Command::Restore, "Restore")];
 /// How many names a search looks at, and finds, at most.
 const SEARCH_LOOKS: usize = 50_000;
 const SEARCH_FINDS: usize = 2_000;
 /// Where each drive keeps what was deleted from it, and the list of it.
 const BIN_DIR: &str = "Recycle Bin";
 const BIN_INFO: &str = "info.txt";
+/// The list of what was emptied from it, so that the deleted files view can
+/// show those under their own names and put them back where they were.
+const BIN_GONE: &str = "emptied.txt";
+/// How many emptied items that list remembers.
+const BIN_GONE_MAX: usize = 500;
+
+/// Whether the Recycle Bin's name for something ("R0007") is `name`, a
+/// deleted file whose first letter may have been lost ("_0007").
+fn same_id(name: &str, id: &str) -> bool {
+    name.len() == id.len() && name.is_char_boundary(1) && name[1..].eq_ignore_ascii_case(&id[1..])
+}
 
 /// Something in the Recycle Bin.
 #[derive(Clone)]
@@ -844,6 +859,8 @@ enum Act {
     Refresh,
     /// Large icons or Details.
     View,
+    /// What was deleted for good from this folder.
+    ShowDeleted,
     /// A line between groups.
     Line,
 }
@@ -894,6 +911,9 @@ impl Files {
             searched_in: String::new(),
             results: Vec::new(),
             found: Vec::new(),
+            lost_in: String::new(),
+            lost: Vec::new(),
+            lost_bin: Vec::new(),
             props: None,
         }
     }
@@ -904,7 +924,7 @@ impl Files {
         if self.path == BIN {
             return self.bin.get(i).map(|b| b.id.clone()).unwrap_or_default();
         }
-        if self.path == SEARCH {
+        if self.path == SEARCH || self.path == DELETED {
             return self.found.get(i).cloned().unwrap_or_default();
         }
         self.entries.get(i).map(|e| e.name.clone()).unwrap_or_default()
@@ -913,6 +933,9 @@ impl Files {
     fn entry_path(&self, i: usize) -> String {
         if self.path == SEARCH {
             return self.found[i].clone();
+        }
+        if self.path == DELETED {
+            return join(&self.lost_in, &self.entries[i].name);
         }
         join(&self.path, &self.entries[i].name)
     }
@@ -925,7 +948,12 @@ impl Files {
     }
     /// Whether it shows a folder (not Computer, the Recycle Bin or search results).
     fn in_folder(&self) -> bool {
-        !self.path.is_empty() && self.path != BIN && self.path != SEARCH
+        !self.path.is_empty() && self.path != BIN && self.path != SEARCH && self.path != DELETED
+    }
+    /// In the deleted files view: what entry `i` is.
+    fn lost_at(&self, i: usize) -> Option<&aero::Deleted> {
+        let slot: u32 = self.found.get(i)?.parse().ok()?;
+        self.lost.iter().find(|d| d.slot == slot)
     }
 }
 
@@ -1012,8 +1040,15 @@ struct Files {
     /// The last search: where it looked and what it found (full paths).
     searched_in: String,
     results: Vec<(String, aero::DirEntry)>,
-    /// In the search results view: each entry's full path.
+    /// In the search results view: each entry's full path. In the deleted
+    /// files view: each entry's slot in its folder.
     found: Vec<String>,
+    /// The deleted files view: the folder looked in, and what it found.
+    lost_in: String,
+    lost: Vec<aero::Deleted>,
+    /// When looking in a Recycle Bin's folder: what each of `lost` was
+    /// before it went to the bin.
+    lost_bin: Vec<Recycled>,
     /// The Properties box, when open.
     props: Option<Props>,
 }
@@ -2144,6 +2179,11 @@ fn split_path(path: &str) -> (String, String) {
     }
 }
 
+/// Whether `path` is a drive's Recycle Bin folder.
+fn bin_folder(path: &str) -> bool {
+    split_path(path).1.eq_ignore_ascii_case(BIN_DIR)
+}
+
 /// What a failed file system call means, for the status bar.
 fn fs_error_text(e: i64) -> &'static str {
     match e {
@@ -2803,13 +2843,15 @@ impl Desktop {
             &[(Command::Yes, "Yes"), (Command::No, "No")]
         } else if self.files.path == BIN {
             &BIN_COMMANDS
+        } else if self.files.path == DELETED {
+            &DELETED_COMMANDS
         } else if self.files.path.is_empty() {
             &COMPUTER_COMMANDS
         } else {
             &COMMANDS
         };
         let mut list: Vec<(Command, &'static str)> = list.to_vec();
-        if self.other.is_some() && self.files.confirm.is_none() && self.files.path != BIN && !self.files.path.is_empty() {
+        if self.other.is_some() && self.files.confirm.is_none() && self.files.in_folder() || self.other.is_some() && self.files.confirm.is_none() && self.files.path == SEARCH {
             // Where the other side is, by an arrow.
             let over: [(Command, &'static str); 2] = if self.right {
                 [(Command::CopyOver, "< Copy"), (Command::MoveOver, "< Move")]
@@ -2923,6 +2965,24 @@ impl Desktop {
             })
             .collect()
     }
+    /// Whether the folder shown is on a drive whose deleted files can be
+    /// looked for (FAT32, writable; not the Recycle Bin's own folder).
+    fn can_undelete(&self) -> bool {
+        self.files.in_folder()
+            && !self.files_read_only()
+            && self.drive_of(&self.files.path).is_some_and(|d| self.files.drives[d].kind == "FAT32")
+            && net_path(&self.files.path).is_none()
+    }
+
+    /// The drive whose Recycle Bin's emptied files can be looked for: the
+    /// first writable FAT32 drive that has emptied something.
+    fn emptied_root(&self) -> Option<String> {
+        self.files.drives.iter()
+            .filter(|v| v.kind == "FAT32" && !v.read_only && net_path(&v.path).is_none())
+            .map(|v| v.path.clone())
+            .find(|r| !Self::read_list(r, BIN_GONE).is_empty())
+    }
+
     fn command_enabled(&self, cmd: Command) -> bool {
         let folder = !self.files.path.is_empty();
         let writable = folder && !self.files_read_only();
@@ -2930,6 +2990,9 @@ impl Desktop {
         let search = self.files.path == SEARCH;
         // In search results each can be on a different drive.
         let all_writable = || self.picked().iter().all(|&j| !self.files_drive_read_only(&self.entry_path(j)));
+        if self.files.path == DELETED {
+            return cmd == Command::Restore && picked && self.picked().iter().all(|&j| self.files.lost_at(j).is_some_and(|d| d.whole));
+        }
         match cmd {
             Command::NewFolder | Command::Paste | Command::Rename if search => false,
             Command::Cut | Command::Delete if search => picked && all_writable(),
@@ -3095,6 +3158,9 @@ impl Desktop {
         if self.files.path == BIN {
             return alloc::vec![(String::from("Recycle Bin"), String::from(BIN))];
         }
+        if self.files.path == DELETED {
+            return alloc::vec![(self.place_title(&self.files), String::from(DELETED))];
+        }
         if self.files.path == SEARCH {
             let at = &self.files.searched_in;
             let place = if at.is_empty() {
@@ -3158,6 +3224,8 @@ impl Desktop {
             "" => String::from("Computer"),
             BIN => String::from("Recycle Bin"),
             SEARCH => String::from("Search Results"),
+            DELETED if !f.lost_bin.is_empty() || bin_folder(&f.lost_in) => String::from("Emptied from the Recycle Bin"),
+            DELETED => format!("Deleted from {}", split_path(&f.lost_in).1),
             p => {
                 if let Some(d) = f.drives.iter().position(|v| v.path.eq_ignore_ascii_case(p)) {
                     return self.drive_name(d);
@@ -3171,7 +3239,7 @@ impl Desktop {
     }
     /// Where a side shows, in full ("C:/docs/Stuff"), for two-pane headers.
     fn place_path(&self, f: &Files) -> String {
-        if f.path.is_empty() || f.path == BIN || f.path == SEARCH {
+        if f.path.is_empty() || f.path == BIN || f.path == SEARCH || f.path == DELETED {
             return self.place_title(f);
         }
         if let Some((i, inner)) = net_path(&f.path) {
@@ -3940,6 +4008,8 @@ impl Desktop {
         if f.entries.is_empty() {
             let empty = if f.path == BIN {
                 "The Recycle Bin is empty."
+            } else if f.path == DELETED {
+                "Nothing deleted is left in this folder."
             } else if f.path == SEARCH {
                 "No items match your search."
             } else {
@@ -4005,6 +4075,10 @@ impl Desktop {
             let kind = match f.bin.get(i) {
                 Some(item) if f.path == BIN => split_path(&item.original).0,
                 _ if f.path == SEARCH => split_path(&f.found[i]).0,
+                _ if f.path == DELETED => String::from(match f.lost_at(i) {
+                    Some(d) if d.whole => "Can be restored",
+                    _ => "Written over",
+                }),
                 _ => type_text(e),
             };
             if dates && e.modified != 0 {
@@ -4084,6 +4158,50 @@ impl Desktop {
         }
         if let Ok(drives) = aero::volumes() {
             self.files.drives = drives;
+        }
+        if path == DELETED {
+            let at = self.files.lost_in.clone();
+            match aero::deleted_list(&at) {
+                Ok(mut lost) => {
+                    self.files.lost_bin.clear();
+                    if bin_folder(&at) {
+                        // Only the files emptied from the bin, under their own names.
+                        let gone = Self::read_list(&split_path(&at).0, BIN_GONE);
+                        lost.retain(|d| !d.is_dir && gone.iter().any(|g| same_id(&d.name, &g.id)));
+                        self.files.lost_bin = lost.iter().map(|d| gone.iter().rev().find(|g| same_id(&d.name, &g.id)).unwrap().clone()).collect();
+                    }
+                    self.files.lost = lost;
+                }
+                Err(e) => {
+                    self.files.status = format!("Can't look for deleted files there: {}", fs_error_text(e));
+                    println!("[desktop] deleted files in {}: {}", at, fs_error_text(e));
+                    return false;
+                }
+            }
+            self.files.entries = self.files.lost.iter().enumerate()
+                .map(|(i, d)| aero::DirEntry {
+                    name: self.files.lost_bin.get(i).map_or_else(|| d.name.clone(), |g| split_path(&g.original).1),
+                    is_dir: d.is_dir,
+                    size: d.size,
+                    modified: d.modified,
+                })
+                .collect();
+            self.files.found = self.files.lost.iter().map(|d| format!("{}", d.slot)).collect();
+            let whole = self.files.lost.iter().filter(|d| d.whole).count();
+            let n = self.files.lost.len();
+            self.files.status = format!("{} deleted item{}, {} can be restored", n, if n == 1 { "" } else { "s" }, whole);
+            self.files.path = path;
+            self.sort_entries();
+            self.files.scroll = 0;
+            self.files.selected = None;
+            let list: Vec<String> = (0..self.files.entries.len())
+                .map(|i| format!("{} ({})", self.files.entries[i].name, if self.files.lost_at(i).is_some_and(|d| d.whole) { "whole" } else { "written over" }))
+                .collect();
+            let c = self.files_client();
+            let row = self.files_row(&c, 0);
+            println!("[desktop] deleted files in {} = {}; first row at {},{}, rows {} apart",
+                at, list.join(" | "), row.x + 40 * self.ui, row.y + row.h / 2, row.h);
+            return true;
         }
         if path == SEARCH {
             self.files.entries = self.files.results.iter().map(|(_, e)| e.clone()).collect();
@@ -4219,6 +4337,10 @@ impl Desktop {
         }
         if path == SEARCH {
             let back = self.files.searched_in.clone();
+            return self.navigate(back);
+        }
+        if path == DELETED {
+            let back = if bin_folder(&self.files.lost_in) { String::from(BIN) } else { self.files.lost_in.clone() };
             return self.navigate(back);
         }
         let at_root = self.drive_of(&path).is_some_and(|d| self.files.drives[d].path.eq_ignore_ascii_case(path.trim_end_matches('/')) || path == "/")
@@ -4477,7 +4599,7 @@ impl Desktop {
             return;
         }
         let (by, desc) = (self.files.sort, self.files.descending);
-        if self.files.path == SEARCH {
+        if self.files.path == SEARCH || self.files.path == DELETED {
             let mut both: Vec<(aero::DirEntry, String)> =
                 core::mem::take(&mut self.files.entries).into_iter().zip(core::mem::take(&mut self.files.found)).collect();
             both.sort_by(|(a, pa), (b, pb)| {
@@ -4640,7 +4762,7 @@ impl Desktop {
             let to = self.files.drives[i].path.clone();
             return self.navigate(to);
         }
-        if self.files.path == BIN {
+        if self.files.path == BIN || self.files.path == DELETED {
             return self.command(Command::Restore);
         }
         let Some(e) = self.files.entries.get(i).cloned() else { return Rect::EMPTY };
@@ -4738,6 +4860,57 @@ impl Desktop {
                 self.files.confirm = Some(cmd);
                 self.files.status = String::from("Press Enter or Yes to go ahead, Esc or No to keep it");
             }
+            Command::Restore if self.files.path == DELETED => {
+                let picked = self.picked();
+                let i = picked[0];
+                let slots: Vec<u32> = picked.iter().filter_map(|&j| self.files.lost_at(j).map(|d| d.slot)).collect();
+                let at = self.files.lost_in.clone();
+                let mut done = Vec::new();
+                let mut failed = None;
+                for slot in slots {
+                    let was = self.files.lost.iter().position(|d| d.slot == slot).and_then(|k| self.files.lost_bin.get(k)).cloned();
+                    match aero::undelete(&at, slot) {
+                        Ok(name) => {
+                            println!("[desktop] undeleted {}", join(&at, &name));
+                            match was {
+                                // Back from the bin's folder to where it was.
+                                Some(g) => {
+                                    let root = split_path(&at).0;
+                                    let item = Recycled { id: name.clone(), ..g.clone() };
+                                    let gone: Vec<Recycled> = Self::read_list(&root, BIN_GONE).into_iter().filter(|b| b.id != g.id).collect();
+                                    let _ = Self::write_list(&root, BIN_GONE, &gone);
+                                    match self.restore(&item) {
+                                        Ok(to) => done.push(split_path(&to).1),
+                                        Err(msg) => {
+                                            println!("[desktop] {}", msg);
+                                            failed = Some(msg);
+                                        }
+                                    }
+                                }
+                                None => done.push(name),
+                            }
+                        }
+                        Err(e) => {
+                            let msg = match e {
+                                aero::E_EXISTS => String::from("Can't restore it: something with that name is there now"),
+                                aero::E_FULL => String::from("Can't restore it: its data has been written over"),
+                                e => format!("Can't restore it: {}", fs_error_text(e)),
+                            };
+                            println!("[desktop] undelete failed in {}: {}", at, msg);
+                            failed = Some(msg);
+                        }
+                    }
+                }
+                self.refresh(None);
+                if !self.files.entries.is_empty() {
+                    self.select(i.min(self.files.entries.len() - 1));
+                }
+                self.files.status = match (failed, done.as_slice()) {
+                    (Some(msg), _) => msg,
+                    (None, [one]) => format!("Restored {}", one),
+                    (None, _) => format!("Restored {} items", done.len()),
+                };
+            }
             Command::Restore => {
                 let picked = self.picked();
                 let i = picked[0];
@@ -4769,7 +4942,7 @@ impl Desktop {
                         let n = items.len();
                         let mut failed = None;
                         for item in &items {
-                            if let Err(msg) = self.purge(item) {
+                            if let Err(msg) = self.purge(item, true) {
                                 failed = Some(msg);
                             }
                         }
@@ -4783,7 +4956,7 @@ impl Desktop {
                             _ => format!("Deleted {} items for good", items.len()),
                         });
                         for item in &items {
-                            if let Err(msg) = self.purge(item) {
+                            if let Err(msg) = self.purge(item, true) {
                                 result = Err(msg);
                             }
                         }
@@ -4970,8 +5143,12 @@ impl Desktop {
     }
 
     fn read_bin(root: &str) -> Vec<Recycled> {
+        Self::read_list(root, BIN_INFO)
+    }
+
+    fn read_list(root: &str, file: &str) -> Vec<Recycled> {
         let mut buf = alloc::vec![0u8; 64 * 1024];
-        let Ok(n) = aero::read_file(&join(&join(root, BIN_DIR), BIN_INFO), &mut buf) else { return Vec::new() };
+        let Ok(n) = aero::read_file(&join(&join(root, BIN_DIR), file), &mut buf) else { return Vec::new() };
         let text = String::from_utf8_lossy(&buf[..n]).into_owned();
         text.lines()
             .filter_map(|line| {
@@ -4990,11 +5167,15 @@ impl Desktop {
     }
 
     fn write_bin(root: &str, items: &[Recycled]) -> Result<(), String> {
+        Self::write_list(root, BIN_INFO, items)
+    }
+
+    fn write_list(root: &str, file: &str, items: &[Recycled]) -> Result<(), String> {
         let mut text = String::new();
         for b in items {
             text.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", b.id, if b.is_dir { "D" } else { "F" }, b.size, b.when, b.original));
         }
-        let path = join(&join(root, BIN_DIR), BIN_INFO);
+        let path = join(&join(root, BIN_DIR), file);
         aero::write_file(&path, text.as_bytes()).map(|_| ()).map_err(|e| format!("Can't write {}: {}", path, fs_error_text(e)))
     }
 
@@ -5024,7 +5205,8 @@ impl Desktop {
         // The next free number, past anything already in the folder.
         let mut next = 1;
         let listed = aero::list_dir(&bin).unwrap_or_default();
-        for name in items.iter().map(|b| b.id.as_str()).chain(listed.iter().map(|l| l.name.as_str())) {
+        let gone = Self::read_list(&root, BIN_GONE);
+        for name in items.iter().chain(gone.iter()).map(|b| b.id.as_str()).chain(listed.iter().map(|l| l.name.as_str())) {
             if let Some(n) = name.strip_prefix('R').and_then(|n| n.parse::<u32>().ok()) {
                 next = next.max(n + 1);
             }
@@ -5064,14 +5246,15 @@ impl Desktop {
         let taken: Vec<&str> = taken.iter().map(|t| t.as_str()).collect();
         let to = join(&dir, &free_name(&name, &taken, item.is_dir, false));
         copy_tree(&item.stored(), &to, item.is_dir, item.size).map_err(|m| format!("Not restored: {}", m))?;
-        self.purge(item)?;
+        self.purge(item, false)?;
         println!("[desktop] restored {} from the Recycle Bin to {}", item.original, to);
         self.files.last_recycled.retain(|l| !(l.root == item.root && l.id == item.id));
         Ok(to)
     }
 
     /// Deletes something in the Recycle Bin for good.
-    fn purge(&self, item: &Recycled) -> Result<(), String> {
+    /// `emptied`: remember it, so it can still be undeleted (FAT32).
+    fn purge(&self, item: &Recycled, emptied: bool) -> Result<(), String> {
         match delete_tree(&item.stored(), item.is_dir) {
             Ok(_) => {}
             // Gone already: just drop it from the list.
@@ -5080,6 +5263,14 @@ impl Desktop {
         }
         let items: Vec<Recycled> = Self::read_bin(&item.root).into_iter().filter(|b| b.id != item.id).collect();
         Self::write_bin(&item.root, &items)?;
+        if emptied {
+            let mut gone = Self::read_list(&item.root, BIN_GONE);
+            gone.push(item.clone());
+            let extra = gone.len().saturating_sub(BIN_GONE_MAX);
+            if let Err(m) = Self::write_list(&item.root, BIN_GONE, &gone[extra..]) {
+                println!("[desktop] {}", m);
+            }
+        }
         println!("[desktop] removed {} from the Recycle Bin", item.original);
         Ok(())
     }
@@ -5395,7 +5586,7 @@ impl Desktop {
 
     /// The button went down on selected entries: they may be dragged next.
     fn press_drag(&mut self, x: i32, y: i32, collapse: Option<usize>) {
-        if self.files.path.is_empty() || self.files.path == BIN {
+        if self.files.path.is_empty() || self.files.path == BIN || self.files.path == DELETED {
             return;
         }
         let items = self.picked_items();
@@ -5707,6 +5898,13 @@ impl Desktop {
                 self.files_area()
             }
             Act::View => self.toggle_icons(),
+            Act::ShowDeleted => {
+                self.files.lost_in = match self.files.path.as_str() {
+                    BIN => self.emptied_root().map_or_else(String::new, |r| join(&r, BIN_DIR)),
+                    p => String::from(p),
+                };
+                self.navigate(String::from(DELETED))
+            }
             Act::Line => Rect::EMPTY,
         };
         area.union(&r).union(&self.sync_preview())
@@ -5779,6 +5977,8 @@ impl Desktop {
                 }
                 if self.files.path == BIN {
                     alloc::vec![(Do(Command::Restore), "Restore", true), (Line, "", false), (Do(Command::Delete), "Delete", true), (Line, "", false), (Do(Command::Properties), "Properties", true)]
+                } else if self.files.path == DELETED {
+                    alloc::vec![(Do(Command::Restore), "Restore", on(self, Command::Restore))]
                 } else {
                     let one_folder = self.picked().len() == 1 && self.files.entries[i].is_dir;
                     let mut v = alloc::vec![(Open, "Open", self.picked().len() == 1)];
@@ -5807,7 +6007,14 @@ impl Desktop {
                 self.files.selected = None;
                 self.files.marked.clear();
                 if self.files.path == BIN {
-                    alloc::vec![(Do(Command::Empty), "Empty Recycle Bin", on(self, Command::Empty)), (Refresh, "Refresh", true)]
+                    alloc::vec![
+                        (Do(Command::Empty), "Empty Recycle Bin", on(self, Command::Empty)),
+                        (Refresh, "Refresh", true),
+                        (Line, "", false),
+                        (ShowDeleted, "Show emptied files", self.emptied_root().is_some()),
+                    ]
+                } else if self.files.path == DELETED {
+                    alloc::vec![(Refresh, "Refresh", true)]
                 } else {
                     alloc::vec![
                         (View, if self.icons { "Details" } else { "Large icons" }, true),
@@ -5816,6 +6023,8 @@ impl Desktop {
                         (Do(Command::Paste), "Paste", on(self, Command::Paste)),
                         (Line, "", false),
                         (Do(Command::NewFolder), "New folder", on(self, Command::NewFolder)),
+                        (Line, "", false),
+                        (ShowDeleted, "Show deleted files", self.can_undelete()),
                     ]
                 }
             }
