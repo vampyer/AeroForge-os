@@ -617,9 +617,6 @@ impl Edges {
     }
 }
 
-/// Two presses closer together than this are a double-click.
-const DOUBLE_CLICK_US: u64 = 500_000;
-
 /// How the Computer window sorts a folder (folders always come first).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortBy {
@@ -758,6 +755,38 @@ enum Place {
     Drive,
     Network,
     Bin,
+    Folder,
+}
+
+/// What a line of the right-click menu does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Act {
+    Open,
+    OpenInTab,
+    Do(Command),
+    Refresh,
+    /// A line between groups.
+    Line,
+}
+
+/// The right-click menu: where it is, its lines, and what they act on (a
+/// place in the pane, for Open and Open in new tab there).
+struct Popup {
+    x: i32,
+    y: i32,
+    items: Vec<(Act, &'static str, bool)>,
+    place: Option<String>,
+}
+
+/// A row of the navigation pane's tree.
+#[derive(Clone)]
+struct PaneRow {
+    name: String,
+    path: String,
+    kind: Place,
+    depth: i32,
+    /// Its arrow: open or closed, or none when there is nothing inside.
+    open: Option<bool>,
 }
 
 impl Files {
@@ -965,12 +994,15 @@ struct Desktop {
     icon: Option<usize>,
     /// Pointer speed, 1 to 10 (see aero::mouse_speed).
     mouse_speed: u64,
-    /// When and where the last press was, for double-clicks.
-    last_press: (u64, i32, i32),
     /// Files being dragged in the Computer window (or pressed on, about to be).
     file_drag: Option<FileDrag>,
     /// The modifier keys held as the key being handled was typed.
     key_mods: u8,
+    /// The navigation pane's tree: the places opened (lower case), and the
+    /// folders found in each.
+    tree_open: Vec<String>,
+    tree_kids: Vec<(String, Vec<String>)>,
+    popup: Option<Popup>,
     /// Two-pane mode: the side not in use (`files` is the one in use), and
     /// whether the one in use is the right-hand side.
     other: Option<Box<Files>>,
@@ -1574,14 +1606,23 @@ impl Desktop {
     }
 
     fn draw(&self, c: &mut Canvas) {
-        self.background(c);
-        self.icons(c);
+        // A window's inside is opaque: when the area lies wholly inside one,
+        // the wallpaper and the windows behind it are not drawn at all.
+        let clip = c.clip;
+        let first = (0..self.windows.len())
+            .rev()
+            .find(|&i| self.windows[i].shown() && self.client(&self.windows[i].rect).intersect(&clip) == clip);
+        if first.is_none() {
+            self.background(c);
+            self.icons(c);
+        }
         let top = self.top_kind();
-        for win in self.windows.iter().filter(|w| w.shown()) {
+        for win in self.windows[first.unwrap_or(0)..].iter().filter(|w| w.shown()) {
             self.window(c, win, Some(win.kind) == top);
         }
         self.snap_preview(c);
         self.taskbar_and_menu(c);
+        self.popup_view(c);
         self.cursor(c);
     }
 
@@ -1598,6 +1639,10 @@ impl Desktop {
     fn hover_area(&self, x: i32, y: i32) -> Rect {
         let s = self.ui;
         let mut spots: Vec<Rect> = Vec::new();
+        if let Some(p) = &self.popup {
+            spots.extend((0..p.items.len()).map(|i| self.popup_item(i)));
+            return spots.into_iter().find(|r| r.contains(x, y)).unwrap_or(Rect::EMPTY);
+        }
         if self.menu {
             spots.extend((0..KINDS.len()).map(|i| self.menu_item(i)));
             spots.push(self.exit_button());
@@ -1685,14 +1730,13 @@ impl Desktop {
     }
 
     /// Left button pressed at (x, y). Returns the area to redraw.
-    fn click(&mut self, x: i32, y: i32) -> Rect {
-        let now = aero::clock_us();
-        let (when, px, py) = self.last_press;
-        let near = 4 * self.ui;
-        let double = when != 0 && now - when < DOUBLE_CLICK_US && (x - px).abs() <= near && (y - py).abs() <= near;
-        // A third press starts over rather than making a second double-click.
-        self.last_press = if double { (0, 0, 0) } else { (now, x, y) };
+    /// A left-button press at (x, y); `double` when the system timed it as
+    /// the second press of a double-click.
+    fn click(&mut self, x: i32, y: i32, double: bool) -> Rect {
         let mut dirty = Rect::EMPTY;
+        if self.popup.is_some() {
+            return self.popup_click(x, y);
+        }
         let menu_was_open = self.menu;
         if self.menu {
             self.menu = false;
@@ -1757,14 +1801,21 @@ impl Desktop {
         // The front-most window under the pointer.
         let hit = (0..self.windows.len()).rev().find(|&i| self.windows[i].shown() && self.windows[i].rect.contains(x, y));
         if let Some(i) = hit {
+            // Bringing a window forward redraws it and the taskbar; a click
+            // inside the window already in front redraws only what it changes.
+            let in_front = self.top_kind() == Some(self.windows[i].kind);
             let i = self.raise(i);
             let r = self.windows[i].rect;
-            dirty = dirty.union(&self.window_area(i)).union(&self.taskbar());
+            if !in_front {
+                dirty = dirty.union(&self.window_area(i)).union(&self.taskbar());
+            }
             if self.caption(&r, Caption::Close).contains(x, y) {
                 self.windows[i].open = false;
                 println!("[desktop] closed {}", self.windows[i].title);
+                dirty = dirty.union(&self.window_area(i)).union(&self.taskbar());
             } else if self.caption(&r, Caption::Minimize).contains(x, y) {
                 self.windows[i].minimized = true;
+                dirty = dirty.union(&self.window_area(i)).union(&self.taskbar());
             } else if self.caption(&r, Caption::Maximize).contains(x, y) {
                 self.maximize(i);
                 dirty = dirty.union(&self.window_area(i));
@@ -1915,6 +1966,15 @@ impl Desktop {
         let mut dirty = Rect::EMPTY;
         for &(k, mods) in keys {
             self.key_mods = mods;
+            if self.popup.is_some() {
+                // The menu takes the keys: Esc closes it, Enter or a
+                // line's first letter... kept simple: anything closes it.
+                dirty = dirty.union(&self.popup_area());
+                self.popup = None;
+                if k == 27 {
+                    continue;
+                }
+            }
             // Esc gives the screen back, unless the Computer window is
             // in front and waiting for a new name or a Yes or No.
             let files_busy = self.files.rename.is_some()
@@ -2295,8 +2355,10 @@ impl Desktop {
         self.client(&self.windows[self.index(Kind::Computer)].rect)
     }
     /// The Computer window's area, to redraw it.
+    /// The inside of the Computer window, which is all that its own
+    /// changes redraw.
     fn files_area(&self) -> Rect {
-        self.window_area(self.index(Kind::Computer))
+        self.client(&self.windows[self.index(Kind::Computer)].rect)
     }
     fn files_nav(&self, c: &Rect) -> Rect {
         Rect::new(c.x, c.y, c.w, 40 * self.ui)
@@ -2371,7 +2433,7 @@ impl Desktop {
     }
     fn files_pane(&self, c: &Rect) -> Rect {
         let b = self.files_body(c);
-        Rect::new(b.x, b.y, (200 * self.ui).min(b.w / 3), b.h)
+        Rect::new(b.x, b.y, (240 * self.ui).min(b.w / 3), b.h)
     }
     /// Right of the navigation pane: the folder shown, or both sides,
     /// then the preview pane if it is on.
@@ -2463,11 +2525,37 @@ impl Desktop {
         let top = 26 * self.ui;
         Rect::new(r.x, r.y + top, r.w, r.h - top)
     }
-    /// The pane's rows: Computer (0), then the drives.
+    /// The pane's rows: the Recycle Bin, then Computer's tree. When they
+    /// don't all fit, the list starts far enough down to show the place in use.
     fn pane_item(&self, c: &Rect, i: usize) -> Rect {
         let s = self.ui;
         let p = self.files_pane(c);
-        Rect::new(p.x, p.y + 6 * s + i as i32 * 28 * s, p.w, 28 * s)
+        let first = self.pane_first(c);
+        if i < first {
+            return Rect::EMPTY;
+        }
+        let r = Rect::new(p.x, p.y + 6 * s + (i - first) as i32 * 28 * s, p.w, 28 * s);
+        if r.y + r.h > p.y + p.h { Rect::EMPTY } else { r }
+    }
+    fn pane_first(&self, c: &Rect) -> usize {
+        let s = self.ui;
+        let p = self.files_pane(c);
+        let fits = ((p.h - 6 * s) / (28 * s)).max(1) as usize;
+        let rows = self.places();
+        if rows.len() <= fits {
+            return 0;
+        }
+        let here = rows.iter().position(|r| r.kind != Place::Computer && r.path.eq_ignore_ascii_case(&self.files.path)).unwrap_or(0);
+        (here + 3).saturating_sub(fits).min(rows.len() - fits)
+    }
+    /// A tree row's arrow.
+    fn pane_arrow(&self, c: &Rect, i: usize, depth: i32) -> Rect {
+        let s = self.ui;
+        let r = self.pane_item(c, i);
+        if r.is_empty() {
+            return r;
+        }
+        Rect::new(r.x + 2 * s + depth * 14 * s, r.y, 16 * s, r.h)
     }
     // A folder list's parts, inside content area `k`.
     fn head_in(&self, k: &Rect) -> Rect {
@@ -2703,16 +2791,133 @@ impl Desktop {
 
     /// The navigation pane's rows: Computer, the drives, the network
     /// drives and the Recycle Bin, as (shown as, path, kind).
-    fn places(&self) -> Vec<(String, String, Place)> {
-        let mut out = alloc::vec![(String::from("Computer"), String::new(), Place::Computer)];
+    fn places(&self) -> Vec<PaneRow> {
+        let row = |name: String, path: String, kind: Place, depth: i32, open: Option<bool>| PaneRow { name, path, kind, depth, open };
+        let mut out = alloc::vec![row(String::from("Recycle Bin"), String::from(BIN), Place::Bin, 0, None)];
+        let computer_open = self.tree_is_open("");
+        out.push(row(String::from("Computer"), String::new(), Place::Computer, 0, Some(computer_open)));
+        if !computer_open {
+            return out;
+        }
         for i in 0..self.files.drives.len() {
-            out.push((self.drive_name(i), self.files.drives[i].path.clone(), Place::Drive));
+            let path = self.files.drives[i].path.clone();
+            out.push(row(self.drive_name(i), path.clone(), Place::Drive, 1, self.tree_arrow(&path)));
+            self.tree_rows(&path, 2, &mut out);
         }
         for sh in shares().iter() {
-            out.push((sh.name(), sh.root(), Place::Network));
+            let path = sh.root();
+            let arrow = if sh.client.is_some() { self.tree_arrow(&path) } else { None };
+            out.push(row(sh.name(), path.clone(), Place::Network, 1, arrow));
+            self.tree_rows(&path, 2, &mut out);
         }
-        out.push((String::from("Recycle Bin"), String::from(BIN), Place::Bin));
         out
+    }
+    fn tree_is_open(&self, path: &str) -> bool {
+        self.tree_open.iter().any(|p| p.eq_ignore_ascii_case(path))
+    }
+    fn tree_kids_of(&self, path: &str) -> Option<&Vec<String>> {
+        self.tree_kids.iter().find(|(p, _)| p.eq_ignore_ascii_case(path)).map(|(_, k)| k)
+    }
+    /// A place's arrow: open, closed, or none if it has no folders.
+    fn tree_arrow(&self, path: &str) -> Option<bool> {
+        match self.tree_kids_of(path) {
+            Some(k) if k.is_empty() => None,
+            _ => Some(self.tree_is_open(path)),
+        }
+    }
+    /// The folders inside an open place, and theirs if open, as rows.
+    fn tree_rows(&self, path: &str, depth: i32, out: &mut Vec<PaneRow>) {
+        if !self.tree_is_open(path) || depth > 12 {
+            return;
+        }
+        let Some(kids) = self.tree_kids_of(path) else { return };
+        for name in kids.clone() {
+            let child = join(path, &name);
+            out.push(PaneRow { name, path: child.clone(), kind: Place::Folder, depth, open: self.tree_arrow(&child) });
+            self.tree_rows(&child, depth + 1, out);
+        }
+    }
+    /// Reads the folders in `path` for the tree (once).
+    fn tree_load(&mut self, path: &str) {
+        if self.tree_kids_of(path).is_some() {
+            return;
+        }
+        let Ok(list) = fs_list(path) else { return };
+        let roots: Vec<String> = self.files.drives.iter().map(|v| v.path.to_lowercase()).collect();
+        let at_root = roots.iter().any(|r| r == &path.to_lowercase()) || net_path(path).is_some_and(|(_, inner)| inner.trim_matches('/').is_empty());
+        let mut kids: Vec<String> = list
+            .into_iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name)
+            .filter(|n| !(at_root && n.eq_ignore_ascii_case(BIN_DIR)))
+            // The first drive's root lists the other drives as folders.
+            .filter(|n| !(path == "/" && roots.iter().any(|r| r[1..].eq_ignore_ascii_case(n))))
+            .collect();
+        kids.sort_by_key(|n| n.to_lowercase());
+        self.tree_kids.push((String::from(path), kids));
+    }
+    /// Opens or closes a place's arrow in the tree.
+    fn tree_toggle(&mut self, path: &str) -> Rect {
+        if self.tree_is_open(path) {
+            let lower = path.to_lowercase();
+            let inside = format!("{}/", lower.trim_end_matches('/'));
+            self.tree_open.retain(|p| *p != lower && !(p.starts_with(&inside) && !lower.is_empty()));
+            println!("[desktop] tree: closed {}", if path.is_empty() { "Computer" } else { path });
+        } else {
+            if !path.is_empty() {
+                self.tree_load(path);
+            }
+            self.tree_open.push(path.to_lowercase());
+            let kids = self.tree_kids_of(path).map(|k| k.join(" | ")).unwrap_or_default();
+            println!("[desktop] tree: opened {} = {}", if path.is_empty() { "Computer" } else { path }, kids);
+        }
+        self.log_pane();
+        self.files_area()
+    }
+    /// Opens the tree down to the folder shown, as Explorer does.
+    fn tree_reveal(&mut self, path: &str) {
+        let root = self
+            .files
+            .drives
+            .iter()
+            .map(|v| v.path.clone())
+            .chain(shares().iter().map(|sh| sh.root()))
+            .filter(|r| {
+                let r = r.to_lowercase();
+                let p = path.to_lowercase();
+                r == "/" || p == r || p.starts_with(&format!("{}/", r))
+            })
+            .max_by_key(|r| r.len());
+        let Some(root) = root else { return };
+        let mut at = root.clone();
+        let rest: Vec<String> = path[root.len().min(path.len())..].split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+        // Every place above the folder shown is opened (not the folder itself).
+        for part in rest.iter() {
+            self.tree_load(&at);
+            if !self.tree_is_open(&at) {
+                self.tree_open.push(at.to_lowercase());
+            }
+            at = join(&at, part);
+        }
+    }
+    /// The tree's rows and where they are, for the log.
+    fn log_pane(&self) {
+        let c = self.files_client();
+        let rows: Vec<String> = self
+            .places()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let b = self.pane_item(&c, i);
+                let a = self.pane_arrow(&c, i, r.depth);
+                let arrow = match r.open {
+                    Some(open) => format!(" ({} {},{})", if open { "v" } else { ">" }, a.x + a.w / 2, a.y + a.h / 2),
+                    None => String::new(),
+                };
+                (!b.is_empty()).then(|| format!("{}{} at {},{}{}", "  ".repeat(r.depth as usize), r.name, b.x + b.w / 2, b.y + b.h / 2, arrow))
+            })
+            .collect();
+        println!("[desktop] pane: {}", rows.join(" | "));
     }
 
     /// How many tiles Computer shows: the drives, then the network drives.
@@ -2995,18 +3200,16 @@ impl Desktop {
         c.fill(pane, rgb(241, 245, 251));
         c.fill(Rect::new(pane.x + pane.w, pane.y, 1, pane.h), rgb(205, 215, 230));
         let here = self.drive_of(&f.path);
-        let pane_cols = ((pane.w - 34 * s) / Font::Normal.w(s)).max(1) as usize;
-        let net_here = net_path(&f.path).map(|(i, _)| i);
-        for (i, (text, path, icon)) in self.places().into_iter().enumerate() {
+        for (i, row) in self.places().into_iter().enumerate() {
             let r = self.pane_item(client, i);
-            if r.y + r.h > pane.y + pane.h {
-                break;
+            if r.is_empty() {
+                continue;
             }
+            let (text, path, icon) = (row.name, row.path, row.kind);
             let current = match icon {
-                Place::Computer => !in_folder,
+                Place::Computer => f.path.is_empty(),
                 Place::Bin => f.path == BIN,
-                Place::Drive => here.is_some_and(|d| f.drives[d].path == path),
-                Place::Network => net_here.is_some_and(|n| shares()[n].root() == path),
+                _ => f.path.eq_ignore_ascii_case(&path) || (icon == Place::Drive && path == "/" && f.path == "/"),
             };
             let box_ = Rect::new(r.x + 3 * s, r.y + s, r.w - 6 * s, r.h - 2 * s);
             if current {
@@ -3015,15 +3218,38 @@ impl Desktop {
             } else if r.contains(px, py) {
                 c.rounded(box_, 2 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
             }
-            let ix = if matches!(icon, Place::Drive | Place::Network) { 18 * s } else { 8 * s };
+            // The arrow: a hollow one pointing right when closed, a solid
+            // one pointing down-right when open, as in Windows 7.
+            let a = self.pane_arrow(client, i, row.depth);
+            if let Some(open) = row.open {
+                let (cx, cy) = (a.x + a.w / 2, a.y + a.h / 2);
+                let hot = a.contains(px, py);
+                if open {
+                    let ink = if hot { rgb(30, 140, 220) } else { rgb(60, 60, 60) };
+                    for k in 0..5 * s {
+                        c.fill(Rect::new(cx + 2 * s - k, cy - 2 * s + k, k + 1, 1), ink);
+                    }
+                } else {
+                    let ink = if hot { rgb(30, 140, 220) } else { rgb(140, 140, 140) };
+                    c.line(cx - 2 * s, cy - 4 * s, cx - 2 * s, cy + 4 * s, 1, ink);
+                    c.line(cx - 2 * s, cy - 4 * s, cx + 2 * s, cy, 1, ink);
+                    c.line(cx - 2 * s, cy + 4 * s, cx + 2 * s, cy, 1, ink);
+                }
+            }
+            let ix = a.x + a.w + 2 * s - r.x;
             match icon {
                 Place::Computer => c.small_computer(r.x + ix, r.y + (r.h - 14 * s) / 2, s),
                 Place::Bin => c.small_bin(r.x + ix + s, r.y + (r.h - 16 * s) / 2, s),
                 Place::Drive => c.small_drive(r.x + ix, r.y + (r.h - 12 * s) / 2, s, false),
                 Place::Network => c.small_drive(r.x + ix, r.y + (r.h - 12 * s) / 2, s, true),
+                Place::Folder => c.folder(r.x + ix, r.y + (r.h - 12 * s) / 2, s),
             }
-            let room = pane_cols.saturating_sub(if ix > 8 * s { 1 } else { 0 });
-            let shown: String = text.chars().take(room).collect();
+            let room = ((r.w - ix - 26 * s) / Font::Normal.w(s)).max(1) as usize;
+            let shown: String = if text.chars().count() > room {
+                text.chars().take(room.saturating_sub(1)).chain(core::iter::once('.')).collect()
+            } else {
+                text
+            };
             c.text(r.x + ix + 22 * s, label_y(&r), &shown, rgb(20, 40, 80), Font::Normal);
         }
 
@@ -3577,7 +3803,8 @@ impl Desktop {
         }
         spots.extend(self.crumb_rects(c).into_iter().map(|(r, _, _)| r));
         spots.extend(self.command_buttons(c).into_iter().map(|(_, _, r)| r));
-        spots.extend((0..self.places().len()).map(|i| self.pane_item(c, i)));
+        let rows = self.places();
+        spots.extend((0..rows.len()).flat_map(|i| [self.pane_item(c, i), self.pane_arrow(c, i, rows[i].depth)]));
         spots.extend((0..self.tabs.len()).flat_map(|i| [self.tab_rect(c, i), self.tab_close(c, i)]));
         spots.push(self.new_tab_button(c));
         spots.push(self.panes_button(c));
@@ -3643,10 +3870,11 @@ impl Desktop {
                 let t = self.drive_tile(&c, self.files.drives.len() + n);
                 tiles.push(format!("{}: {} SMB at {},{}", sh.letter, sh.root(), t.x + t.w / 2, t.y + t.h / 2));
             }
-            let bin = self.pane_item(&c, self.places().len() - 1);
+            let bin = self.pane_item(&c, 0);
             let map = self.command_buttons(&c).into_iter().find(|(cmd, _, _)| *cmd == Command::Map).map(|(_, _, r)| r).unwrap_or(Rect::EMPTY);
             println!("[desktop] Computer: drives = {}; Recycle Bin at {},{}; Map network drive at {},{}", tiles.join(" | "),
                 bin.x + 60 * self.ui, bin.y + bin.h / 2, map.x + map.w / 2, map.y + map.h / 2);
+            self.log_pane();
             let n = self.tile_count();
             self.files.status = format!("{} drive{}", n, if n == 1 { "" } else { "s" });
             self.files.entries.clear();
@@ -3674,6 +3902,7 @@ impl Desktop {
                 self.files.found.clear();
                 let n = self.files.entries.len();
                 self.files.status = format!("{} item{}", n, if n == 1 { "" } else { "s" });
+                self.tree_reveal(&path);
                 let names: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
                 let c = self.files_client();
                 let row = self.files_row(&c, 0);
@@ -3682,6 +3911,7 @@ impl Desktop {
                 self.files.path = path;
                 self.files.scroll = 0;
                 self.files.selected = None;
+                self.log_pane();
                 true
             }
             Err(e) => {
@@ -3827,6 +4057,7 @@ impl Desktop {
         let (plus, panes) = (self.new_tab_button(&c), self.panes_button(&c));
         println!("[desktop] tabs: {}; tab {} in front; + at {},{}; Two panes at {},{}", tabs.join(" | "), self.tab + 1,
             plus.x + plus.w / 2, plus.y + plus.h / 2, panes.x + panes.w / 2, panes.y + panes.h / 2);
+        self.log_pane();
     }
 
     /// Brings tab `i` to the front.
@@ -4952,9 +5183,9 @@ impl Desktop {
         if self.files_pane(&c).contains(x, y) {
             let places = self.places();
             if let Some(i) = (0..places.len()).find(|&i| self.pane_item(&c, i).contains(x, y)) {
-                let (name, path, kind) = places[i].clone();
-                if kind != Place::Computer {
-                    target = Some((path, name));
+                let row = places[i].clone();
+                if row.kind != Place::Computer {
+                    target = Some((row.path, row.name));
                 }
             }
         }
@@ -5079,6 +5310,245 @@ impl Desktop {
         area
     }
 
+    // ------------------------------------------------------ right-click menu
+
+    fn popup_size(&self) -> (i32, i32) {
+        let s = self.ui;
+        let Some(p) = &self.popup else { return (0, 0) };
+        let w = p.items.iter().map(|(_, l, _)| Font::Normal.width(s, l)).max().unwrap_or(0) + 64 * s;
+        let h = p.items.iter().map(|(a, _, _)| if *a == Act::Line { 9 * s } else { 30 * s }).sum::<i32>() + 6 * s;
+        (w, h)
+    }
+    fn popup_area(&self) -> Rect {
+        let Some(p) = &self.popup else { return Rect::EMPTY };
+        let (w, h) = self.popup_size();
+        // With room for its shadow.
+        Rect::new(p.x, p.y, w + 4 * self.ui, h + 4 * self.ui)
+    }
+    fn popup_item(&self, i: usize) -> Rect {
+        let s = self.ui;
+        let Some(p) = &self.popup else { return Rect::EMPTY };
+        let (w, _) = self.popup_size();
+        let mut y = p.y + 3 * s;
+        for (j, (a, _, _)) in p.items.iter().enumerate() {
+            let h = if *a == Act::Line { 9 * s } else { 30 * s };
+            if j == i {
+                return if *a == Act::Line { Rect::EMPTY } else { Rect::new(p.x + 3 * s, y, w - 6 * s, h) };
+            }
+            y += h;
+        }
+        Rect::EMPTY
+    }
+
+    /// Opens the menu at (x, y), kept on the screen, and logs its lines.
+    fn show_popup(&mut self, x: i32, y: i32, items: Vec<(Act, &'static str, bool)>, place: Option<String>) -> Rect {
+        self.popup = Some(Popup { x, y, items, place });
+        let (w, h) = self.popup_size();
+        let (sw, sh) = (self.w, self.h - 40 * self.ui);
+        if let Some(p) = self.popup.as_mut() {
+            p.x = x.min(sw - w - 4);
+            p.y = if y + h > sh { (y - h).max(0) } else { y };
+        }
+        let p = self.popup.as_ref().unwrap();
+        let lines: Vec<String> = (0..p.items.len())
+            .filter(|&i| p.items[i].0 != Act::Line)
+            .map(|i| {
+                let r = self.popup_item(i);
+                format!("{}{} at {},{}", p.items[i].1, if p.items[i].2 { "" } else { " (off)" }, r.x + r.w / 2, r.y + r.h / 2)
+            })
+            .collect();
+        println!("[desktop] menu: {}", lines.join(" | "));
+        self.popup_area()
+    }
+
+    fn popup_view(&self, c: &mut Canvas) {
+        let s = self.ui;
+        let Some(p) = &self.popup else { return };
+        let (w, h) = self.popup_size();
+        let r = Rect::new(p.x, p.y, w, h);
+        // A soft shadow, then the menu: light grey with a white gutter edge, as in Windows 7.
+        c.shade(Rect::new(r.x + 4 * s, r.y + 4 * s, r.w, r.h), 0x000000, 50);
+        c.fill(r, rgb(240, 240, 240));
+        c.frame(r, rgb(151, 151, 151));
+        c.fill(Rect::new(r.x + 30 * s, r.y + 2 * s, 1, r.h - 4 * s), rgb(226, 227, 227));
+        c.fill(Rect::new(r.x + 31 * s, r.y + 2 * s, 1, r.h - 4 * s), 0xFFFFFF);
+        let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
+        let mut y = r.y + 3 * s;
+        for (i, (act, label, on)) in p.items.iter().enumerate() {
+            if *act == Act::Line {
+                c.fill(Rect::new(r.x + 34 * s, y + 4 * s, r.w - 38 * s, 1), rgb(226, 227, 227));
+                c.fill(Rect::new(r.x + 34 * s, y + 5 * s, r.w - 38 * s, 1), 0xFFFFFF);
+                y += 9 * s;
+                continue;
+            }
+            let b = self.popup_item(i);
+            if *on && b.contains(px, py) {
+                c.rounded(b, 3 * s, false, rgb(241, 246, 252), rgb(220, 234, 250), 255);
+                c.rounded_outline(b, 3 * s, false, rgb(168, 202, 238), 255);
+            }
+            let ink = if *on { rgb(0, 0, 0) } else { rgb(160, 160, 160) };
+            let font = if *act == Act::Open { Font::Bold } else { Font::Normal };
+            c.text(r.x + 40 * s, b.y + (b.h - Font::Normal.h(s)) / 2, label, ink, font);
+            let _ = i;
+            y += 30 * s;
+        }
+    }
+
+    fn popup_click(&mut self, x: i32, y: i32) -> Rect {
+        let area = self.popup_area();
+        let n = self.popup.as_ref().map_or(0, |p| p.items.len());
+        let hit = (0..n).find(|&i| self.popup_item(i).contains(x, y));
+        let Some(p) = self.popup.take() else { return Rect::EMPTY };
+        let Some(i) = hit else { return area };
+        let (act, label, on) = p.items[i];
+        if !on {
+            return area;
+        }
+        println!("[desktop] menu: chose {}", label);
+        let r = match act {
+            Act::Open => match p.place {
+                Some(path) if path == BIN || path.is_empty() || net_path(&path).is_none() => self.navigate(path),
+                Some(path) => {
+                    let n = shares().iter().position(|sh| sh.root() == path).unwrap_or(0);
+                    self.open_share(n)
+                }
+                None => self.open_selected(),
+            },
+            Act::OpenInTab => {
+                let path = match p.place {
+                    Some(path) => path,
+                    None => match self.files.selected {
+                        Some(i) if self.files.path.is_empty() => {
+                            if i < self.files.drives.len() { self.files.drives[i].path.clone() } else { shares()[i - self.files.drives.len()].root() }
+                        }
+                        Some(i) => self.entry_path(i),
+                        None => return area,
+                    },
+                };
+                self.new_tab();
+                self.navigate(path)
+            }
+            Act::Do(cmd) => self.command(cmd),
+            Act::Refresh => {
+                let keep = self.selected_entry().map(|e| e.name);
+                self.refresh(keep);
+                self.files_area()
+            }
+            Act::Line => Rect::EMPTY,
+        };
+        area.union(&r).union(&self.sync_preview())
+    }
+
+    /// A right-click: on the Computer window, a menu for what is under the
+    /// pointer (selecting it first), as in Explorer.
+    fn right_click(&mut self, x: i32, y: i32) -> Rect {
+        if self.popup.is_some() {
+            let a = self.popup_area();
+            self.popup = None;
+            return a;
+        }
+        let Some(top) = self.windows.iter().rposition(|w| w.shown() && w.rect.contains(x, y)) else { return Rect::EMPTY };
+        if self.windows[top].kind != Kind::Computer {
+            return Rect::EMPTY;
+        }
+        let mut dirty = Rect::EMPTY;
+        if top != self.windows.len() - 1 {
+            dirty = self.bring(Kind::Computer);
+        }
+        let c = self.files_client();
+        if self.files.rename.is_some() {
+            self.finish_rename();
+        }
+        self.files.confirm = None;
+        self.files.props = None;
+        self.files.query_focus = false;
+        // The other side of two panes comes into use first.
+        if self.other.is_some() && self.side(&c, !self.right).contains(x, y) {
+            dirty = dirty.union(&self.switch_side());
+        }
+        let on = |d: &Self, cmd: Command| d.command_enabled(cmd);
+        use Act::*;
+        // The pane: Open, Open in new tab.
+        if self.files_pane(&c).contains(x, y) {
+            let rows = self.places();
+            let Some(i) = (0..rows.len()).find(|&i| self.pane_item(&c, i).contains(x, y)) else { return dirty };
+            let path = rows[i].path.clone();
+            let items = alloc::vec![(Open, "Open", true), (OpenInTab, "Open in new tab", path != BIN)];
+            return dirty.union(&self.files_area()).union(&self.show_popup(x, y, items, Some(path)));
+        }
+        let k = self.files_content(&c);
+        if !k.contains(x, y) || self.files.form.is_some() {
+            return dirty;
+        }
+        let items: Vec<(Act, &'static str, bool)> = if self.files.path.is_empty() {
+            // Computer: a drive, or the empty space.
+            match (0..self.tile_count()).find(|&i| self.drive_tile(&c, i).contains(x, y)) {
+                Some(i) => {
+                    self.select(i);
+                    let mut v = alloc::vec![(Open, "Open", true), (OpenInTab, "Open in new tab", true), (Line, "", false)];
+                    if i >= self.files.drives.len() {
+                        v.push((Do(Command::Disconnect), "Disconnect", true));
+                    }
+                    v.push((Do(Command::Properties), "Properties", true));
+                    v
+                }
+                None => {
+                    self.files.selected = None;
+                    alloc::vec![(Do(Command::Map), "Map network drive...", true), (Refresh, "Refresh", true)]
+                }
+            }
+        } else {
+            let rows = self.files_rows(&c);
+            let i = if rows.contains(x, y) { self.files.scroll + ((y - rows.y) / self.files_row_h()) as usize } else { usize::MAX };
+            if i < self.files.entries.len() {
+                if !self.is_marked(i) {
+                    self.select(i);
+                }
+                if self.files.path == BIN {
+                    alloc::vec![(Do(Command::Restore), "Restore", true), (Line, "", false), (Do(Command::Delete), "Delete", true), (Line, "", false), (Do(Command::Properties), "Properties", true)]
+                } else {
+                    let one_folder = self.picked().len() == 1 && self.files.entries[i].is_dir;
+                    let mut v = alloc::vec![(Open, "Open", self.picked().len() == 1)];
+                    if one_folder {
+                        v.push((OpenInTab, "Open in new tab", true));
+                    }
+                    v.extend([
+                        (Line, "", false),
+                        (Do(Command::Cut), "Cut", on(self, Command::Cut)),
+                        (Do(Command::Copy), "Copy", on(self, Command::Copy)),
+                    ]);
+                    if one_folder {
+                        v.push((Do(Command::Paste), "Paste", on(self, Command::Paste)));
+                    }
+                    v.extend([
+                        (Line, "", false),
+                        (Do(Command::Delete), "Delete", on(self, Command::Delete)),
+                        (Do(Command::Rename), "Rename", on(self, Command::Rename)),
+                        (Line, "", false),
+                        (Do(Command::Properties), "Properties", true),
+                    ]);
+                    v
+                }
+            } else {
+                // The empty space of a folder.
+                self.files.selected = None;
+                self.files.marked.clear();
+                if self.files.path == BIN {
+                    alloc::vec![(Do(Command::Empty), "Empty Recycle Bin", on(self, Command::Empty)), (Refresh, "Refresh", true)]
+                } else {
+                    alloc::vec![
+                        (Refresh, "Refresh", true),
+                        (Line, "", false),
+                        (Do(Command::Paste), "Paste", on(self, Command::Paste)),
+                        (Line, "", false),
+                        (Do(Command::NewFolder), "New folder", on(self, Command::NewFolder)),
+                    ]
+                }
+            }
+        };
+        dirty.union(&self.files_area()).union(&self.sync_preview()).union(&self.show_popup(x, y, items, None))
+    }
+
     /// A click inside the Computer window.
     fn files_click(&mut self, x: i32, y: i32, double: bool) -> Rect {
         let c = self.files_client();
@@ -5166,7 +5636,11 @@ impl Desktop {
         if self.files_pane(&c).contains(x, y) {
             let places = self.places();
             if let Some(i) = (0..places.len()).find(|&i| self.pane_item(&c, i).contains(x, y)) {
-                let (_, path, kind) = places[i].clone();
+                let row = places[i].clone();
+                if row.open.is_some() && self.pane_arrow(&c, i, row.depth).contains(x, y) {
+                    return self.tree_toggle(&row.path);
+                }
+                let (path, kind) = (row.path, row.kind);
                 if kind == Place::Network {
                     let n = shares().iter().position(|s| s.root() == path).unwrap_or(0);
                     return self.open_share(n);
@@ -5675,7 +6149,11 @@ fn main() -> i64 {
         window(Kind::Welcome, "Welcome", Rect::new(w / 12, h / 7, 460 * s, 290 * s)),
         window(Kind::System, "System", Rect::new(w / 12 + 480 * s, h / 7 + 30 * s, 300 * s, 190 * s)),
         window(Kind::Notes, "Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 500 * s, 290 * s)),
-        Window { open: false, ..window(Kind::Computer, "Computer", Rect::new((w - 820 * s).max(130 * s), 40 * s, 800 * s, 480 * s)) },
+        // A file manager wants room: most of the screen, right of the icons.
+        Window { open: false, ..window(Kind::Computer, "Computer", {
+            let (cw, ch) = ((w - 150 * s).min(1040 * s).max(800 * s), (h - 180 * s).min(620 * s).max(480 * s));
+            Rect::new((w - cw - 20 * s).max(130 * s), 30 * s, cw, ch)
+        }) },
         Window { open: false, ..window(Kind::Calculator, "Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s)) },
     ];
     let pointer = screen.pointer().unwrap_or_default();
@@ -5709,9 +6187,11 @@ fn main() -> i64 {
         calc: Calc { display: String::from("0"), ..Default::default() },
         icon: None,
         mouse_speed: { saved_network_drives(); saved_mouse_speed() },
-        last_press: (0, 0, 0),
         file_drag: None,
         key_mods: 0,
+        tree_open: alloc::vec![String::new()],
+        tree_kids: Vec::new(),
+        popup: None,
     };
     let mut canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
     present(&screen, &mut canvas, &desk, Rect::new(0, 0, w, h));
@@ -5739,9 +6219,14 @@ fn main() -> i64 {
             spots.add(desk.cursor_rect());
             spots.add(desk.hover_area(p.x as i32, p.y as i32));
             // Both presses of a quick double-click can land between two looks.
-            let presses = p.presses.wrapping_sub(old.presses) & 0xFF_FFFF;
-            for _ in 0..presses.min(3) {
-                dirty = dirty.union(&desk.click(p.x as i32, p.y as i32));
+            // The double-clicks among them are the last ones.
+            let presses = (p.presses.wrapping_sub(old.presses) & 0xF_FFFF).min(3);
+            let doubles = (p.doubles.wrapping_sub(old.doubles) & 0xF) as u32;
+            for k in 0..presses {
+                dirty = dirty.union(&desk.click(p.x as i32, p.y as i32, k + doubles.min(presses) >= presses));
+            }
+            if p.buttons & 2 != 0 && old.buttons & 2 == 0 {
+                dirty = dirty.union(&desk.right_click(p.x as i32, p.y as i32));
             }
             if let Some((i, mut gx, gy)) = desk.drag {
                 let (px, py) = (p.x as i32, p.y as i32);
@@ -5833,10 +6318,13 @@ fn main() -> i64 {
                     dirty = dirty.union(&desk.menu_rect());
                 }
             }
+            // Only their insides, and the caret only blinks in the window in
+            // front: redrawing whole windows here, glass and all, kept the
+            // desktop busy for a large part of every second.
             for kind in [Kind::System, Kind::Notes] {
                 let at = desk.index(kind);
-                if desk.windows[at].shown() {
-                    dirty = dirty.union(&desk.window_area(at));
+                if desk.windows[at].shown() && (kind == Kind::System || desk.top_kind() == Some(kind)) {
+                    dirty = dirty.union(&desk.client(&desk.windows[at].rect));
                 }
             }
         }

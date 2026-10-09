@@ -75,10 +75,11 @@ def main():
         want = {(x + 486, y + 120): (255, 255, 255), (x + 486, y + 240): (255, 255, 255),
                 # Below the last row of the Computer window's list.
                 (cx + 300, cy + 290): (255, 255, 255)}
-        # The Computer window was made 700 wide: wallpaper just right of it.
-        paper = at(cx + 720, cy + 200)
+        # The Computer window was made narrower: wallpaper just right of it.
+        cw = int(sys.argv[7]) if len(sys.argv) > 7 else 700
+        paper = at(cx + cw + 20, cy + 200)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
-            sys.exit(f'{path}: the Computer window was not resized ({cx + 720},{cy + 200} is {paper})')
+            sys.exit(f'{path}: the Computer window was not resized ({cx + cw + 20},{cy + 200} is {paper})')
     elif mode == 'explorer':
         # The Computer window at cx,cy showing the drives: the light blue
         # navigation pane at the left, white tiles area, the first tile's

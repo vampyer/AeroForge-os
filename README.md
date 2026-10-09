@@ -506,6 +506,13 @@ and exact size, then its first lines if it reads as text, or its bytes as a hex 
 characters they make) if it doesn't; Text and Hex switch between the two. It reads up to the first 64 KB, and
 for a folder it shows how many things are in it.
 
+Since 0.54 the file manager looks and works more like Windows Explorer. It opens bigger, and the pane on the
+left is a folder tree: the arrow next to a drive or folder opens and closes it, and clicking one goes there.
+Right-clicking a file, a folder, a drive, a place in the tree or empty space brings up a menu of what can be
+done there (Open, Open in new tab, Cut, Copy, Paste, Delete, Rename, New folder, Refresh, Properties...).
+Clicks redraw only what they change, the clock and the Notes caret no longer redraw whole windows twice a
+second, and double-clicks are timed by the system as they happen, so a busy moment doesn't lose them.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

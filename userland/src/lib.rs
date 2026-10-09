@@ -352,7 +352,9 @@ pub mod display {
 
     /// The mouse pointer: position on screen, buttons held (bit 0 = left,
     /// 1 = right, 2 = middle) and how many times the left button has been
-    /// pressed (24 bits, wraps), so a quick click between reads is seen.
+    /// pressed (20 bits, wraps), so a quick click between reads is seen.
+    /// `doubles` counts the presses that were the second of a double-click
+    /// (4 bits, wraps), timed by the system as they happen.
     /// `keys` are the modifier keys held now: MOD_SHIFT, MOD_CTRL, MOD_ALT
     /// and MOD_CAPS (Caps Lock on).
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -362,6 +364,7 @@ pub mod display {
         pub buttons: u8,
         pub keys: u8,
         pub presses: u32,
+        pub doubles: u8,
     }
 
     pub const MOD_SHIFT: u8 = 1;
@@ -377,7 +380,8 @@ pub mod display {
                 y: ((v >> 16) & 0xFFFF) as usize,
                 buttons: ((v >> 32) & 0xF) as u8,
                 keys: ((v >> 36) & 0xF) as u8,
-                presses: (v >> 40) as u32 & 0xFF_FFFF,
+                presses: (v >> 40) as u32 & 0xF_FFFF,
+                doubles: (v >> 60) as u8 & 0xF,
             })
         }
 
