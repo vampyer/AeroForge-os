@@ -192,12 +192,35 @@ pub fn delete_file(path: &str) -> Result<(), i64> {
     check(unsafe { syscall(sys::FILE_DELETE, path.as_ptr() as u64, path.len() as u64, 0, 0) }).map(|_| ())
 }
 
+/// A Windows file time (100 ns steps since 1601, UTC), such as SMB gives,
+/// as YYYYMMDDhhmmss in decimal digits like `DirEntry::modified` (0 if 0).
+pub fn packed_filetime(ft: u64) -> u64 {
+    if ft == 0 {
+        return 0;
+    }
+    let secs = ft / 10_000_000;
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days to a civil date, counted from 0000-03-01 (1601-01-01 is day 584_694).
+    let z = days + 584_694;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u64;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u64;
+    let year = (yoe + era * 400 + if month <= 2 { 1 } else { 0 }) as u64;
+    ((((year * 100 + month) * 100 + day) * 100 + rest / 3600) * 100 + rest / 60 % 60) * 100 + rest % 60
+}
+
 /// One entry of a directory listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: alloc::string::String,
     pub is_dir: bool,
     pub size: u64,
+    /// When it was last written, YYYYMMDDhhmmss as a number (0: unknown).
+    pub modified: u64,
 }
 
 /// The mouse pointer speed, 1 (slowest) to 10; 5 moves one pixel per
@@ -219,12 +242,15 @@ pub fn list_dir(path: &str) -> Result<alloc::vec::Vec<DirEntry>, i64> {
         let size = u64::from_le_bytes(buf[at + 1..at + 9].try_into().unwrap());
         let len = buf[at + 9] as usize;
         let name = &buf[at + 10..(at + 10 + len).min(n)];
+        let timed = buf[at] & 2 != 0 && at + 18 + len <= n;
+        let modified = if timed { u64::from_le_bytes(buf[at + 10 + len..at + 18 + len].try_into().unwrap()) } else { 0 };
         out.push(DirEntry {
             name: alloc::string::String::from_utf8_lossy(name).into_owned(),
             is_dir: buf[at] & 1 != 0,
             size,
+            modified,
         });
-        at += 10 + len;
+        at += 10 + len + if buf[at] & 2 != 0 { 8 } else { 0 };
     }
     Ok(out)
 }

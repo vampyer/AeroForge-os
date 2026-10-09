@@ -22,12 +22,14 @@ pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// When it was last written, as `rtc::DateTime::packed` (0: unknown).
+    pub modified: u64,
 }
 
 impl DirEntry {
     /// A directory entry standing for another volume's mount point.
     pub fn mount_point(name: &str) -> Self {
-        Self { name: String::from(name), is_dir: true, size: 0 }
+        Self { name: String::from(name), is_dir: true, size: 0, modified: 0 }
     }
 }
 

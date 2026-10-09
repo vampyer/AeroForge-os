@@ -48,6 +48,8 @@ struct DirEntry {
     name: String,
     is_dir: bool,
     size: u32,
+    /// Last written, as rtc::DateTime::packed (0: unknown).
+    modified: u64,
     cluster: u32,
     short: [u8; 11],
     /// Index of the 8.3 entry in its directory, and how many long-name entries precede it.
@@ -132,7 +134,7 @@ impl FatVolume {
         let st = &mut *self.state.lock();
         let dir = self.lookup(st, path)?;
         let entries = if dir.is_dir { parse_dir(&self.read_dir_raw(st, dir.cluster)?.1) } else { vec![dir] };
-        Ok(entries.into_iter().map(|e| vfs::DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64 }).collect())
+        Ok(entries.into_iter().map(|e| vfs::DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64, modified: e.modified }).collect())
     }
 
     /// Reads up to `limit` bytes of a file.
@@ -260,7 +262,7 @@ impl FatVolume {
     }
 
     fn root(&self) -> DirEntry {
-        DirEntry { name: String::from("/"), is_dir: true, size: 0, cluster: self.root_cluster, short: [b' '; 11], slot: 0, lfn: 0 }
+        DirEntry { name: String::from("/"), is_dir: true, size: 0, modified: 0, cluster: self.root_cluster, short: [b' '; 11], slot: 0, lfn: 0 }
     }
 
     fn lookup(&self, st: &mut State, path: &str) -> Res<DirEntry> {
@@ -606,6 +608,8 @@ fn parse_dir(raw: &[u8]) -> Vec<DirEntry> {
             name,
             is_dir: attr & ATTR_DIR != 0,
             size: u32::from_le_bytes(e[28..32].try_into().unwrap()),
+            modified: crate::rtc::DateTime::from_dos(u16::from_le_bytes([e[24], e[25]]), u16::from_le_bytes([e[22], e[23]]))
+                .map_or(0, |t| t.packed()),
             cluster: cluster_of(e),
             short: e[0..11].try_into().unwrap(),
             slot: slot as u32,
