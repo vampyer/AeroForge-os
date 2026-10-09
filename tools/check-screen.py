@@ -75,10 +75,11 @@ def main():
         want = {(x + 486, y + 120): (255, 255, 255), (x + 486, y + 240): (255, 255, 255),
                 # Below the last row of the Computer window's list.
                 (cx + 300, cy + 290): (255, 255, 255)}
-        # The Computer window was made 700 wide: wallpaper just right of it.
-        paper = at(cx + 720, cy + 200)
+        # The Computer window was made narrower: wallpaper just right of it.
+        cw = int(sys.argv[7]) if len(sys.argv) > 7 else 700
+        paper = at(cx + cw + 20, cy + 200)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
-            sys.exit(f'{path}: the Computer window was not resized ({cx + 720},{cy + 200} is {paper})')
+            sys.exit(f'{path}: the Computer window was not resized ({cx + cw + 20},{cy + 200} is {paper})')
     elif mode == 'explorer':
         # The Computer window at cx,cy showing the drives: the light blue
         # navigation pane at the left, white tiles area, the first tile's
@@ -101,10 +102,10 @@ def main():
         want = {}
     elif mode == 'snap':
         # Welcome's white client area fills the left half below its text;
-        # the right half still shows wallpaper below the other windows.
-        paper = at(w * 3 // 4, h - 150)
+        # the right edge still shows wallpaper beside the other windows.
+        paper = at(w - 40, h - 150)
         if not (paper[2] > paper[0] + 40 and paper != (255, 255, 255)):
-            sys.exit(f'{path}: no wallpaper at {w * 3 // 4},{h - 150} ({paper})')
+            sys.exit(f'{path}: no wallpaper at {w - 40},{h - 150} ({paper})')
         want = {(w // 4, h // 2): (255, 255, 255), (20, h - 100): (255, 255, 255)}
     else:
         sys.exit(__doc__)

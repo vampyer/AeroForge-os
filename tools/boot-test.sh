@@ -165,6 +165,12 @@ point_at() {
     fast_monitor "${moves[@]}"; sleep 0.5
 }
 double_click() { fast_monitor "mouse_button 1" "mouse_button 0" "mouse_button 1" "mouse_button 0"; }
+# Where the Computer window's folder tree shows $1, and its arrow, from the
+# latest "[desktop] pane: name at x,y (> ax,ay) | ..." line.
+pane_row() { grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o " $1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
+pane_arrow() { grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o " $1 at [0-9]*,[0-9]* ([>v] [0-9]*,[0-9]*)" | head -1 | grep -o "[0-9]*,[0-9]*)" | tr -d ')' | tr ',' ' '; }
+# Where the open right-click menu shows $1, from the latest "[desktop] menu: ..." line.
+menu_item() { grep -a "\[desktop\] menu: " "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 # Where the desktop's Computer window shows the entry named $2 of folder $1,
 # from its latest "[desktop] Computer: <folder> = a | b; first row at x,y, rows h apart" line.
 row_of() {
@@ -462,6 +468,26 @@ for _ in $(seq "$TIMEOUT"); do
         # Preview off, and close the tab (Ctrl+W).
         monitor "sendkey alt-p"; sleep 0.5; type_keys $'\x17'; STAGE=panesclose
     elif [ $STAGE = panesclose ] && grep -q "\[desktop\] tabs: [^|]*; tab 1 in front" "$LOG"; then
+        # The folder tree: close C: by its arrow, then open it again.
+        sleep 0.5; point_at $(pane_arrow "AEROFORGE (C:)"); monitor "mouse_button 1" "mouse_button 0"; STAGE=treeclose
+    elif [ $STAGE = treeclose ] && grep -q "\[desktop\] tree: closed /[^a-z0-9]*$" "$LOG"; then
+        sleep 0.5; point_at $(pane_arrow "AEROFORGE (C:)"); monitor "mouse_button 1" "mouse_button 0"; STAGE=treeopen
+    elif [ $STAGE = treeopen ] && grep -q "\[desktop\] tree: opened / = .*games" "$LOG"; then
+        # Click games in the tree to go there.
+        sleep 0.5; point_at $(pane_row "games"); monitor "mouse_button 1" "mouse_button 0"; STAGE=treego
+    elif [ $STAGE = treego ] && grep -q "\[desktop\] Computer: /games = " "$LOG"; then
+        # Right-click its file: a menu; Copy from it.
+        sleep 0.5; point_at $(row_of /games PUT-GAMES-HERE.TXT); monitor "mouse_button 2" "mouse_button 0"; STAGE=menufile
+    elif [ $STAGE = menufile ] && grep -q "\[desktop\] menu: Open at .*| Copy at " "$LOG"; then
+        sleep 0.5; monitor "screendump build/gop-menu.ppm"
+        point_at $(menu_item Copy); monitor "mouse_button 1" "mouse_button 0"; STAGE=menucopy
+    elif [ $STAGE = menucopy ] && grep -q "\[desktop\] menu: chose Copy" "$LOG"; then
+        # Right-click the empty space under it: Paste is on now; Refresh.
+        read -r RX RY RH <<< "$(grep -ao "Computer: /games = .*first row at [0-9]*,[0-9]*, rows [0-9]*" "$LOG" | tail -1 | sed 's/.*first row at //' | tr -c '0-9\n' ' ')"
+        sleep 0.5; point_at "$RX" $((RY + 4 * RH)); monitor "mouse_button 2" "mouse_button 0"; STAGE=menuspace
+    elif [ $STAGE = menuspace ] && grep -q "\[desktop\] menu: Refresh at [0-9,]* | Paste at " "$LOG"; then
+        sleep 0.5; point_at $(menu_item Refresh); monitor "mouse_button 1" "mouse_button 0"; STAGE=menurefresh
+    elif [ $STAGE = menurefresh ] && grep -q "\[desktop\] menu: chose Refresh" "$LOG"; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
@@ -608,7 +634,8 @@ for _ in $(seq "$TIMEOUT"); do
         python3 tools/check-screen.py start build/gop-start.ppm || { fail "the Start button or the Start menu is wrong in the screenshot"; }
         python3 tools/check-screen.py snap build/gop-snap.ppm || { fail "the snapped window is not on the left half of the screenshot"; }
         CXY=$(grep -ao "opened Computer at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
-        grep -q "\[desktop\] resized Computer to 700x560" "$LOG" || { fail "dragging the Computer window's corner did not resize it to 700x560"; }
+        read -r _ _ CW CH <<< "$(grep -ao "opened Computer at [0-9]*,[0-9]* ([0-9]*x[0-9]*)" "$LOG" | head -1 | tr -c '0-9\n' ' ')"
+        grep -q "\[desktop\] resized Computer to $((CW - 100))x$((CH + 80))" "$LOG" || { fail "dragging the Computer window's corner did not make it 100 narrower and 80 taller"; }
         grep -q "\[desktop\] Computer: drives = C: / FAT32 at [0-9,]* | D: /sata0p1 FAT32 at [0-9,]* | E: /sata1p1 NTFS at [0-9,]* | F: /usb0p1 FAT32 at " "$LOG" \
             || { fail "the Computer window did not open on the four drives ($(grep -ao 'Computer: drives = [^;]*' "$LOG" | head -1))"; }
         grep -q "\[desktop\] renamed /docs/New folder to /docs/Stuff" "$LOG" || { fail "Ctrl+N and typing a name did not make the folder /docs/Stuff"; }
@@ -673,7 +700,7 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "Ctrl+S in Notes did not save the file back to the NVMe disk"; }
         mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge.txt" | tail -n 1 | grep -q "hello aero$" \
             || { fail "the file Notes saved does not end with the typed words on the NVMe disk image"; }
-        python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 "${CXY%,*}" "${CXY#*,}" \
+        python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 "${CXY%,*}" "${CXY#*,}" $((CW - 100)) \
             || { fail "the desktop screenshot is wrong"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
             || { fail "busy CPUs with uneven numbers of threads did not even out"; }

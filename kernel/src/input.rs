@@ -3,7 +3,9 @@
 //! While a program has the display (display::acquire), typed keys go to
 //! it instead of the shell, and it can read the mouse pointer. Keys are
 //! queued; the pointer is a snapshot (position and buttons) plus a count
-//! of left-button presses, so a click between two reads is not lost.
+//! of left-button presses, so a click between two reads is not lost, and a
+//! count of the presses that made a double-click, timed here as they happen
+//! rather than when a busy program gets round to reading them.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -15,8 +17,19 @@ const KEY_QUEUE: usize = 64;
 
 /// Process that owns the screen (and so the keyboard), or NOBODY.
 static OWNER: AtomicU64 = AtomicU64::new(NOBODY);
-/// Left-button presses since boot (wraps at 24 bits for the syscall).
+/// Left-button presses since boot (wraps at 20 bits for the syscall).
 static PRESSES: AtomicU32 = AtomicU32::new(0);
+/// Presses that were the second of a double-click (wraps at 4 bits).
+static DOUBLES: AtomicU32 = AtomicU32::new(0);
+/// When (microseconds) and where (x | y << 16) the last press that could
+/// start a double-click was; 0 after a double-click, so a third press
+/// starts over.
+static LAST_PRESS_US: AtomicU64 = AtomicU64::new(0);
+static LAST_PRESS_AT: AtomicU32 = AtomicU32::new(0);
+/// Two presses closer together than this, in time and in pixels either
+/// way, are a double-click.
+const DOUBLE_CLICK_US: u64 = 500_000;
+const DOUBLE_CLICK_PX: i32 = 8;
 /// The modifier keys held now (DHI_MOD_*: Shift 1, Ctrl 2, Alt 4, Caps Lock 8),
 /// from the last key event of any keyboard.
 static MODIFIERS: AtomicU8 = AtomicU8::new(0);
@@ -70,6 +83,22 @@ pub fn push_key(c: u8) -> bool {
 /// The mouse buttons changed from `old` to `new`.
 pub fn buttons(old: u32, new: u32) {
     if new & 1 != 0 && old & 1 == 0 {
+        let now = crate::apic::micros();
+        let (x, y) = (usb::MOUSE_X.load(Ordering::Relaxed), usb::MOUSE_Y.load(Ordering::Relaxed));
+        let when = LAST_PRESS_US.load(Ordering::Relaxed);
+        let at = LAST_PRESS_AT.load(Ordering::Relaxed);
+        let (px, py) = ((at & 0xFFFF) as i32, (at >> 16) as i32);
+        let double = when != 0
+            && now.saturating_sub(when) < DOUBLE_CLICK_US
+            && (x - px).abs() <= DOUBLE_CLICK_PX
+            && (y - py).abs() <= DOUBLE_CLICK_PX;
+        if double {
+            DOUBLES.fetch_add(1, Ordering::Relaxed);
+            LAST_PRESS_US.store(0, Ordering::Relaxed);
+        } else {
+            LAST_PRESS_US.store(now.max(1), Ordering::Relaxed);
+            LAST_PRESS_AT.store((x.max(0) as u32 & 0xFFFF) | (y.max(0) as u32 & 0xFFFF) << 16, Ordering::Relaxed);
+        }
         PRESSES.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -91,7 +120,7 @@ pub fn read_keys(pid: u64, out: &mut [u16]) -> Option<usize> {
 }
 
 /// The pointer for `pid`: x | y << 16 | buttons << 32 | modifier keys << 36
-/// | presses << 40. The modifiers ride along so a click can be told apart
+/// | presses << 40 | double-clicks << 60. The modifiers ride along so a click can be told apart
 /// from a Ctrl+click or Shift+click.
 /// None if `pid` does not own the screen.
 pub fn pointer(pid: u64) -> Option<u64> {
@@ -102,6 +131,7 @@ pub fn pointer(pid: u64) -> Option<u64> {
     let y = usb::MOUSE_Y.load(Ordering::Relaxed).max(0) as u64 & 0xFFFF;
     let b = usb::MOUSE_BUTTONS.load(Ordering::Relaxed) as u64 & 0xF;
     let m = MODIFIERS.load(Ordering::Relaxed) as u64 & 0xF;
-    let p = PRESSES.load(Ordering::Relaxed) as u64 & 0xFF_FFFF;
-    Some(x | y << 16 | b << 32 | m << 36 | p << 40)
+    let p = PRESSES.load(Ordering::Relaxed) as u64 & 0xF_FFFF;
+    let d = DOUBLES.load(Ordering::Relaxed) as u64 & 0xF;
+    Some(x | y << 16 | b << 32 | m << 36 | p << 40 | d << 60)
 }

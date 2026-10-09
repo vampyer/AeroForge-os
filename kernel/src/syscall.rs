@@ -756,7 +756,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 .map_err(display_error)
         }
         SYS_DISPLAY_RELEASE => Ok(display::release(proc_.pid) as u64),
-        // The mouse pointer for the screen's owner: x | y << 16 | buttons << 32 | left presses << 40.
+        // The mouse pointer for the screen's owner: x | y << 16 | buttons << 32 | left presses << 40 | double-clicks << 60.
         SYS_POINTER => input::pointer(proc_.pid).ok_or(E_RIGHTS),
         SYS_MOUSE_SPEED => {
             // Pointer speed 1-10: a0 = 0 reads it, 1-10 sets it; returns the speed.
