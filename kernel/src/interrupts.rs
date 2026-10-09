@@ -173,8 +173,11 @@ extern "C" fn isr_dispatch(frame: &mut InterruptFrame) {
         }
         VECTOR_KEYBOARD => {
             let mut ev = dhi::KeyEvent::default();
-            if unsafe { dhi::aero_ps2kbd_on_irq(&mut ev) } == 1 && ev.pressed == 1 && ev.typed() != 0 {
-                push_key(ev.typed());
+            if unsafe { dhi::aero_ps2kbd_on_irq(&mut ev) } == 1 {
+                crate::input::modifiers(ev.modifiers);
+                if ev.pressed == 1 && ev.typed() != 0 {
+                    push_key(ev.typed());
+                }
             }
             apic::eoi();
         }

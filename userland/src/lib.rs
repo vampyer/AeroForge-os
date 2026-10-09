@@ -353,13 +353,21 @@ pub mod display {
     /// The mouse pointer: position on screen, buttons held (bit 0 = left,
     /// 1 = right, 2 = middle) and how many times the left button has been
     /// pressed (24 bits, wraps), so a quick click between reads is seen.
+    /// `keys` are the modifier keys held now: MOD_SHIFT, MOD_CTRL, MOD_ALT
+    /// and MOD_CAPS (Caps Lock on).
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
     pub struct Pointer {
         pub x: usize,
         pub y: usize,
         pub buttons: u8,
+        pub keys: u8,
         pub presses: u32,
     }
+
+    pub const MOD_SHIFT: u8 = 1;
+    pub const MOD_CTRL: u8 = 2;
+    pub const MOD_ALT: u8 = 4;
+    pub const MOD_CAPS: u8 = 8;
 
     impl Screen {
         /// Where the mouse is now.
@@ -367,7 +375,8 @@ pub mod display {
             check(unsafe { syscall(sys::POINTER, 0, 0, 0, 0) }).map(|v| Pointer {
                 x: (v & 0xFFFF) as usize,
                 y: ((v >> 16) & 0xFFFF) as usize,
-                buttons: ((v >> 32) & 0xFF) as u8,
+                buttons: ((v >> 32) & 0xF) as u8,
+                keys: ((v >> 36) & 0xF) as u8,
                 presses: (v >> 40) as u32 & 0xFF_FFFF,
             })
         }
@@ -376,6 +385,18 @@ pub mod display {
         /// Backspace 8), into `out`. Returns how many.
         pub fn keys(&self, out: &mut [u8]) -> Result<usize, i64> {
             check(unsafe { syscall(sys::KEYS_READ, out.as_mut_ptr() as u64, out.len() as u64, 0, 0) }).map(|n| n as usize)
+        }
+
+        /// Like keys(), with the modifier keys (MOD_SHIFT, MOD_CTRL, MOD_ALT,
+        /// MOD_CAPS) held as each was typed: (character, modifiers).
+        pub fn keys_with_modifiers(&self, out: &mut [(u8, u8)]) -> Result<usize, i64> {
+            let mut raw = [0u8; 128];
+            let max = out.len().min(raw.len() / 2);
+            let n = check(unsafe { syscall(sys::KEYS_READ, raw.as_mut_ptr() as u64, max as u64, 1, 0) })? as usize;
+            for (i, slot) in out.iter_mut().take(n).enumerate() {
+                *slot = (raw[2 * i], raw[2 * i + 1]);
+            }
+            Ok(n)
         }
     }
 

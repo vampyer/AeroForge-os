@@ -779,11 +779,18 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 | (t.minute as u64) << 8 | t.second as u64)
         }
         SYS_KEYS_READ => {
-            // Up to a1 typed keys (ASCII) into a0 for the screen's owner; returns how many.
-            let mut keys = [0u8; 64];
+            // Up to a1 typed keys (ASCII) into a0 for the screen's owner; returns
+            // how many. With a2 = 1, two bytes a key: the character, then the
+            // modifier keys held as it was typed (Shift 1, Ctrl 2, Alt 4, Caps 8).
+            let mut keys = [0u16; 64];
             let max = (a1 as usize).min(keys.len());
             let n = input::read_keys(proc_.pid, &mut keys[..max]).ok_or(E_RIGHTS)?;
-            if n > 0 && !security::copy_to_user(a0, &keys[..n]) {
+            let bytes: Vec<u8> = if a2 == 1 {
+                keys[..n].iter().flat_map(|k| [*k as u8, (*k >> 8) as u8]).collect()
+            } else {
+                keys[..n].iter().map(|k| *k as u8).collect()
+            };
+            if n > 0 && !security::copy_to_user(a0, &bytes) {
                 return Err(E_FAULT);
             }
             Ok(n as u64)

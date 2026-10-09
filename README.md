@@ -485,6 +485,17 @@ are saved to `/AeroForge.ini`; the password never is, so after a restart the dri
 opened. The client is `userland/src/smb.rs` (with its own MD4, MD5 and SHA-256); `smbtest` and the boot test
 use a Samba server started by `tools/smb-server.sh`.
 
+Since 0.51 the file manager has the tools of an advanced one. Several things can be selected at once:
+Ctrl+click adds or takes one away, Shift+click and Shift with the arrows select a range, and Ctrl+A selects
+everything; Cut, Copy, Paste, Delete, Restore and Ctrl+Z then work on all of them. Files and folders can be
+dragged onto a folder, a drive or network drive in the pane, a part of the address, or the Recycle Bin: on
+the same drive they move, to another one they are copied (Ctrl copies, Shift moves), as in Windows. The
+search box (Ctrl+F) looks through everything under the folder shown, or every drive from Computer, by part
+of a name or a pattern such as `*.txt`, and lists what it finds with the folder each is in. Properties
+(Alt+Enter) shows a file's or folder's size and what a folder holds, and a drive's file system, used and
+free space with a pie chart. Programs that own the screen now get the modifier keys held with each key
+(`keys_with_modifiers`) and with the pointer (`Pointer::keys`).
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

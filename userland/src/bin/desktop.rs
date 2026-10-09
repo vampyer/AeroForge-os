@@ -638,27 +638,39 @@ enum Command {
     /// Computer's: network drives.
     Map,
     Disconnect,
+    Properties,
     /// The answers to "Delete ...?".
     Yes,
     No,
 }
 
-const COMMANDS: [(Command, &str); 6] = [
+const COMMANDS: [(Command, &str); 7] = [
     (Command::NewFolder, "New folder"),
     (Command::Cut, "Cut"),
     (Command::Copy, "Copy"),
     (Command::Paste, "Paste"),
     (Command::Rename, "Rename"),
     (Command::Delete, "Delete"),
+    (Command::Properties, "Properties"),
 ];
 
-const COMPUTER_COMMANDS: [(Command, &str); 2] = [(Command::Map, "Map network drive"), (Command::Disconnect, "Disconnect")];
+const COMPUTER_COMMANDS: [(Command, &str); 3] =
+    [(Command::Map, "Map network drive"), (Command::Disconnect, "Disconnect"), (Command::Properties, "Properties")];
 
-const BIN_COMMANDS: [(Command, &str); 3] =
-    [(Command::Restore, "Restore"), (Command::Delete, "Delete"), (Command::Empty, "Empty Recycle Bin")];
+const BIN_COMMANDS: [(Command, &str); 4] = [
+    (Command::Restore, "Restore"),
+    (Command::Delete, "Delete"),
+    (Command::Empty, "Empty Recycle Bin"),
+    (Command::Properties, "Properties"),
+];
 
 /// The Computer window's path for the Recycle Bin.
 const BIN: &str = "::bin";
+/// Its path for search results.
+const SEARCH: &str = "::search";
+/// How many names a search looks at, and finds, at most.
+const SEARCH_LOOKS: usize = 50_000;
+const SEARCH_FINDS: usize = 2_000;
 /// Where each drive keeps what was deleted from it, and the list of it.
 const BIN_DIR: &str = "Recycle Bin";
 const BIN_INFO: &str = "info.txt";
@@ -684,14 +696,40 @@ impl Recycled {
     }
 }
 
-/// What Copy or Cut picked up.
+/// A file or folder being copied, moved or dragged.
 #[derive(Clone)]
-struct Clip {
+struct Item {
     path: String,
     is_dir: bool,
     size: u64,
-    /// Cut: Paste moves it instead of copying it.
+}
+
+/// What Copy or Cut picked up.
+#[derive(Clone)]
+struct Clip {
+    items: Vec<Item>,
+    /// Cut: Paste moves them instead of copying them.
     cut: bool,
+}
+
+/// A press on selected files in the Computer window: once the pointer
+/// moves a few pixels with the button held, they are dragged.
+struct FileDrag {
+    x0: i32,
+    y0: i32,
+    items: Vec<Item>,
+    active: bool,
+    /// Pressed on one of several selected: if no drag happens, the click
+    /// leaves just this one selected.
+    collapse: Option<usize>,
+}
+
+/// What dropping dragged files does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropAction {
+    Move,
+    Copy,
+    Recycle,
 }
 
 /// "Map network drive": where, and who to sign in as.
@@ -714,6 +752,15 @@ enum Place {
     Bin,
 }
 
+/// The Properties box: what is selected, in more detail.
+struct Props {
+    title: String,
+    folder: bool,
+    rows: Vec<(&'static str, String)>,
+    /// A drive's used and total bytes, drawn as a pie.
+    pie: Option<(u64, u64)>,
+}
+
 /// What the Computer window (the file manager) shows and is doing.
 struct Files {
     /// The folder shown, or "" for Computer itself: the drives.
@@ -722,8 +769,13 @@ struct Files {
     drives: Vec<aero::Volume>,
     /// The first entry shown.
     scroll: usize,
-    /// The selected entry, or drive in Computer.
+    /// The selected entry (the one with the focus), or drive in Computer.
     selected: Option<usize>,
+    /// Every entry selected (by key(): name, or Recycle Bin number), when
+    /// Ctrl or Shift picked more than one. Empty: just `selected`.
+    marked: Vec<String>,
+    /// Where a Shift+click or Shift+arrow range starts.
+    anchor: Option<usize>,
     status: String,
     /// Where Back and Forward go.
     back: Vec<String>,
@@ -739,10 +791,20 @@ struct Files {
     confirm: Option<Command>,
     /// The Recycle Bin, when shown: one per entry.
     bin: Vec<Recycled>,
-    /// The last thing deleted, for Ctrl+Z.
-    last_recycled: Option<Recycled>,
+    /// The last things deleted together, for Ctrl+Z.
+    last_recycled: Vec<Recycled>,
     /// "Map network drive" is open (in Computer, over the drives).
     form: Option<MapForm>,
+    /// What is typed in the search box, and whether keys go there.
+    query: String,
+    query_focus: bool,
+    /// The last search: where it looked and what it found (full paths).
+    searched_in: String,
+    results: Vec<(String, aero::DirEntry)>,
+    /// In the search results view: each entry's full path.
+    found: Vec<String>,
+    /// The Properties box, when open.
+    props: Option<Props>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -802,6 +864,10 @@ struct Desktop {
     mouse_speed: u64,
     /// When and where the last press was, for double-clicks.
     last_press: (u64, i32, i32),
+    /// Files being dragged in the Computer window (or pressed on, about to be).
+    file_drag: Option<FileDrag>,
+    /// The modifier keys held as the key being handled was typed.
+    key_mods: u8,
 }
 
 impl Desktop {
@@ -875,9 +941,14 @@ impl Desktop {
         Rect::new(m.x + m.w - 200 * s, m.y + m.h - 42 * s, 190 * s, 34 * s)
     }
     fn cursor_rect(&self) -> Rect {
-        // Room for the arrow and for the resize arrows centred on the pointer.
+        // Room for the arrow and for the resize arrows centred on the pointer,
+        // and for the label under it while files are dragged.
         let s = self.ui;
-        Rect::new(self.pointer.x as i32 - 10 * s, self.pointer.y as i32 - 10 * s, 23 * s, 30 * s)
+        let (x, y) = (self.pointer.x as i32, self.pointer.y as i32);
+        if self.file_drag.as_ref().is_some_and(|d| d.active) {
+            return Rect::new(x - 10 * s, y - 10 * s, 340 * s, 60 * s);
+        }
+        Rect::new(x - 10 * s, y - 10 * s, 23 * s, 30 * s)
     }
     /// The edges of the front-most window under (x, y) that a drag from
     /// there would move: the outer few pixels of its frame and its corners.
@@ -1317,6 +1388,37 @@ impl Desktop {
 
     fn cursor(&self, c: &mut Canvas) {
         let (x0, y0, s) = (self.pointer.x as i32, self.pointer.y as i32, self.ui);
+        if let Some(d) = self.file_drag.as_ref().filter(|d| d.active) {
+            // What is dragged, and what dropping it here would do.
+            let what = match d.items.as_slice() {
+                [one] => split_path(&one.path).1,
+                many => format!("{} items", many.len()),
+            };
+            let what: String = if what.chars().count() > 22 { what.chars().take(19).chain("...".chars()).collect() } else { what };
+            let (text, ok) = match self.drop_target(x0, y0) {
+                Some((_, name, action)) => {
+                    let verb = match action {
+                        DropAction::Move => "Move to",
+                        DropAction::Copy => "Copy to",
+                        DropAction::Recycle => "Move to",
+                    };
+                    let name: String = if name.chars().count() > 18 { name.chars().take(15).chain("...".chars()).collect() } else { name };
+                    (format!("{}  {} {}", what, verb, name), true)
+                }
+                None => (what, false),
+            };
+            let w = Font::Normal.width(s, &text) + 30 * s;
+            let r = Rect::new(x0 + 14 * s, y0 + 20 * s, w, 24 * s);
+            c.rounded(r, 3 * s, false, rgb(250, 252, 255), rgb(222, 233, 246), 235);
+            c.rounded_outline(r, 3 * s, false, rgb(120, 150, 190), 255);
+            if d.items.iter().any(|it| it.is_dir) {
+                c.folder(r.x + 6 * s, r.y + 6 * s, s);
+            } else {
+                c.page(r.x + 8 * s, r.y + 5 * s, s);
+            }
+            let ink = if ok { rgb(20, 40, 80) } else { rgb(120, 125, 135) };
+            c.text(r.x + 24 * s, r.y + (r.h - Font::Normal.h(s)) / 2, &text, ink, Font::Normal);
+        }
         let edges = match self.resize {
             Some((_, e, ..)) => Some(e),
             None if self.drag.is_none() => self.edges_at(x0, y0).map(|(_, e)| e),
@@ -1687,12 +1789,17 @@ impl Desktop {
     }
 
 
-    fn typed(&mut self, keys: &[u8]) -> Rect {
+    fn typed(&mut self, keys: &[(u8, u8)]) -> Rect {
         let mut dirty = Rect::EMPTY;
-        for &k in keys {
+        for &(k, mods) in keys {
+            self.key_mods = mods;
             // Esc gives the screen back, unless the Computer window is
             // in front and waiting for a new name or a Yes or No.
-            let files_busy = self.files.rename.is_some() || self.files.confirm.is_some() || self.files.form.is_some();
+            let files_busy = self.files.rename.is_some()
+                || self.files.confirm.is_some()
+                || self.files.form.is_some()
+                || self.files.query_focus
+                || self.files.props.is_some();
             if self.top_kind() == Some(Kind::Computer) && (k != 27 || files_busy) {
                 dirty = dirty.union(&self.files_key(k));
                 continue;
@@ -2078,7 +2185,14 @@ impl Desktop {
     }
     fn files_address(&self, c: &Rect) -> Rect {
         let s = self.ui;
-        Rect::new(c.x + 112 * s, c.y + 6 * s, c.w - 120 * s, 28 * s)
+        let search = self.files_search(c);
+        Rect::new(c.x + 112 * s, c.y + 6 * s, search.x - 8 * s - (c.x + 112 * s), 28 * s)
+    }
+    /// The search box, right of the address, as in Windows 7.
+    fn files_search(&self, c: &Rect) -> Rect {
+        let s = self.ui;
+        let w = (c.w / 4).clamp(120 * s, 240 * s);
+        Rect::new(c.x + c.w - 8 * s - w, c.y + 6 * s, w, 28 * s)
     }
     fn files_commands(&self, c: &Rect) -> Rect {
         Rect::new(c.x, c.y + 40 * self.ui, c.w, 34 * self.ui)
@@ -2182,6 +2296,16 @@ impl Desktop {
             let n = self.files.bin.len();
             return format!("Delete {} item{} for good?", n, if n == 1 { "" } else { "s" });
         }
+        let picked = self.picked();
+        if picked.len() > 1 {
+            let n = picked.len();
+            let network = picked.iter().any(|&j| self.files.path != BIN && self.recycle_root_of(&self.entry_path(j)).is_none());
+            return if self.files.path == BIN || network {
+                format!("Delete these {} items for good?", n)
+            } else {
+                format!("Move these {} items to the Recycle Bin?", n)
+            };
+        }
         let name = self.selected_entry().map(|e| e.name).unwrap_or_default();
         let shown: String = if name.chars().count() > 24 {
             let mut n: String = name.chars().take(21).collect();
@@ -2233,11 +2357,58 @@ impl Desktop {
         }
         self.files.selected.and_then(|i| self.files.entries.get(i).cloned())
     }
+    /// What tells entry `i` apart from the rest: its name, or in the
+    /// Recycle Bin (where two can have the same name) its number.
+    fn entry_key(&self, i: usize) -> String {
+        if self.files.path == BIN {
+            return self.files.bin.get(i).map(|b| b.id.clone()).unwrap_or_default();
+        }
+        if self.files.path == SEARCH {
+            return self.files.found.get(i).cloned().unwrap_or_default();
+        }
+        self.files.entries.get(i).map(|e| e.name.clone()).unwrap_or_default()
+    }
+    /// Where entry `i` is.
+    fn entry_path(&self, i: usize) -> String {
+        if self.files.path == SEARCH {
+            return self.files.found[i].clone();
+        }
+        join(&self.files.path, &self.files.entries[i].name)
+    }
+    fn is_marked(&self, i: usize) -> bool {
+        match self.files.selected {
+            None => false,
+            Some(at) if self.files.marked.is_empty() => at == i,
+            Some(_) => self.files.marked.contains(&self.entry_key(i)),
+        }
+    }
+    /// The entries selected, in the order shown.
+    fn picked(&self) -> Vec<usize> {
+        if self.files.path.is_empty() {
+            return Vec::new();
+        }
+        (0..self.files.entries.len()).filter(|&i| self.is_marked(i)).collect()
+    }
+    /// The selected entries as things to copy, move or drag.
+    fn picked_items(&self) -> Vec<Item> {
+        self.picked()
+            .into_iter()
+            .map(|i| {
+                let e = &self.files.entries[i];
+                Item { path: self.entry_path(i), is_dir: e.is_dir, size: e.size }
+            })
+            .collect()
+    }
     fn command_enabled(&self, cmd: Command) -> bool {
         let folder = !self.files.path.is_empty();
         let writable = folder && !self.files_read_only();
-        let picked = self.selected_entry().is_some();
+        let picked = !self.picked().is_empty();
+        let search = self.files.path == SEARCH;
+        // In search results each can be on a different drive.
+        let all_writable = || self.picked().iter().all(|&j| !self.files_drive_read_only(&self.entry_path(j)));
         match cmd {
+            Command::NewFolder | Command::Paste | Command::Rename if search => false,
+            Command::Cut | Command::Delete if search => picked && all_writable(),
             Command::NewFolder => writable,
             Command::Copy => picked,
             Command::Cut | Command::Rename => picked && writable,
@@ -2248,6 +2419,8 @@ impl Desktop {
             Command::Empty => !self.files.bin.is_empty(),
             Command::Map => !folder && self.files.form.is_none(),
             Command::Disconnect => !folder && self.files.selected.is_some_and(|i| i >= self.files.drives.len()),
+            Command::Properties if !folder => self.files.selected.is_some() && self.files.form.is_none(),
+            Command::Properties => picked,
             Command::Yes | Command::No => true,
         }
     }
@@ -2275,6 +2448,19 @@ impl Desktop {
     fn crumbs(&self) -> Vec<(String, String)> {
         if self.files.path == BIN {
             return alloc::vec![(String::from("Recycle Bin"), String::from(BIN))];
+        }
+        if self.files.path == SEARCH {
+            let at = &self.files.searched_in;
+            let place = if at.is_empty() {
+                String::from("Computer")
+            } else if let Some(d) = self.files.drives.iter().position(|v| v.path.eq_ignore_ascii_case(at)) {
+                self.drive_name(d)
+            } else if let Some(sh) = shares().iter().find(|sh| sh.root().eq_ignore_ascii_case(at)) {
+                sh.name()
+            } else {
+                split_path(at).1
+            };
+            return alloc::vec![(format!("Search Results in {}", place), String::from(SEARCH))];
         }
         let mut out = alloc::vec![(String::from("Computer"), String::new())];
         if let Some((i, inner)) = net_path(&self.files.path) {
@@ -2378,6 +2564,33 @@ impl Desktop {
             }
         }
 
+        // Search box.
+        let q = self.files_search(client);
+        c.fill(q, 0xFFFFFF);
+        c.frame(q, if f.query_focus { rgb(60, 110, 190) } else { rgb(130, 150, 180) });
+        let qy = q.y + (q.h - Font::Normal.h(s)) / 2;
+        let room = ((q.w - 34 * s) / Font::Normal.w(s)).max(1) as usize;
+        if f.query.is_empty() && !f.query_focus {
+            let place = match self.crumbs().last() {
+                Some((name, _)) if in_folder && f.path != BIN && f.path != SEARCH => name.clone(),
+                _ => String::from("Computer"),
+            };
+            let hint: String = format!("Search {}", place).chars().take(room).collect();
+            c.text(q.x + 6 * s, qy, &hint, rgb(140, 145, 155), Font::Normal);
+        } else {
+            let skip = f.query.chars().count().saturating_sub(room.saturating_sub(1));
+            let shown: String = f.query.chars().skip(skip).collect();
+            c.text(q.x + 6 * s, qy, &shown, 0x101010, Font::Normal);
+            if f.query_focus {
+                let caret = q.x + 6 * s + shown.chars().count() as i32 * Font::Normal.w(s);
+                c.fill(Rect::new(caret, qy + 2 * s, s.max(2), Font::Normal.h(s) - 4 * s), 0x101010);
+            }
+        }
+        // A magnifying glass.
+        let (gx, gy) = (q.x + q.w - 22 * s, q.y + 6 * s);
+        c.rounded_outline(Rect::new(gx, gy, 11 * s, 11 * s), 5 * s, false, rgb(80, 100, 130), 255);
+        c.line(gx + 9 * s, gy + 9 * s, gx + 14 * s, gy + 14 * s, 2 * s, rgb(80, 100, 130));
+
         // Command bar.
         let bar = self.files_commands(client);
         c.gradient(bar, rgb(250, 252, 255), rgb(222, 233, 246), 255);
@@ -2440,6 +2653,7 @@ impl Desktop {
         } else {
             self.drives_view(c, client);
         }
+        self.props_view(c, client);
 
         // Status bar: what is selected, and the drive's free space at the right.
         let sb = self.files_status_bar(client);
@@ -2726,7 +2940,13 @@ impl Desktop {
         let head = self.files_head(client);
         let rows = self.files_rows(client);
         let head_y = head.y + (head.h - Font::Normal.h(s)) / 2;
-        let type_label = if f.path == BIN { "Original location" } else { "Type" };
+        let type_label = if f.path == BIN {
+            "Original location"
+        } else if f.path == SEARCH {
+            "In folder"
+        } else {
+            "Type"
+        };
         for (by, label, x, end) in [
             (SortBy::Name, "Name", rows.x + 30 * s, type_x),
             (SortBy::Type, type_label, type_x, size_x),
@@ -2751,7 +2971,13 @@ impl Desktop {
         }
         c.fill(Rect::new(head.x, head.y + head.h - 1, head.w, 1), rgb(225, 230, 240));
         if f.entries.is_empty() {
-            let empty = if f.path == BIN { "The Recycle Bin is empty." } else { "This folder is empty." };
+            let empty = if f.path == BIN {
+                "The Recycle Bin is empty."
+            } else if f.path == SEARCH {
+                "No items match your search."
+            } else {
+                "This folder is empty."
+            };
             c.text(rows.x + 30 * s, rows.y + 10 * s, empty, rgb(120, 125, 135), Font::Normal);
         }
         let name_cols = ((type_x - 12 * s - rows.x - 30 * s) / fw).max(1) as usize;
@@ -2759,7 +2985,7 @@ impl Desktop {
         for (i, e) in f.entries.iter().enumerate().skip(f.scroll).take(self.files_visible(client)) {
             let r = self.files_row(client, i - f.scroll);
             let box_ = Rect::new(r.x + 2 * s, r.y, r.w - 4 * s, r.h);
-            if f.selected == Some(i) {
+            if self.is_marked(i) {
                 c.rounded(box_, 2 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
                 c.rounded_outline(box_, 2 * s, false, rgb(125, 162, 206), 255);
             } else if r.contains(px, py) {
@@ -2791,7 +3017,7 @@ impl Desktop {
                     c.fill(Rect::new(caret, ty + 2 * s, s.max(2), Font::Normal.h(s) - 4 * s), 0x101010);
                 }
                 _ => {
-                    let cut = f.clip.as_ref().is_some_and(|k| k.cut && k.path == join(&f.path, &e.name));
+                    let cut = f.clip.as_ref().is_some_and(|k| k.cut && k.items.iter().any(|it| it.path == self.entry_path(i)));
                     let ink = if cut { rgb(140, 140, 140) } else { 0x101010 };
                     let name: String = if e.name.chars().count() > name_cols {
                         let mut n: String = e.name.chars().take(name_cols.saturating_sub(3)).collect();
@@ -2805,6 +3031,7 @@ impl Desktop {
             }
             let kind = match f.bin.get(i) {
                 Some(item) if f.path == BIN => split_path(&item.original).0,
+                _ if f.path == SEARCH => split_path(&f.found[i]).0,
                 _ => type_text(e),
             };
             let kind: String = kind.chars().take(type_cols).collect();
@@ -2869,11 +3096,23 @@ impl Desktop {
     fn open_dir(&mut self, path: String) -> bool {
         self.files.rename = None;
         self.files.confirm = None;
+        self.files.props = None;
         if !path.is_empty() {
             self.files.form = None;
         }
         if let Ok(drives) = aero::volumes() {
             self.files.drives = drives;
+        }
+        if path == SEARCH {
+            self.files.entries = self.files.results.iter().map(|(_, e)| e.clone()).collect();
+            self.files.found = self.files.results.iter().map(|(p, _)| p.clone()).collect();
+            let n = self.files.found.len();
+            self.files.status = format!("{} item{} found", n, if n == 1 { "" } else { "s" });
+            self.files.path = path;
+            self.sort_entries();
+            self.files.scroll = 0;
+            self.files.selected = None;
+            return true;
         }
         if path == BIN {
             self.load_bin();
@@ -2924,7 +3163,11 @@ impl Desktop {
                     entries.retain(|e| !(e.is_dir && e.name.eq_ignore_ascii_case(BIN_DIR)));
                 }
                 self.files.entries = entries;
+                // Sorted as a folder (not as the Recycle Bin or search results it may come from).
+                let from = core::mem::replace(&mut self.files.path, path.clone());
                 self.sort_entries();
+                self.files.path = from;
+                self.files.found.clear();
                 let n = self.files.entries.len();
                 self.files.status = format!("{} item{}", n, if n == 1 { "" } else { "s" });
                 let names: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
@@ -2988,6 +3231,10 @@ impl Desktop {
         if path == BIN {
             return self.navigate(String::new());
         }
+        if path == SEARCH {
+            let back = self.files.searched_in.clone();
+            return self.navigate(back);
+        }
         let at_root = self.drive_of(&path).is_some_and(|d| self.files.drives[d].path.eq_ignore_ascii_case(path.trim_end_matches('/')) || path == "/")
             || net_path(&path).is_some_and(|(_, inner)| inner.trim_matches('/').is_empty());
         let up = if at_root { String::new() } else { split_path(&path).0 };
@@ -3016,6 +3263,20 @@ impl Desktop {
             return;
         }
         let (by, desc) = (self.files.sort, self.files.descending);
+        if self.files.path == SEARCH {
+            let mut both: Vec<(aero::DirEntry, String)> =
+                core::mem::take(&mut self.files.entries).into_iter().zip(core::mem::take(&mut self.files.found)).collect();
+            both.sort_by(|(a, pa), (b, pb)| {
+                let order = match by {
+                    SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortBy::Type => pa.to_lowercase().cmp(&pb.to_lowercase()),
+                    SortBy::Size => a.size.cmp(&b.size).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                };
+                b.is_dir.cmp(&a.is_dir).then(if desc { order.reverse() } else { order })
+            });
+            (self.files.entries, self.files.found) = both.into_iter().unzip();
+            return;
+        }
         self.files.entries.sort_by(|a, b| {
             let order = match by {
                 SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -3026,10 +3287,101 @@ impl Desktop {
         });
     }
 
+    /// Brings entry `i` into view.
+    fn scroll_to(&mut self, i: usize) {
+        let c = self.files_client();
+        let visible = self.files_visible(&c);
+        if i < self.files.scroll {
+            self.files.scroll = i;
+        } else if i >= self.files.scroll + visible {
+            self.files.scroll = i + 1 - visible;
+        }
+    }
+
+    /// Ctrl+click: adds entry `i` to the selection, or takes it out.
+    fn toggle(&mut self, i: usize) {
+        if self.files.path.is_empty() {
+            return self.select(i);
+        }
+        let mut marked = self.picked().into_iter().map(|j| self.entry_key(j)).collect::<Vec<_>>();
+        let key = self.entry_key(i);
+        match marked.iter().position(|k| *k == key) {
+            Some(at) => {
+                marked.remove(at);
+            }
+            None => marked.push(key),
+        }
+        self.files.marked = marked;
+        self.files.selected = Some(i);
+        self.files.anchor = Some(i);
+        self.scroll_to(i);
+        self.pick_status();
+    }
+
+    /// Shift+click or Shift+arrow: selects everything from the anchor to `i`.
+    fn extend(&mut self, i: usize) {
+        if self.files.path.is_empty() {
+            return self.select(i);
+        }
+        let from = self.files.anchor.unwrap_or(i).min(self.files.entries.len().saturating_sub(1));
+        let (a, b) = (from.min(i), from.max(i));
+        self.files.marked = (a..=b).map(|j| self.entry_key(j)).collect();
+        self.files.selected = Some(i);
+        self.files.anchor = Some(from);
+        self.scroll_to(i);
+        self.pick_status();
+    }
+
+    /// Ctrl+A.
+    fn select_all(&mut self) {
+        let n = self.files.entries.len();
+        if self.files.path.is_empty() || n == 0 {
+            return;
+        }
+        self.files.marked = (0..n).map(|j| self.entry_key(j)).collect();
+        self.files.selected = Some(self.files.selected.unwrap_or(0).min(n - 1));
+        self.pick_status();
+    }
+
+    /// The status line for what is selected: one thing says what it is,
+    /// several say how many and how big.
+    fn pick_status(&mut self) {
+        let picked = self.picked();
+        match picked.len() {
+            0 => self.files.status = format!("{} items", self.files.entries.len()),
+            1 if self.files.marked.len() <= 1 => {
+                let at = picked[0];
+                self.files.marked.clear();
+                self.files.selected = Some(at);
+                self.describe(at);
+            }
+            n => {
+                let names: Vec<String> = picked.iter().map(|&j| self.files.entries[j].name.clone()).collect();
+                println!("[desktop] selected {} items: {}", n, names.join(" | "));
+                let bytes: u64 = picked.iter().map(|&j| self.files.entries[j].size).sum();
+                let files = picked.iter().filter(|&&j| !self.files.entries[j].is_dir).count();
+                self.files.status = if files > 0 {
+                    format!("{} items selected  {} in {} file{}", n, size_text(bytes), files, if files == 1 { "" } else { "s" })
+                } else {
+                    format!("{} items selected", n)
+                };
+            }
+        }
+    }
+
     /// Selects entry (or drive) `i`, scrolls it into view and says what it is.
     fn select(&mut self, i: usize) {
-        let c = self.files_client();
+        self.files.marked.clear();
+        self.files.anchor = Some(i);
         self.files.selected = Some(i);
+        if !self.files.path.is_empty() {
+            self.scroll_to(i);
+        }
+        self.describe(i);
+    }
+
+    /// Says on the status line what entry (or drive) `i` is.
+    fn describe(&mut self, i: usize) {
         if self.files.path.is_empty() && i >= self.files.drives.len() {
             let sh = &shares()[i - self.files.drives.len()];
             self.files.status = format!("{}  {}", sh.unc(), if sh.client.is_some() { "connected" } else { "not connected: open it to sign in" });
@@ -3039,12 +3391,6 @@ impl Desktop {
             let v = &self.files.drives[i];
             self.files.status = format!("{}  {} {}{}", self.drive_name(i), space_text(v.size), v.kind, if v.read_only { ", read-only" } else { "" });
             return;
-        }
-        let visible = self.files_visible(&c);
-        if i < self.files.scroll {
-            self.files.scroll = i;
-        } else if i >= self.files.scroll + visible {
-            self.files.scroll = i + 1 - visible;
         }
         if self.files.path == BIN {
             let b = &self.files.bin[i];
@@ -3080,7 +3426,7 @@ impl Desktop {
             return self.command(Command::Restore);
         }
         let Some(e) = self.files.entries.get(i).cloned() else { return Rect::EMPTY };
-        let path = join(&self.files.path, &e.name);
+        let path = self.entry_path(i);
         if e.is_dir {
             self.navigate(path)
         } else {
@@ -3112,14 +3458,26 @@ impl Desktop {
                 }
             }
             Command::Copy | Command::Cut => {
-                let e = self.selected_entry().unwrap();
-                let path = join(&dir, &e.name);
+                let items = self.picked_items();
                 let cut = cmd == Command::Cut;
-                println!("[desktop] {} {}", if cut { "cut" } else { "copied" }, path);
-                self.files.status = format!("{} \"{}\": open a folder and Paste", if cut { "Cut" } else { "Copied" }, e.name);
-                self.files.clip = Some(Clip { path, is_dir: e.is_dir, size: e.size, cut });
+                for it in &items {
+                    println!("[desktop] {} {}", if cut { "cut" } else { "copied" }, it.path);
+                }
+                let what = match items.as_slice() {
+                    [one] => format!("\"{}\"", split_path(&one.path).1),
+                    _ => format!("{} items", items.len()),
+                };
+                self.files.status = format!("{} {}: open a folder and Paste", if cut { "Cut" } else { "Copied" }, what);
+                self.files.clip = Some(Clip { items, cut });
             }
-            Command::Paste => self.paste(),
+            Command::Paste => {
+                let Some(clip) = self.files.clip.clone() else { return area };
+                let (status, moved) = self.transfer(&clip.items, &dir, clip.cut);
+                if clip.cut && moved > 0 {
+                    self.files.clip = None;
+                }
+                self.files.status = status;
+            }
             Command::Rename => {
                 let e = self.selected_entry().unwrap();
                 self.files.rename = Some(e.name);
@@ -3131,18 +3489,26 @@ impl Desktop {
                 self.files.status = String::from("Press Enter or Yes to go ahead, Esc or No to keep it");
             }
             Command::Restore => {
-                let i = self.files.selected.unwrap();
-                let item = self.files.bin[i].clone();
-                match self.restore(&item) {
-                    Ok(to) => {
-                        self.refresh(None);
-                        if !self.files.entries.is_empty() {
-                            self.select(i.min(self.files.entries.len() - 1));
-                        }
-                        self.files.status = format!("Restored to {}", to);
+                let picked = self.picked();
+                let i = picked[0];
+                let items: Vec<Recycled> = picked.iter().map(|&j| self.files.bin[j].clone()).collect();
+                let mut done = Vec::new();
+                let mut failed = None;
+                for item in &items {
+                    match self.restore(item) {
+                        Ok(to) => done.push(to),
+                        Err(msg) => failed = Some(msg),
                     }
-                    Err(msg) => self.files.status = msg,
                 }
+                self.refresh(None);
+                if !self.files.entries.is_empty() {
+                    self.select(i.min(self.files.entries.len() - 1));
+                }
+                self.files.status = match (failed, done.as_slice()) {
+                    (Some(msg), _) => msg,
+                    (None, [one]) => format!("Restored to {}", one),
+                    (None, _) => format!("Restored {} items", done.len()),
+                };
             }
             Command::Yes => {
                 let what = self.files.confirm.take();
@@ -3161,20 +3527,21 @@ impl Desktop {
                         failed.map_or(Ok(String::from("The Recycle Bin is empty")), Err)
                     }
                     _ if self.files.path == BIN => {
-                        let item = self.files.bin[at].clone();
-                        self.purge(&item).map(|_| format!("Deleted \"{}\" for good", split_path(&item.original).1))
+                        let items: Vec<Recycled> = self.picked().iter().map(|&j| self.files.bin[j].clone()).collect();
+                        let mut result = Ok(match items.as_slice() {
+                            [one] => format!("Deleted \"{}\" for good", split_path(&one.original).1),
+                            _ => format!("Deleted {} items for good", items.len()),
+                        });
+                        for item in &items {
+                            if let Err(msg) = self.purge(item) {
+                                result = Err(msg);
+                            }
+                        }
+                        result
                     }
                     _ => {
-                        let e = self.selected_entry().unwrap();
-                        let path = join(&dir, &e.name);
-                        if self.recycle_root().is_some() {
-                            self.recycle(&path, &e).map(|_| format!("Moved \"{}\" to the Recycle Bin (Ctrl+Z puts it back)", e.name))
-                        } else {
-                            delete_tree(&path, e.is_dir).map(|n| {
-                                println!("[desktop] deleted {} ({} item{})", path, n, if n == 1 { "" } else { "s" });
-                                format!("Deleted \"{}\"", e.name)
-                            })
-                        }
+                        let items = self.picked_items();
+                        self.delete_items(&items)
                     }
                 };
                 self.refresh(None);
@@ -3194,6 +3561,7 @@ impl Desktop {
                 self.files.status = String::from("Nothing was deleted");
             }
             Command::Map => return self.open_form(None),
+            Command::Properties => self.open_props(),
             Command::Disconnect => {
                 let n = self.files.selected.unwrap() - self.files.drives.len();
                 let sh = shares().remove(n);
@@ -3206,58 +3574,101 @@ impl Desktop {
         area
     }
 
-    /// Copies (or moves, after Cut) what the clipboard holds into the folder shown.
-    fn paste(&mut self) {
-        let Some(clip) = self.files.clip.clone() else { return };
-        let dir = self.files.path.clone();
-        let (from_dir, name) = split_path(&clip.path);
-        if clip.is_dir && (dir.eq_ignore_ascii_case(&clip.path) || dir.to_lowercase().starts_with(&format!("{}/", clip.path.to_lowercase()))) {
-            self.files.status = String::from("A folder can't go inside itself");
-            return;
-        }
-        if clip.cut && from_dir.eq_ignore_ascii_case(&dir) {
-            self.files.clip = None;
-            self.files.status = String::from("It is already here");
-            return;
-        }
-        let taken: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
-        let new_name = free_name(&name, &taken, clip.is_dir, true);
-        let to = join(&dir, &new_name);
-        if clip.cut {
-            let r = move_tree(&clip.path, &to, clip.is_dir, clip.size);
-            match r {
-                Ok(()) => {
-                    println!("[desktop] moved {} to {}", clip.path, to);
-                    self.files.status = format!("Moved \"{}\" here", name);
-                    self.files.clip = None;
-                    self.refresh(Some(new_name));
-                    self.files.status = format!("Moved \"{}\" here", name);
+    /// Copies (or moves, when `cut`) `items` into folder `dir`, under new
+    /// names where theirs are taken there. Shows `dir` afterwards if it is
+    /// the folder open, with what arrived selected. Returns what to say and
+    /// how many went.
+    fn transfer(&mut self, items: &[Item], dir: &str, cut: bool) -> (String, usize) {
+        let mut taken: Vec<String> = fs_list(dir).unwrap_or_default().into_iter().map(|e| e.name).collect();
+        let mut arrived = Vec::new();
+        let mut files = 0;
+        let mut problem = None;
+        for it in items {
+            let (from_dir, name) = split_path(&it.path);
+            let lower = it.path.to_lowercase();
+            if it.is_dir && (dir.eq_ignore_ascii_case(&it.path) || dir.to_lowercase().starts_with(&format!("{}/", lower))) {
+                problem = Some(String::from("A folder can't go inside itself"));
+                continue;
+            }
+            if cut && from_dir.eq_ignore_ascii_case(dir) {
+                problem = Some(if items.len() == 1 { String::from("It is already here") } else { String::from("Some are already here") });
+                continue;
+            }
+            let names: Vec<&str> = taken.iter().map(|t| t.as_str()).collect();
+            let new_name = free_name(&name, &names, it.is_dir, true);
+            let to = join(dir, &new_name);
+            let result = if cut {
+                move_tree(&it.path, &to, it.is_dir, it.size).map(|()| {
+                    println!("[desktop] moved {} to {}", it.path, to);
+                    0
+                })
+            } else {
+                copy_tree(&it.path, &to, it.is_dir, it.size).map(|n| {
+                    println!("[desktop] pasted {} as {} ({} file{})", it.path, to, n, if n == 1 { "" } else { "s" });
+                    n
+                })
+            };
+            match result {
+                Ok(n) => {
+                    files += n;
+                    taken.push(new_name.clone());
+                    arrived.push(new_name);
                 }
                 Err(msg) => {
-                    println!("[desktop] move failed: {}", msg);
-                    self.refresh(None);
-                    self.files.status = msg;
+                    println!("[desktop] {} failed: {}", if cut { "move" } else { "paste" }, msg);
+                    problem = Some(msg);
                 }
             }
-            return;
         }
-        match copy_tree(&clip.path, &to, clip.is_dir, clip.size) {
-            Ok(n) => {
-                let files = format!("{} file{}", n, if n == 1 { "" } else { "s" });
-                {
-                    println!("[desktop] pasted {} as {} ({})", clip.path, to, files);
-                    self.files.status = format!("Pasted \"{}\" ({})", new_name, files);
+        if self.files.path.eq_ignore_ascii_case(dir) {
+            self.refresh(None);
+            self.files.marked.clear();
+            let at: Vec<usize> = arrived.iter().filter_map(|n| self.files.entries.iter().position(|e| e.name == *n)).collect();
+            if let Some(&first) = at.first() {
+                self.select(first);
+                if at.len() > 1 {
+                    self.files.marked = at.iter().map(|&j| self.entry_key(j)).collect();
                 }
-                let status = self.files.status.clone();
-                self.refresh(Some(new_name));
-                self.files.status = status;
             }
-            Err(msg) => {
-                println!("[desktop] paste failed: {}", msg);
-                self.refresh(None);
-                self.files.status = msg;
+        } else if cut {
+            // Moved out of the folder shown.
+            self.refresh(None);
+        }
+        let n = arrived.len();
+        let status = match (problem, arrived.as_slice()) {
+            (Some(msg), []) => msg,
+            (Some(msg), _) => format!("{} of {} done: {}", n, items.len(), msg),
+            (None, [one]) if cut => format!("Moved \"{}\" to {}", one, dir),
+            (None, [one]) => format!("Pasted \"{}\" ({} file{})", one, files, if files == 1 { "" } else { "s" }),
+            (None, _) if cut => format!("Moved {} items to {}", n, dir),
+            (None, _) => format!("Pasted {} items ({} files)", n, files),
+        };
+        (status, n)
+    }
+
+    /// Deletes `items`: into their drive's Recycle Bin where there is one
+    /// (Ctrl+Z puts them all back), for good otherwise (network drives).
+    fn delete_items(&mut self, items: &[Item]) -> Result<String, String> {
+        self.files.last_recycled.clear();
+        let mut binned = 0;
+        let mut gone = 0;
+        for it in items {
+            let e = aero::DirEntry { name: split_path(&it.path).1, is_dir: it.is_dir, size: it.size };
+            if self.recycle_root_of(&it.path).is_some() {
+                self.recycle(&it.path, &e)?;
+                binned += 1;
+            } else {
+                let n = delete_tree(&it.path, it.is_dir)?;
+                println!("[desktop] deleted {} ({} item{})", it.path, n, if n == 1 { "" } else { "s" });
+                gone += 1;
             }
         }
+        Ok(match (items, binned) {
+            ([one], 1) => format!("Moved \"{}\" to the Recycle Bin (Ctrl+Z puts it back)", split_path(&one.path).1),
+            ([one], _) => format!("Deleted \"{}\"", split_path(&one.path).1),
+            (_, 0) => format!("Deleted {} items", gone),
+            _ => format!("Moved {} items to the Recycle Bin (Ctrl+Z puts them back)", binned),
+        })
     }
 
     /// Gives the selected entry the name typed for it.
@@ -3299,7 +3710,11 @@ impl Desktop {
 
     /// The drive root of the folder shown, if things deleted there can go to its Recycle Bin.
     fn recycle_root(&self) -> Option<String> {
-        let d = self.drive_of(&self.files.path)?;
+        self.recycle_root_of(&self.files.path)
+    }
+    /// The root of the drive `path` is on, if it has a Recycle Bin.
+    fn recycle_root_of(&self, path: &str) -> Option<String> {
+        let d = self.drive_of(path)?;
         let v = &self.files.drives[d];
         if v.read_only { None } else { Some(v.path.clone()) }
     }
@@ -3349,7 +3764,7 @@ impl Desktop {
 
     /// Moves `path` into its drive's Recycle Bin.
     fn recycle(&mut self, path: &str, e: &aero::DirEntry) -> Result<Recycled, String> {
-        let root = self.recycle_root().ok_or_else(|| String::from("This drive has no Recycle Bin"))?;
+        let root = self.recycle_root_of(path).ok_or_else(|| String::from("This drive has no Recycle Bin"))?;
         let bin = join(&root, BIN_DIR);
         match aero::create_dir(&bin) {
             Ok(()) | Err(aero::E_EXISTS) => {}
@@ -3377,7 +3792,7 @@ impl Desktop {
         }
         delete_tree(path, e.is_dir)?;
         println!("[desktop] moved {} to the Recycle Bin as {}", path, item.stored());
-        self.files.last_recycled = Some(item.clone());
+        self.files.last_recycled.push(item.clone());
         Ok(item)
     }
 
@@ -3401,9 +3816,7 @@ impl Desktop {
         copy_tree(&item.stored(), &to, item.is_dir, item.size).map_err(|m| format!("Not restored: {}", m))?;
         self.purge(item)?;
         println!("[desktop] restored {} from the Recycle Bin to {}", item.original, to);
-        if self.files.last_recycled.as_ref().is_some_and(|l| l.root == item.root && l.id == item.id) {
-            self.files.last_recycled = None;
-        }
+        self.files.last_recycled.retain(|l| !(l.root == item.root && l.id == item.id));
         Ok(to)
     }
 
@@ -3423,25 +3836,479 @@ impl Desktop {
 
     /// Ctrl+Z: puts back the last thing deleted.
     fn undo_delete(&mut self) -> Rect {
-        let Some(item) = self.files.last_recycled.clone() else {
+        let items = self.files.last_recycled.clone();
+        if items.is_empty() {
             println!("[desktop] nothing to undo");
             self.files.status = String::from("Nothing to undo");
             return self.files_area();
-        };
-        match self.restore(&item) {
-            Ok(to) => {
-                let (dir, name) = split_path(&to);
-                if self.files.path.eq_ignore_ascii_case(&dir) || self.files.path == BIN {
-                    self.refresh(Some(name));
+        }
+        let mut back = Vec::new();
+        let mut failed = None;
+        for item in items.iter().rev() {
+            match self.restore(item) {
+                Ok(to) => back.push(to),
+                Err(msg) => {
+                    println!("[desktop] {}", msg);
+                    failed = Some(msg);
                 }
-                self.files.status = format!("Undid the delete: {} is back", to);
-            }
-            Err(msg) => {
-                println!("[desktop] {}", msg);
-                self.files.status = msg;
             }
         }
+        if let Some(to) = back.first() {
+            let (dir, name) = split_path(to);
+            if self.files.path.eq_ignore_ascii_case(&dir) || self.files.path == BIN {
+                self.refresh(Some(name));
+            }
+        }
+        self.files.status = match (failed, back.as_slice()) {
+            (Some(msg), _) => msg,
+            (None, [one]) => format!("Undid the delete: {} is back", one),
+            (None, _) => format!("Undid the delete: {} items are back", back.len()),
+        };
         self.files_area()
+    }
+
+    /// Looks for `query` in the names of everything under the folder shown
+    /// (every drive, from Computer) and shows what it found. A query with
+    /// * or ? matches whole names (*.txt); otherwise any name containing
+    /// it matches. Case does not matter.
+    fn search(&mut self) -> Rect {
+        let query = String::from(self.files.query.trim());
+        self.files.query_focus = false;
+        if query.is_empty() {
+            return self.files_area();
+        }
+        let base = match self.files.path.as_str() {
+            "" | BIN => String::new(),
+            SEARCH => self.files.searched_in.clone(),
+            p => String::from(p),
+        };
+        let mut stack: Vec<String> = if base.is_empty() {
+            let mut roots: Vec<String> = self.files.drives.iter().map(|v| v.path.clone()).collect();
+            roots.extend(shares().iter().filter(|s| s.client.is_some()).map(|s| s.root()));
+            roots
+        } else {
+            alloc::vec![base.clone()]
+        };
+        // Deeper drives (/sata0p1) are walked on their own, not again under /.
+        let roots: Vec<String> = self.files.drives.iter().map(|v| v.path.to_lowercase()).collect();
+        let pattern = query.to_lowercase();
+        let mut found = Vec::new();
+        let mut looked = 0;
+        while let Some(dir) = stack.pop() {
+            let Ok(list) = fs_list(&dir) else { continue };
+            for e in list {
+                looked += 1;
+                let path = join(&dir, &e.name);
+                if e.is_dir && (e.name.eq_ignore_ascii_case(BIN_DIR) && self.files.drives.iter().any(|v| v.path.eq_ignore_ascii_case(&dir))
+                    || roots.contains(&path.to_lowercase()))
+                {
+                    continue;
+                }
+                if name_matches(&e.name.to_lowercase(), &pattern) && found.len() < SEARCH_FINDS {
+                    found.push((path.clone(), e.clone()));
+                }
+                if e.is_dir {
+                    stack.push(path);
+                }
+            }
+            if looked >= SEARCH_LOOKS {
+                break;
+            }
+        }
+        let shown: Vec<&str> = found.iter().take(8).map(|(p, _)| p.as_str()).collect();
+        println!("[desktop] search for \"{}\" in {}: {} found ({})", query, if base.is_empty() { "Computer" } else { base.as_str() },
+            found.len(), shown.join(" | "));
+        self.files.searched_in = base;
+        self.files.results = found;
+        let r = self.navigate(String::from(SEARCH));
+        if looked >= SEARCH_LOOKS {
+            self.files.status = format!("{}; stopped after looking at {} names", self.files.status, SEARCH_LOOKS);
+        }
+        r
+    }
+
+    /// A key typed while the search box has the focus.
+    fn search_key(&mut self, k: u8) -> Rect {
+        let area = self.files_area();
+        match k {
+            b'\n' => return self.search(),
+            27 if !self.files.query.is_empty() => self.files.query.clear(),
+            27 | 9 => self.files.query_focus = false,
+            8 => {
+                self.files.query.pop();
+            }
+            32..=126 if self.files.query.len() < 80 => self.files.query.push(k as char),
+            _ => return Rect::EMPTY,
+        }
+        area
+    }
+
+    /// Fills in the Properties box for what is selected.
+    fn open_props(&mut self) {
+        let f = &self.files;
+        let props = if f.path.is_empty() {
+            let Some(i) = f.selected else { return };
+            if i >= f.drives.len() {
+                let sh = &shares()[i - f.drives.len()];
+                Props {
+                    title: sh.name(),
+                    folder: false,
+                    rows: alloc::vec![
+                        ("Type", String::from("Network drive (SMB)")),
+                        ("Folder", sh.unc()),
+                        ("Signed in as", sh.user.clone()),
+                        ("Status", String::from(if sh.client.is_some() { "Connected" } else { "Not connected" })),
+                    ],
+                    pie: None,
+                }
+            } else {
+                let v = &f.drives[i];
+                let kind = if v.device.starts_with("usb") { "USB Drive" } else { "Local Disk" };
+                let mut rows = alloc::vec![("Type", String::from(kind)), ("File system", v.kind.clone()), ("Device", v.device.clone())];
+                let pie = v.free.map(|free| {
+                    let used = v.size.saturating_sub(free);
+                    rows.push(("Used space", format!("{}  ({} bytes)", space_text(used), group(used))));
+                    rows.push(("Free space", format!("{}  ({} bytes)", space_text(free), group(free))));
+                    (used, v.size)
+                });
+                rows.push(("Capacity", format!("{}  ({} bytes)", space_text(v.size), group(v.size))));
+                if v.read_only {
+                    rows.push(("Attributes", String::from("Read-only")));
+                }
+                println!("[desktop] properties of {}: {} {}, {} bytes, {} free", self.drive_name(i), kind, v.kind, v.size,
+                    v.free.map_or(String::from("not known"), |b| format!("{} bytes", b)));
+                Props { title: self.drive_name(i), folder: false, rows, pie }
+            }
+        } else if f.path == BIN {
+            let picked = self.picked();
+            let items: Vec<&Recycled> = picked.iter().map(|&j| &f.bin[j]).collect();
+            let bytes: u64 = items.iter().map(|b| b.size).sum();
+            match items.as_slice() {
+                [one] => Props {
+                    title: split_path(&one.original).1,
+                    folder: one.is_dir,
+                    rows: alloc::vec![
+                        ("Original location", split_path(&one.original).0),
+                        ("Deleted", one.when.clone()),
+                        ("Size", format!("{}  ({} bytes)", size_text(one.size), group(one.size))),
+                    ],
+                    pie: None,
+                },
+                many => Props {
+                    title: format!("{} items", many.len()),
+                    folder: false,
+                    rows: alloc::vec![("Size", format!("{}  ({} bytes)", size_text(bytes), group(bytes)))],
+                    pie: None,
+                },
+            }
+        } else {
+            let items = self.picked_items();
+            if items.is_empty() {
+                return;
+            }
+            let (mut bytes, mut files, mut dirs) = (0u64, 0usize, 0usize);
+            for it in &items {
+                if it.is_dir {
+                    let (b, nf, nd) = tree_size(&it.path);
+                    bytes += b;
+                    files += nf;
+                    dirs += nd;
+                } else {
+                    bytes += it.size;
+                }
+            }
+            let size = format!("{}  ({} bytes)", size_text(bytes), group(bytes));
+            let contains = format!("{} File{}, {} Folder{}", files, if files == 1 { "" } else { "s" }, dirs, if dirs == 1 { "" } else { "s" });
+            let location = {
+                let first = split_path(&items[0].path).0;
+                if items.iter().all(|it| split_path(&it.path).0 == first) { first } else { String::from("Various folders") }
+            };
+            let props = match items.as_slice() {
+                [one] if one.is_dir => {
+                    println!("[desktop] properties of {}: {} bytes in {} file(s) and {} folder(s)", one.path, bytes, files, dirs);
+                    Props {
+                        title: split_path(&one.path).1,
+                        folder: true,
+                        rows: alloc::vec![("Type", String::from("File folder")), ("Location", location), ("Size", size), ("Contains", contains)],
+                        pie: None,
+                    }
+                }
+                [one] => {
+                    let e = aero::DirEntry { name: split_path(&one.path).1, is_dir: false, size: one.size };
+                    println!("[desktop] properties of {}: {} bytes", one.path, bytes);
+                    Props {
+                        title: e.name.clone(),
+                        folder: false,
+                        rows: alloc::vec![("Type", type_text(&e)), ("Location", location), ("Size", size)],
+                        pie: None,
+                    }
+                }
+                many => {
+                    let top_files = many.iter().filter(|it| !it.is_dir).count();
+                    println!("[desktop] properties of {} items: {} bytes in {} file(s) and {} folder(s)", many.len(), bytes, files + top_files,
+                        dirs + many.len() - top_files);
+                    Props {
+                        title: format!("{} items", many.len()),
+                        folder: false,
+                        rows: alloc::vec![
+                            ("Location", location),
+                            ("Size", size),
+                            ("Contains", format!("{} Files, {} Folders", files + top_files, dirs + many.len() - top_files)),
+                        ],
+                        pie: None,
+                    }
+                }
+            };
+            props
+        };
+        self.files.props = Some(props);
+    }
+
+    /// Where the Properties box is drawn: in the middle of the content.
+    fn props_rect(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let Some(p) = &self.files.props else { return Rect::EMPTY };
+        let k = self.files_content(client);
+        let h = 60 * s + p.rows.len() as i32 * 24 * s + if p.pie.is_some() { 130 * s } else { 0 } + 44 * s;
+        let w = (500 * s).min(k.w - 16 * s);
+        let h = h.min(k.h - 8 * s);
+        Rect::new(k.x + (k.w - w) / 2, k.y + (k.h - h) / 2, w, h)
+    }
+    fn props_ok(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let r = self.props_rect(client);
+        Rect::new(r.x + r.w - 90 * s, r.y + r.h - 36 * s, 76 * s, 26 * s)
+    }
+
+    fn props_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        let Some(p) = &self.files.props else { return };
+        let r = self.props_rect(client);
+        c.rounded(r, 4 * s, false, rgb(252, 253, 255), rgb(236, 242, 250), 255);
+        c.rounded_outline(r, 4 * s, false, rgb(110, 140, 180), 255);
+        if p.folder {
+            c.folder(r.x + 16 * s, r.y + 18 * s, s);
+        } else if p.pie.is_some() || p.rows.first().is_some_and(|(_, v)| v.starts_with("Network")) {
+            c.small_drive(r.x + 14 * s, r.y + 18 * s, s, p.pie.is_none());
+        } else {
+            c.page(r.x + 18 * s, r.y + 16 * s, s);
+        }
+        let fw = Font::Normal.w(s);
+        let title: String = p.title.chars().take(((r.w - 60 * s) / fw).max(1) as usize).collect();
+        c.text(r.x + 44 * s, r.y + 16 * s, &title, rgb(30, 57, 145), Font::Normal);
+        c.fill(Rect::new(r.x + 12 * s, r.y + 46 * s, r.w - 24 * s, 1), rgb(200, 210, 225));
+        let label_w = p.rows.iter().map(|(l, _)| l.len() as i32 + 2).max().unwrap_or(8) * fw;
+        let value_x = r.x + 16 * s + label_w;
+        let room = ((r.x + r.w - 12 * s - value_x) / fw).max(1) as usize;
+        let mut y = r.y + 58 * s;
+        for (label, value) in &p.rows {
+            c.text(r.x + 16 * s, y, &format!("{}:", label), rgb(80, 85, 95), Font::Normal);
+            // Too long: the byte count in brackets goes first.
+            let value = if value.chars().count() > room { value.split("  (").next().unwrap_or(value) } else { value.as_str() };
+            let v: String = value.chars().take(room).collect();
+            c.text(value_x, y, &v, 0x101010, Font::Normal);
+            y += 24 * s;
+        }
+        if let Some((used, total)) = p.pie {
+            // Used in blue and free in magenta, as Windows draws it.
+            let rad = 50 * s;
+            let (cx, cy) = (r.x + 90 * s, y + 8 * s + rad);
+            let frac = if total == 0 { 0.0 } else { used as f32 / total as f32 };
+            let (blue, pink) = (rgb(38, 110, 210), rgb(200, 60, 170));
+            for dy in -rad..=rad {
+                for dx in -rad..=rad {
+                    if dx * dx + dy * dy > rad * rad {
+                        continue;
+                    }
+                    let turn = clockwise_turn(dx as f32, dy as f32);
+                    c.fill(Rect::new(cx + dx, cy + dy, 1, 1), if turn < frac { blue } else { pink });
+                }
+            }
+            c.rounded_outline(Rect::new(cx - rad, cy - rad, 2 * rad + 1, 2 * rad + 1), rad, false, rgb(90, 100, 120), 255);
+            let lx = cx + rad + 30 * s;
+            for (i, (color, text)) in [(blue, format!("Used  {}", space_text(used))), (pink, format!("Free  {}", space_text(total.saturating_sub(used))))]
+                .iter()
+                .enumerate()
+            {
+                let ly = cy - 20 * s + i as i32 * 28 * s;
+                c.fill(Rect::new(lx, ly + 2 * s, 12 * s, 12 * s), *color);
+                c.text(lx + 20 * s, ly, text, 0x101010, Font::Normal);
+            }
+        }
+        let ok = self.props_ok(client);
+        let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
+        let hover = ok.contains(px, py);
+        c.rounded(ok, 3 * s, false, rgb(250, 252, 255), if hover { rgb(190, 220, 250) } else { rgb(220, 230, 242) }, 255);
+        c.rounded_outline(ok, 3 * s, false, rgb(110, 135, 170), 255);
+        c.text(ok.x + (ok.w - Font::Normal.width(s, "OK")) / 2, ok.y + (ok.h - Font::Normal.h(s)) / 2, "OK", 0x101010, Font::Normal);
+    }
+
+    /// The button went down on selected entries: they may be dragged next.
+    fn press_drag(&mut self, x: i32, y: i32, collapse: Option<usize>) {
+        if self.files.path.is_empty() || self.files.path == BIN {
+            return;
+        }
+        let items = self.picked_items();
+        if !items.is_empty() {
+            self.file_drag = Some(FileDrag { x0: x, y0: y, items, active: false, collapse });
+        }
+    }
+
+    /// Where `path` lives: a drive's number, or a network drive's.
+    fn volume_of(&self, path: &str) -> Option<(bool, usize)> {
+        match net_path(path) {
+            Some((i, _)) => Some((true, i)),
+            None => self.drive_of(path).map(|d| (false, d)),
+        }
+    }
+
+    /// Where dropping the dragged files at (x, y) would put them: a folder
+    /// shown, a drive or the Recycle Bin in the pane, or a part of the
+    /// address. With what it would be called and what would happen:
+    /// Ctrl copies, Shift moves, and otherwise they move on the same drive
+    /// and are copied to another one, as in Windows.
+    fn drop_target(&self, x: i32, y: i32) -> Option<(String, String, DropAction)> {
+        let d = self.file_drag.as_ref()?;
+        let win = self.windows.last()?;
+        if win.kind != Kind::Computer || !win.shown() {
+            return None;
+        }
+        let c = self.files_client();
+        if !c.contains(x, y) {
+            return None;
+        }
+        let mut target = None;
+        let rows = self.files_rows(&c);
+        if rows.contains(x, y) && !self.files.path.is_empty() && self.files.path != BIN {
+            let i = self.files.scroll + ((y - rows.y) / self.files_row_h()) as usize;
+            if let Some(e) = self.files.entries.get(i) {
+                if e.is_dir && !self.is_marked(i) {
+                    target = Some((self.entry_path(i), e.name.clone()));
+                }
+            }
+        }
+        if self.files_pane(&c).contains(x, y) {
+            let places = self.places();
+            if let Some(i) = (0..places.len()).find(|&i| self.pane_item(&c, i).contains(x, y)) {
+                let (name, path, kind) = places[i].clone();
+                if kind != Place::Computer {
+                    target = Some((path, name));
+                }
+            }
+        }
+        if let Some((_, text, path)) = self.crumb_rects(&c).into_iter().find(|(r, _, _)| r.contains(x, y)) {
+            if !path.is_empty() && path != BIN {
+                target = Some((path, text));
+            }
+        }
+        let (dir, name) = target?;
+        if dir == BIN {
+            // Only what is on a drive with a Recycle Bin can go in it.
+            if d.items.iter().any(|it| self.recycle_root_of(&it.path).is_none()) {
+                return None;
+            }
+            return Some((dir, name, DropAction::Recycle));
+        }
+        if self.volume_of(&dir).is_none() {
+            return None;
+        }
+        // Not into itself, and not to where they already are.
+        if d.items.iter().any(|it| {
+            dir.eq_ignore_ascii_case(&it.path) || dir.to_lowercase().starts_with(&format!("{}/", it.path.to_lowercase()))
+        }) {
+            return None;
+        }
+        let keys = self.pointer.keys;
+        let same = d.items.iter().all(|it| self.volume_of(&it.path) == self.volume_of(&dir));
+        let action = if keys & aero::display::MOD_CTRL != 0 {
+            DropAction::Copy
+        } else if keys & aero::display::MOD_SHIFT != 0 || same {
+            DropAction::Move
+        } else {
+            DropAction::Copy
+        };
+        if action == DropAction::Move && d.items.iter().all(|it| split_path(&it.path).0.eq_ignore_ascii_case(&dir)) {
+            return None;
+        }
+        if action != DropAction::Recycle && self.files_drive_read_only(&dir) {
+            return None;
+        }
+        Some((dir, name, action))
+    }
+
+    /// Whether `path` is on a drive that can't be written (NTFS).
+    fn files_drive_read_only(&self, path: &str) -> bool {
+        if net_path(path).is_some() {
+            return false;
+        }
+        self.drive_of(path).map(|d| self.files.drives[d].read_only).unwrap_or(true)
+    }
+
+    /// The pointer moved or a button changed while files are pressed on or
+    /// dragged. Returns what to redraw.
+    fn file_drag_step(&mut self, p: aero::display::Pointer) -> Rect {
+        let Some(d) = self.file_drag.as_mut() else { return Rect::EMPTY };
+        let (x, y) = (p.x as i32, p.y as i32);
+        if p.buttons & 1 != 0 {
+            if !d.active && ((x - d.x0).abs() > 5 * self.ui || (y - d.y0).abs() > 5 * self.ui) {
+                d.active = true;
+                let n = d.items.len();
+                println!("[desktop] dragging {} item{}", n, if n == 1 { "" } else { "s" });
+            }
+            return if d.active { self.files_area().union(&self.cursor_rect()) } else { Rect::EMPTY };
+        }
+        let d = self.file_drag.take().unwrap();
+        if !d.active {
+            if let Some(i) = d.collapse {
+                if i < self.files.entries.len() {
+                    self.select(i);
+                }
+                return self.files_area();
+            }
+            return Rect::EMPTY;
+        }
+        // Dropped.
+        self.file_drag = Some(d);
+        let target = self.drop_target(x, y);
+        let d = self.file_drag.take().unwrap();
+        let area = self.files_area();
+        let Some((dir, name, action)) = target else {
+            self.files.status = String::from("Drop them on a folder, a drive or the Recycle Bin");
+            return area;
+        };
+        let n = d.items.len();
+        println!("[desktop] dropped {} item{} on {}: {}", n, if n == 1 { "" } else { "s" }, dir, match action {
+            DropAction::Move => "move",
+            DropAction::Copy => "copy",
+            DropAction::Recycle => "Recycle Bin",
+        });
+        let status = match action {
+            DropAction::Recycle => {
+                let r = self.delete_items(&d.items);
+                self.refresh(None);
+                r.unwrap_or_else(|m| m)
+            }
+            DropAction::Move | DropAction::Copy => {
+                let cut = action == DropAction::Move;
+                let (status, _) = self.transfer(&d.items, &dir, cut);
+                if !self.files.path.eq_ignore_ascii_case(&dir) {
+                    self.refresh(None);
+                }
+                if let Some(clip) = self.files.clip.as_mut() {
+                    // What was cut and has now moved can't be pasted.
+                    if cut {
+                        clip.items.retain(|it| !d.items.iter().any(|m| m.path == it.path));
+                    }
+                }
+                if self.files.clip.as_ref().is_some_and(|c| c.items.is_empty()) {
+                    self.files.clip = None;
+                }
+                let _ = name;
+                status
+            }
+        };
+        self.files.status = status;
+        area
     }
 
     /// A click inside the Computer window.
@@ -3457,6 +4324,16 @@ impl Desktop {
             }
             return Rect::EMPTY;
         }
+        if self.files.props.is_some() {
+            // OK, or a click anywhere else, closes it.
+            self.files.props = None;
+            return area;
+        }
+        if self.files_search(&c).contains(x, y) {
+            self.files.query_focus = true;
+            return area;
+        }
+        self.files.query_focus = false;
         for i in 0..3 {
             let (bx, by, br) = self.files_arrow(&c, i);
             if (x - bx) * (x - bx) + (y - by) * (y - by) <= br * br {
@@ -3544,14 +4421,35 @@ impl Desktop {
             return Rect::EMPTY;
         }
         let i = self.files.scroll + ((y - rows.y) / self.files_row_h()) as usize;
+        let keys = self.pointer.keys;
         if i >= self.files.entries.len() {
-            self.files.selected = None;
-            self.files.status = format!("{} items", self.files.entries.len());
+            if keys & (aero::display::MOD_CTRL | aero::display::MOD_SHIFT) == 0 {
+                self.files.selected = None;
+                self.files.marked.clear();
+                self.files.status = format!("{} items", self.files.entries.len());
+            }
             return area;
         }
-        self.select(i);
         if double {
+            self.select(i);
             return self.open_selected();
+        }
+        if keys & aero::display::MOD_CTRL != 0 {
+            self.toggle(i);
+        } else if keys & aero::display::MOD_SHIFT != 0 {
+            self.extend(i);
+        } else if self.is_marked(i) && self.picked().len() > 1 {
+            // Pressed on one of several selected: they stay selected so
+            // they can be dragged together; a plain click (no drag) leaves
+            // just this one selected when the button comes up.
+            self.files.selected = Some(i);
+            self.press_drag(x, y, Some(i));
+            return area;
+        } else {
+            self.select(i);
+        }
+        if keys & (aero::display::MOD_CTRL | aero::display::MOD_SHIFT) == 0 {
+            self.press_drag(x, y, None);
         }
         area
     }
@@ -3582,6 +4480,25 @@ impl Desktop {
         if self.files.form.is_some() {
             return self.form_key(k);
         }
+        if self.files.query_focus {
+            return self.search_key(k);
+        }
+        if self.files.props.is_some() {
+            if matches!(k, b'\n' | 27 | b' ') {
+                self.files.props = None;
+                return area;
+            }
+            return Rect::EMPTY;
+        }
+        if k == b'\n' && self.key_mods & aero::display::MOD_ALT != 0 {
+            // Alt+Enter.
+            return self.command(Command::Properties);
+        }
+        if k == 0x06 || k == 0x05 {
+            // Ctrl+F or Ctrl+E: to the search box.
+            self.files.query_focus = true;
+            return area;
+        }
         if self.files.confirm.is_some() {
             return match k {
                 b'\n' | b'y' | b'Y' => self.command(Command::Yes),
@@ -3608,6 +4525,10 @@ impl Desktop {
             0x16 => return self.command(Command::Paste),
             0x0E => return self.command(Command::NewFolder),
             0x1A => return self.undo_delete(),
+            0x01 => {
+                self.select_all();
+                return area;
+            }
             KEY_DOWN => at.map_or(0, |i| i + step),
             KEY_UP => at.map_or(0, |i| i.saturating_sub(step)),
             KEY_RIGHT if self.files.path.is_empty() => at.map_or(0, |i| i + 1),
@@ -3632,7 +4553,14 @@ impl Desktop {
         if count == 0 {
             return Rect::EMPTY;
         }
-        self.select(target.min(count - 1));
+        // Shift with an arrow (or Home, End, Page Up, Page Down) selects
+        // everything passed over.
+        let moving = matches!(k, KEY_DOWN | KEY_UP | KEY_PGDN | KEY_PGUP | KEY_HOME | KEY_END);
+        if moving && self.key_mods & aero::display::MOD_SHIFT != 0 && !self.files.path.is_empty() {
+            self.extend(target.min(count - 1));
+        } else {
+            self.select(target.min(count - 1));
+        }
         area
     }
 }
@@ -3731,6 +4659,87 @@ fn saved_network_drives() {
     }
 }
 
+/// 1234567 as "1,234,567".
+fn group(n: u64) -> String {
+    let digits = format!("{}", n);
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// How far round a circle (0 to 1, clockwise from the top) the point
+/// (dx, dy) from its middle is, for drawing a pie.
+fn clockwise_turn(dx: f32, dy: f32) -> f32 {
+    if dx == 0.0 && dy == 0.0 {
+        return 0.0;
+    }
+    // atan2 without the standard library: an octant, then a polynomial
+    // good to about a tenth of a degree.
+    let (ax, ay) = (if dx < 0.0 { -dx } else { dx }, if dy < 0.0 { -dy } else { dy });
+    let (a, b) = if ax > ay { (ay, ax) } else { (ax, ay) };
+    let t = a / b;
+    let t2 = t * t;
+    let mut angle = ((-0.0464964749 * t2 + 0.15931422) * t2 - 0.327622764) * t2 * t + t;
+    if ay > ax {
+        angle = core::f32::consts::FRAC_PI_2 - angle;
+    }
+    // angle is from the x axis towards y, in the first quadrant; turn it
+    // into "clockwise from up" with y pointing down the screen.
+    let full = match (dx >= 0.0, dy >= 0.0) {
+        (true, false) => core::f32::consts::FRAC_PI_2 - angle,
+        (true, true) => core::f32::consts::FRAC_PI_2 + angle,
+        (false, true) => 3.0 * core::f32::consts::FRAC_PI_2 - angle,
+        (false, false) => 3.0 * core::f32::consts::FRAC_PI_2 + angle,
+    };
+    full / (2.0 * core::f32::consts::PI)
+}
+
+/// What a folder holds: bytes, files and folders, all the way down (up to
+/// SEARCH_LOOKS names).
+fn tree_size(path: &str) -> (u64, usize, usize) {
+    let (mut bytes, mut files, mut dirs) = (0u64, 0usize, 0usize);
+    let mut stack = alloc::vec![String::from(path)];
+    while let Some(dir) = stack.pop() {
+        for e in fs_list(&dir).unwrap_or_default() {
+            if e.is_dir {
+                dirs += 1;
+                stack.push(join(&dir, &e.name));
+            } else {
+                files += 1;
+                bytes += e.size;
+            }
+        }
+        if files + dirs >= SEARCH_LOOKS {
+            break;
+        }
+    }
+    (bytes, files, dirs)
+}
+
+/// Whether `name` matches a search: a pattern with * and ? matches whole
+/// names; anything else matches names containing it. Both lowercase.
+fn name_matches(name: &str, pattern: &str) -> bool {
+    if !pattern.contains(['*', '?']) {
+        return name.contains(pattern);
+    }
+    fn glob(n: &[char], p: &[char]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some(('*', rest)) => (0..=n.len()).any(|i| glob(&n[i..], rest)),
+            Some(('?', rest)) => !n.is_empty() && glob(&n[1..], rest),
+            Some((c, rest)) => n.first() == Some(c) && glob(&n[1..], rest),
+        }
+    }
+    let n: Vec<char> = name.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    glob(&n, &p)
+}
+
 /// A file size the way Explorer shows it: whole kilobytes, rounded up.
 fn size_text(bytes: u64) -> String {
     if bytes >= 10 * 1024 * 1024 * 1024 {
@@ -3808,6 +4817,8 @@ fn main() -> i64 {
             drives: Vec::new(),
             scroll: 0,
             selected: None,
+            marked: Vec::new(),
+            anchor: None,
             status: String::new(),
             back: Vec::new(),
             forward: Vec::new(),
@@ -3818,13 +4829,21 @@ fn main() -> i64 {
             rename_all: false,
             confirm: None,
             bin: Vec::new(),
-            last_recycled: None,
+            last_recycled: Vec::new(),
             form: None,
+            query: String::new(),
+            query_focus: false,
+            searched_in: String::new(),
+            results: Vec::new(),
+            found: Vec::new(),
+            props: None,
         },
         calc: Calc { display: String::from("0"), ..Default::default() },
         icon: None,
         mouse_speed: { saved_network_drives(); saved_mouse_speed() },
         last_press: (0, 0, 0),
+        file_drag: None,
+        key_mods: 0,
     };
     let mut canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
     present(&screen, &mut canvas, &desk, Rect::new(0, 0, w, h));
@@ -3834,7 +4853,7 @@ fn main() -> i64 {
     println!("[desktop] up at {}x{}; Notes title bar at {},{}; Computer icon at {},{}; Calculator icon at {},{}", w, h,
         notes.x + 60 * s, notes.y + 12 * s, icon.x + icon.w / 2, icon.y + icon.h / 2, calc.x + calc.w / 2, calc.y + calc.h / 2);
 
-    let mut keys = [0u8; 64];
+    let mut keys = [(0u8, 0u8); 64];
     let mut tick = 0u64;
     // How long redraws take after the pointer moves, for the log.
     let (mut moves, mut move_us, mut worst_us) = (0u64, 0u64, 0u64);
@@ -3923,11 +4942,14 @@ fn main() -> i64 {
                     dirty = dirty.union(&desk.window_area(i));
                 }
             }
+            if desk.file_drag.is_some() {
+                dirty = dirty.union(&desk.file_drag_step(p));
+            }
             if desk.top_kind() == Some(Kind::System) {
                 dirty = dirty.union(&desk.window_area(desk.windows.len() - 1));
             }
         }
-        if let Ok(n) = screen.keys(&mut keys) {
+        if let Ok(n) = screen.keys_with_modifiers(&mut keys) {
             dirty = dirty.union(&desk.typed(&keys[..n]));
         }
         // Twice a second: the clock, the System window and the Notes caret.

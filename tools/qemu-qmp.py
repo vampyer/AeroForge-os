@@ -2,6 +2,8 @@
 """Sends input to a QEMU guest over QMP, for what the human monitor cannot do.
 
 Usage: qemu-qmp.py <qmp socket> abs <x> <y>   (absolute pointer, 0..32767 each)
+       qemu-qmp.py <qmp socket> down <key>     (hold a key down: ctrl, shift, alt, ...)
+       qemu-qmp.py <qmp socket> up <key>       (let it go)
 """
 import json
 import socket
@@ -29,4 +31,7 @@ if sys.argv[2] == 'abs':
     x, y = int(sys.argv[3]), int(sys.argv[4])
     call('input-send-event', events=[{'type': 'abs', 'data': {'axis': 'x', 'value': x}},
                                      {'type': 'abs', 'data': {'axis': 'y', 'value': y}}])
+elif sys.argv[2] in ('down', 'up'):
+    call('input-send-event', events=[{'type': 'key', 'data': {'down': sys.argv[2] == 'down',
+                                                              'key': {'type': 'qcode', 'data': sys.argv[3]}}}])
 s.close()

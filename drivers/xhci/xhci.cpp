@@ -2048,6 +2048,14 @@ private:
             ev.key.modifiers = modifiers;
             enqueue(ev);
         }
+        // Shift, Ctrl or Alt alone went down or up: say so (no character),
+        // so programs know what is held for Ctrl+click and the like.
+        if (r[0] != d.last_keys[0]) {
+            dhi_input_event ev{};
+            ev.kind = DHI_INPUT_KEY;
+            ev.key.modifiers = modifiers;
+            enqueue(ev);
+        }
         for (int i = 0; i < 8; ++i) d.last_keys[i] = r[i];
     }
 
