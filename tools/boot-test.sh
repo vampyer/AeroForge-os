@@ -485,7 +485,7 @@ for _ in $(seq "$TIMEOUT"); do
         # Right-click the empty space under it: Paste is on now; Refresh.
         read -r RX RY RH <<< "$(grep -ao "Computer: /games = .*first row at [0-9]*,[0-9]*, rows [0-9]*" "$LOG" | tail -1 | sed 's/.*first row at //' | tr -c '0-9\n' ' ')"
         sleep 0.5; point_at "$RX" $((RY + 4 * RH)); monitor "mouse_button 2" "mouse_button 0"; STAGE=menuspace
-    elif [ $STAGE = menuspace ] && grep -q "\[desktop\] menu: Refresh at [0-9,]* | Paste at " "$LOG"; then
+    elif [ $STAGE = menuspace ] && grep -q "\[desktop\] menu: .*Refresh at [0-9,]* | Paste at " "$LOG"; then
         sleep 0.5; point_at $(menu_item Refresh); monitor "mouse_button 1" "mouse_button 0"; STAGE=menurefresh
     elif [ $STAGE = menurefresh ] && grep -q "\[desktop\] menu: chose Refresh" "$LOG"; then
         # Large icons from the same menu, then back to Details.
