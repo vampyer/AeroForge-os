@@ -635,6 +635,9 @@ enum Command {
     /// The Recycle Bin's own commands.
     Restore,
     Empty,
+    /// Computer's: network drives.
+    Map,
+    Disconnect,
     /// The answers to "Delete ...?".
     Yes,
     No,
@@ -648,6 +651,8 @@ const COMMANDS: [(Command, &str); 6] = [
     (Command::Rename, "Rename"),
     (Command::Delete, "Delete"),
 ];
+
+const COMPUTER_COMMANDS: [(Command, &str); 2] = [(Command::Map, "Map network drive"), (Command::Disconnect, "Disconnect")];
 
 const BIN_COMMANDS: [(Command, &str); 3] =
     [(Command::Restore, "Restore"), (Command::Delete, "Delete"), (Command::Empty, "Empty Recycle Bin")];
@@ -689,6 +694,26 @@ struct Clip {
     cut: bool,
 }
 
+/// "Map network drive": where, and who to sign in as.
+struct MapForm {
+    /// Folder ("\\\\server\\share"), user name, password.
+    fields: [String; 3],
+    focus: usize,
+    /// Why the last try failed.
+    error: String,
+    /// Signing in again to this saved drive, rather than adding one.
+    share: Option<usize>,
+}
+
+/// What a row of the navigation pane is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Computer,
+    Drive,
+    Network,
+    Bin,
+}
+
 /// What the Computer window (the file manager) shows and is doing.
 struct Files {
     /// The folder shown, or "" for Computer itself: the drives.
@@ -716,6 +741,8 @@ struct Files {
     bin: Vec<Recycled>,
     /// The last thing deleted, for Ctrl+Z.
     last_recycled: Option<Recycled>,
+    /// "Map network drive" is open (in Computer, over the drives).
+    form: Option<MapForm>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1571,7 +1598,7 @@ impl Desktop {
         if let Ok(now) = aero::mouse_speed(Some(speed)) {
             self.mouse_speed = now;
         }
-        let saved = aero::write_file(SETTINGS, format!("mouse speed = {}\n", self.mouse_speed).as_bytes()).is_ok();
+        let saved = self.save_settings();
         println!("[desktop] mouse speed {}{}", self.mouse_speed, if saved { ", saved" } else { "" });
     }
 
@@ -1610,10 +1637,9 @@ impl Desktop {
         }
         let path = self.notes_path.clone().unwrap_or_else(|| String::from("/Notes.txt"));
         let data = self.notes.as_bytes();
-        self.notes_status = match aero::write_file(&path, data) {
+        self.notes_status = match fs_write(&path, data) {
             Ok(_) => {
-                let mut back = alloc::vec![0u8; data.len() + 1];
-                let same = matches!(aero::read_file(&path, &mut back), Ok(n) if &back[..n] == data);
+                let same = matches!(fs_read(&path, data.len() + 1), Ok(back) if back == data);
                 println!("[desktop] saved {} ({} bytes, {})", path, data.len(), if same { "read back the same" } else { "read back different" });
                 self.notes_path = Some(path);
                 String::from(if same { "Saved" } else { "Saved, but it reads back different" })
@@ -1624,6 +1650,7 @@ impl Desktop {
                     aero::E_RIGHTS => "Can't save here (read-only)",
                     aero::E_FULL => "Can't save: the disk is full",
                     aero::E_NOTFOUND => "Can't save: no disk there",
+                    aero::E_CLOSED => "Can't save: the network drive is not connected",
                     _ => "Can't save that file",
                 })
             }
@@ -1633,23 +1660,23 @@ impl Desktop {
 
     /// Opens a text file in Notes.
     fn open_file(&mut self, path: String) -> Rect {
-        let mut buf = alloc::vec![0u8; 4096];
-        let n = match aero::read_file(&path, &mut buf) {
-            Ok(n) => n,
+        let buf = match fs_read(&path, 4096) {
+            Ok(b) => b,
             Err(e) => {
                 println!("[desktop] cannot read {} ({})", path, e);
                 self.files.status = String::from("Can't read that file");
                 return self.files_area();
             }
         };
-        let text = &buf[..n];
+        let n = buf.len();
+        let text = &buf[..];
         if text.iter().any(|&b| b == 0 || (b < 32 && b != b'\n' && b != b'\r' && b != b'\t')) {
             self.files.status = String::from("Notes can only open text files");
             return self.files_area();
         }
         self.notes = String::from_utf8_lossy(text).replace('\r', "").replace('\t', "    ");
         // Only the start of a long file fits; saving that would cut the file.
-        self.notes_cut = n == buf.len() || self.notes.len() > 3000;
+        self.notes_cut = n >= 4096 || self.notes.len() > 3000;
         while self.notes.len() > 3000 {
             self.notes.pop();
         }
@@ -1665,7 +1692,7 @@ impl Desktop {
         for &k in keys {
             // Esc gives the screen back, unless the Computer window is
             // in front and waiting for a new name or a Yes or No.
-            let files_busy = self.files.rename.is_some() || self.files.confirm.is_some();
+            let files_busy = self.files.rename.is_some() || self.files.confirm.is_some() || self.files.form.is_some();
             if self.top_kind() == Some(Kind::Computer) && (k != 27 || files_busy) {
                 dirty = dirty.union(&self.files_key(k));
                 continue;
@@ -1753,17 +1780,150 @@ fn fs_error_text(e: i64) -> &'static str {
         aero::E_FULL => "the disk is full",
         aero::E_NOTFOUND => "it is not there any more",
         aero::E_EXISTS => "something with that name is already there",
+        aero::E_CLOSED => "the network drive is not connected",
         _ => "the disk refused it",
     }
+}
+
+// ------------------------------------------------------- network drives
+
+/// A mapped network drive: a share on another computer (SMB 2).
+struct NetShare {
+    /// "192.168.1.20", "nas" or "10.0.2.2:4450".
+    host: String,
+    share: String,
+    user: String,
+    /// Kept for this session only, to sign in again if the link drops;
+    /// never saved to the disk.
+    password: Option<String>,
+    client: Option<aero::smb::Client>,
+    letter: char,
+}
+
+impl NetShare {
+    /// Its path in the Computer window: "//host/share".
+    fn root(&self) -> String {
+        format!("//{}/{}", self.host, self.share)
+    }
+    /// The way Windows writes it: "\\host\share".
+    fn unc(&self) -> String {
+        format!("\\\\{}\\{}", self.host, self.share)
+    }
+    fn name(&self) -> String {
+        format!("{} on {} ({}:)", self.share, self.host, self.letter)
+    }
+}
+
+/// The mapped network drives. The desktop has one thread, so a plain cell
+/// does; the free functions below (copy, delete, ...) reach it too.
+struct NetCell(core::cell::UnsafeCell<Vec<NetShare>>);
+unsafe impl Sync for NetCell {}
+static NET: NetCell = NetCell(core::cell::UnsafeCell::new(Vec::new()));
+
+fn shares() -> &'static mut Vec<NetShare> {
+    // SAFETY: only the desktop's one thread touches it, and no reference
+    // is kept across calls.
+    unsafe { &mut *NET.0.get() }
+}
+
+/// The mapped share a "//host/share/..." path is on, and the path inside it.
+fn net_path(path: &str) -> Option<(usize, String)> {
+    let rest = path.strip_prefix("//")?;
+    let mut parts = rest.splitn(3, '/');
+    let (host, share) = (parts.next()?, parts.next()?);
+    let inner = String::from(parts.next().unwrap_or(""));
+    let i = shares().iter().position(|s| s.host.eq_ignore_ascii_case(host) && s.share.eq_ignore_ascii_case(share))?;
+    Some((i, inner))
+}
+
+/// Runs `f` on share `i`'s connection, signing in again once if the link dropped.
+fn with_share<T>(i: usize, f: impl Fn(&mut aero::smb::Client) -> Result<T, i64>) -> Result<T, i64> {
+    let s = &mut shares()[i];
+    if let Some(c) = s.client.as_mut() {
+        match f(c) {
+            Err(aero::E_CLOSED) | Err(aero::E_TIMEDOUT) => s.client = None,
+            r => return r,
+        }
+    }
+    let Some(password) = s.password.clone() else { return Err(aero::E_CLOSED) };
+    match aero::smb::Client::connect(&s.host, &s.share, &s.user, &password) {
+        Ok(c) => {
+            println!("[desktop] signed in to {} again", s.unc());
+            f(s.client.insert(c))
+        }
+        Err(msg) => {
+            println!("[desktop] {}: {}", s.unc(), msg);
+            Err(aero::E_CLOSED)
+        }
+    }
+}
+
+// Files on the local drives or on network drives, by path.
+
+fn fs_list(path: &str) -> Result<Vec<aero::DirEntry>, i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.list(&inner)),
+        None => aero::list_dir(path),
+    }
+}
+
+fn fs_read(path: &str, limit: usize) -> Result<Vec<u8>, i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.read(&inner, limit)),
+        None => {
+            let mut buf = alloc::vec![0u8; limit];
+            let n = aero::read_file(path, &mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+    }
+}
+
+fn fs_write(path: &str, data: &[u8]) -> Result<(), i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.write(&inner, data)),
+        None => aero::write_file(path, data).map(|_| ()),
+    }
+}
+
+fn fs_mkdir(path: &str) -> Result<(), i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.create_dir(&inner)),
+        None => aero::create_dir(path),
+    }
+}
+
+fn fs_delete(path: &str, is_dir: bool) -> Result<(), i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.delete(&inner, is_dir)),
+        None => aero::delete_file(path),
+    }
+}
+
+/// Renames in place when both paths are on the same network share (local
+/// drives have no rename call yet). None when it can't be done that way.
+fn fs_rename(from: &str, to: &str) -> Option<Result<(), i64>> {
+    let (i, a) = net_path(from)?;
+    let (j, b) = net_path(to)?;
+    (i == j).then(|| with_share(i, |c| c.rename(&a, &b)))
+}
+
+/// Moves a file or folder: a rename on one network share, else copy and delete.
+fn move_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<(), String> {
+    if let Some(r) = fs_rename(from, to) {
+        return r.map_err(|e| format!("Can't move {}: {}", from, fs_error_text(e)));
+    }
+    copy_tree(from, to, is_dir, size)?;
+    delete_tree(from, is_dir).map(|_| ())
 }
 
 /// Copies a file, or a folder and all it holds, to `to`. Returns how many
 /// files it copied.
 fn copy_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<usize, String> {
     if is_dir {
-        aero::create_dir(to).map_err(|e| format!("Can't make {}: {}", to, fs_error_text(e)))?;
+        fs_mkdir(to).map_err(|e| format!("Can't make {}: {}", to, fs_error_text(e)))?;
         let mut n = 0;
-        for e in aero::list_dir(from).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))? {
+        for e in fs_list(from).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))? {
             n += copy_tree(&join(from, &e.name), &join(to, &e.name), e.is_dir, e.size)?;
         }
         return Ok(n);
@@ -1771,9 +1931,8 @@ fn copy_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<usize, Str
     if size > MAX_COPY {
         return Err(format!("{} is too big to copy here yet (8 MB at most)", split_path(from).1));
     }
-    let mut buf = alloc::vec![0u8; size as usize + 1];
-    let n = aero::read_file(from, &mut buf).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))?;
-    aero::write_file(to, &buf[..n]).map_err(|e| format!("Can't write {}: {}", to, fs_error_text(e)))?;
+    let data = fs_read(from, size as usize + 1).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))?;
+    fs_write(to, &data).map_err(|e| format!("Can't write {}: {}", to, fs_error_text(e)))?;
     Ok(1)
 }
 
@@ -1781,11 +1940,11 @@ fn copy_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<usize, Str
 fn delete_tree(path: &str, is_dir: bool) -> Result<usize, String> {
     let mut n = 0;
     if is_dir {
-        for e in aero::list_dir(path).map_err(|e| format!("Can't read {}: {}", path, fs_error_text(e)))? {
+        for e in fs_list(path).map_err(|e| format!("Can't read {}: {}", path, fs_error_text(e)))? {
             n += delete_tree(&join(path, &e.name), e.is_dir)?;
         }
     }
-    aero::delete_file(path).map_err(|e| format!("Can't delete {}: {}", path, fs_error_text(e)))?;
+    fs_delete(path, is_dir).map_err(|e| format!("Can't delete {}: {}", path, fs_error_text(e)))?;
     Ok(n + 1)
 }
 
@@ -1851,6 +2010,14 @@ fn free_name(name: &str, taken: &[&str], is_dir: bool, copy: bool) -> String {
 
 impl Canvas {
     /// A hard drive, 32 x 22 at scale 1: a grey box with a green light.
+    /// A network drive: the drive on a cable and a green network bar.
+    fn net_drive(&mut self, x: i32, y: i32, s: i32, connected: bool) {
+        self.drive(x, y - 3 * s, s, false);
+        self.fill(Rect::new(x + 15 * s, y + 19 * s, 3 * s, 4 * s), rgb(60, 70, 85));
+        let bar = if connected { rgb(40, 160, 70) } else { rgb(170, 60, 50) };
+        self.fill(Rect::new(x + 4 * s, y + 23 * s, 24 * s, 3 * s), bar);
+    }
+
     fn drive(&mut self, x: i32, y: i32, s: i32, removable: bool) {
         let body = Rect::new(x, y + 6 * s, 32 * s, 16 * s);
         let (top, bottom) = if removable { (rgb(120, 170, 230), rgb(40, 90, 170)) } else { (rgb(210, 215, 222), rgb(130, 136, 146)) };
@@ -1861,11 +2028,16 @@ impl Canvas {
     }
 
     /// The small drive for the navigation pane, 16 x 12 at scale 1.
-    fn small_drive(&mut self, x: i32, y: i32, s: i32) {
-        let body = Rect::new(x, y + 3 * s, 16 * s, 9 * s);
+    fn small_drive(&mut self, x: i32, y: i32, s: i32, network: bool) {
+        let body = Rect::new(x, y + 1 * s, 16 * s, 9 * s);
         self.gradient(body, rgb(215, 220, 228), rgb(140, 146, 156), 255);
         self.frame(body, rgb(90, 96, 106));
-        self.fill(Rect::new(x + 11 * s, y + 8 * s, 3 * s, 2 * s), rgb(80, 220, 90));
+        self.fill(Rect::new(x + 11 * s, y + 6 * s, 3 * s, 2 * s), rgb(80, 220, 90));
+        if network {
+            // A cable down to a green bar: a network drive.
+            self.fill(Rect::new(x + 7 * s, y + 10 * s, 2 * s, 2 * s), rgb(60, 70, 85));
+            self.fill(Rect::new(x + 2 * s, y + 12 * s, 12 * s, 2 * s), rgb(40, 150, 70));
+        }
     }
 
     /// A small wastebasket for the Recycle Bin, 14 x 16 at scale 1.
@@ -1989,6 +2161,8 @@ impl Desktop {
             &[(Command::Yes, "Yes"), (Command::No, "No")]
         } else if self.files.path == BIN {
             &BIN_COMMANDS
+        } else if self.files.path.is_empty() {
+            &COMPUTER_COMMANDS
         } else {
             &COMMANDS
         };
@@ -2025,7 +2199,7 @@ impl Desktop {
 
     /// The drive a path is on.
     fn drive_of(&self, path: &str) -> Option<usize> {
-        if !path.starts_with('/') {
+        if !path.starts_with('/') || path.starts_with("//") {
             return None;
         }
         let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
@@ -2048,6 +2222,9 @@ impl Desktop {
     }
     /// The folder shown is on a read-only drive (or is Computer itself).
     fn files_read_only(&self) -> bool {
+        if net_path(&self.files.path).is_some() {
+            return false;
+        }
         self.drive_of(&self.files.path).map(|d| self.files.drives[d].read_only).unwrap_or(true)
     }
     fn selected_entry(&self) -> Option<aero::DirEntry> {
@@ -2069,8 +2246,29 @@ impl Desktop {
             Command::Delete if self.files.path == BIN => picked,
             Command::Delete => picked && writable,
             Command::Empty => !self.files.bin.is_empty(),
+            Command::Map => !folder && self.files.form.is_none(),
+            Command::Disconnect => !folder && self.files.selected.is_some_and(|i| i >= self.files.drives.len()),
             Command::Yes | Command::No => true,
         }
+    }
+
+    /// The navigation pane's rows: Computer, the drives, the network
+    /// drives and the Recycle Bin, as (shown as, path, kind).
+    fn places(&self) -> Vec<(String, String, Place)> {
+        let mut out = alloc::vec![(String::from("Computer"), String::new(), Place::Computer)];
+        for i in 0..self.files.drives.len() {
+            out.push((self.drive_name(i), self.files.drives[i].path.clone(), Place::Drive));
+        }
+        for sh in shares().iter() {
+            out.push((sh.name(), sh.root(), Place::Network));
+        }
+        out.push((String::from("Recycle Bin"), String::from(BIN), Place::Bin));
+        out
+    }
+
+    /// How many tiles Computer shows: the drives, then the network drives.
+    fn tile_count(&self) -> usize {
+        self.files.drives.len() + shares().len()
     }
 
     /// The parts of the address: (shown as, path to go to).
@@ -2079,6 +2277,15 @@ impl Desktop {
             return alloc::vec![(String::from("Recycle Bin"), String::from(BIN))];
         }
         let mut out = alloc::vec![(String::from("Computer"), String::new())];
+        if let Some((i, inner)) = net_path(&self.files.path) {
+            let mut at = shares()[i].root();
+            out.push((shares()[i].name(), at.clone()));
+            for part in inner.split('/').filter(|p| !p.is_empty()) {
+                at = join(&at, part);
+                out.push((String::from(part), at.clone()));
+            }
+            return out;
+        }
         let Some(d) = self.drive_of(&self.files.path) else { return out };
         let root = self.files.drives[d].path.clone();
         out.push((self.drive_name(d), root.clone()));
@@ -2195,18 +2402,17 @@ impl Desktop {
         c.fill(Rect::new(pane.x + pane.w, pane.y, 1, pane.h), rgb(205, 215, 230));
         let here = self.drive_of(&f.path);
         let pane_cols = ((pane.w - 34 * s) / Font::Normal.w(s)).max(1) as usize;
-        let bin_item = f.drives.len() + 1;
-        for i in 0..=bin_item {
+        let net_here = net_path(&f.path).map(|(i, _)| i);
+        for (i, (text, path, icon)) in self.places().into_iter().enumerate() {
             let r = self.pane_item(client, i);
             if r.y + r.h > pane.y + pane.h {
                 break;
             }
-            let current = if i == 0 {
-                !in_folder
-            } else if i == bin_item {
-                f.path == BIN
-            } else {
-                here == Some(i - 1)
+            let current = match icon {
+                Place::Computer => !in_folder,
+                Place::Bin => f.path == BIN,
+                Place::Drive => here.is_some_and(|d| f.drives[d].path == path),
+                Place::Network => net_here.is_some_and(|n| shares()[n].root() == path),
             };
             let box_ = Rect::new(r.x + 3 * s, r.y + s, r.w - 6 * s, r.h - 2 * s);
             if current {
@@ -2215,19 +2421,12 @@ impl Desktop {
             } else if r.contains(px, py) {
                 c.rounded(box_, 2 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
             }
-            let (text, ix) = if i == 0 {
-                (String::from("Computer"), 8 * s)
-            } else if i == bin_item {
-                (String::from("Recycle Bin"), 8 * s)
-            } else {
-                (self.drive_name(i - 1), 18 * s)
-            };
-            if i == 0 {
-                c.small_computer(r.x + ix, r.y + (r.h - 14 * s) / 2, s);
-            } else if i == bin_item {
-                c.small_bin(r.x + ix + s, r.y + (r.h - 16 * s) / 2, s);
-            } else {
-                c.small_drive(r.x + ix, r.y + (r.h - 12 * s) / 2, s);
+            let ix = if matches!(icon, Place::Drive | Place::Network) { 18 * s } else { 8 * s };
+            match icon {
+                Place::Computer => c.small_computer(r.x + ix, r.y + (r.h - 14 * s) / 2, s),
+                Place::Bin => c.small_bin(r.x + ix + s, r.y + (r.h - 16 * s) / 2, s),
+                Place::Drive => c.small_drive(r.x + ix, r.y + (r.h - 12 * s) / 2, s, false),
+                Place::Network => c.small_drive(r.x + ix, r.y + (r.h - 12 * s) / 2, s, true),
             }
             let room = pane_cols.saturating_sub(if ix > 8 * s { 1 } else { 0 });
             let shown: String = text.chars().take(room).collect();
@@ -2264,7 +2463,11 @@ impl Desktop {
         let f = &self.files;
         let k = self.files_content(client);
         let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
-        let heading = format!("Drives ({})", f.drives.len());
+        if f.form.is_some() {
+            self.form_view(c, client);
+            return;
+        }
+        let heading = format!("Drives ({})", self.tile_count());
         c.text(k.x + 12 * s, k.y + 8 * s, &heading, rgb(30, 57, 145), Font::Normal);
         let line_x = k.x + 24 * s + Font::Normal.width(s, &heading);
         c.fill(Rect::new(line_x, k.y + 8 * s + Font::Normal.h(s) / 2, k.x + k.w - 12 * s - line_x, 1), rgb(200, 215, 235));
@@ -2306,6 +2509,211 @@ impl Desktop {
             let detail: String = detail.chars().take(small_cols).collect();
             c.text(tx, t.y + 43 * s, &detail, rgb(90, 95, 105), Font::Small);
         }
+        for (n, sh) in shares().iter().enumerate() {
+            let i = f.drives.len() + n;
+            let t = self.drive_tile(client, i);
+            if t.y + t.h > k.y + k.h {
+                break;
+            }
+            if f.selected == Some(i) {
+                c.rounded(t, 3 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
+                c.rounded_outline(t, 3 * s, false, rgb(125, 162, 206), 255);
+            } else if t.contains(px, py) {
+                c.rounded(t, 3 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
+                c.rounded_outline(t, 3 * s, false, rgb(185, 210, 238), 255);
+            }
+            c.net_drive(t.x + 8 * s, t.y + 14 * s, s, sh.client.is_some());
+            let tx = t.x + 50 * s;
+            let cols = ((t.x + t.w - 8 * s - tx) / Font::Normal.w(s)).max(1) as usize;
+            let name: String = sh.name().chars().take(cols).collect();
+            c.text(tx, t.y + 4 * s, &name, 0x101010, Font::Normal);
+            let detail = if sh.client.is_some() { format!("{}, signed in as {}", sh.unc(), sh.user) } else { format!("{}, not connected", sh.unc()) };
+            let small_cols = ((t.x + t.w - 8 * s - tx) / Font::Small.w(s)).max(1) as usize;
+            let detail: String = detail.chars().take(small_cols).collect();
+            c.text(tx, t.y + 34 * s, &detail, rgb(90, 95, 105), Font::Small);
+        }
+    }
+
+    // The "Map network drive" form, in Computer's content area.
+    fn form_field(&self, c: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let k = self.files_content(c);
+        Rect::new(k.x + 20 * s, k.y + 96 * s + i as i32 * 62 * s, (k.w - 40 * s).min(440 * s), 30 * s)
+    }
+    fn form_button(&self, c: &Rect, connect: bool) -> Rect {
+        let s = self.ui;
+        let last = self.form_field(c, 2);
+        Rect::new(last.x + if connect { 0 } else { 116 * s }, last.y + last.h + 16 * s, 106 * s, 32 * s)
+    }
+
+    fn form_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        let Some(form) = &self.files.form else { return };
+        let k = self.files_content(client);
+        let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
+        c.text(k.x + 20 * s, k.y + 10 * s, "Map a network drive", rgb(30, 57, 145), Font::Normal);
+        c.text(k.x + 20 * s, k.y + 40 * s, "A shared folder on another computer,", rgb(80, 85, 95), Font::Small);
+        c.text(k.x + 20 * s, k.y + 60 * s, "like \\\\192.168.1.20\\Users", rgb(80, 85, 95), Font::Small);
+        let fw = Font::Normal.w(s);
+        for (i, label) in ["Folder", "User name", "Password"].iter().enumerate() {
+            let r = self.form_field(client, i);
+            c.text(r.x, r.y - 22 * s, label, rgb(40, 50, 70), Font::Small);
+            c.fill(r, 0xFFFFFF);
+            let focused = form.focus == i;
+            c.frame(r, if focused { rgb(60, 110, 190) } else { rgb(150, 160, 175) });
+            let text: String = if i == 2 { "*".repeat(form.fields[2].chars().count()) } else { form.fields[i].clone() };
+            let room = ((r.w - 12 * s) / fw).max(1) as usize;
+            let skip = text.chars().count().saturating_sub(room.saturating_sub(1));
+            let shown: String = text.chars().skip(skip).collect();
+            let ty = r.y + (r.h - Font::Normal.h(s)) / 2;
+            c.text(r.x + 6 * s, ty, &shown, 0x101010, Font::Normal);
+            if focused {
+                let caret = r.x + 6 * s + shown.chars().count() as i32 * fw;
+                c.fill(Rect::new(caret, ty + 2 * s, s.max(2), Font::Normal.h(s) - 4 * s), 0x101010);
+            }
+        }
+        for (connect, label) in [(true, "Connect"), (false, "Cancel")] {
+            let b = self.form_button(client, connect);
+            let hot = b.contains(px, py);
+            let (top, bottom) = if hot { (rgb(250, 252, 255), rgb(190, 215, 245)) } else { (rgb(250, 251, 253), rgb(220, 228, 238)) };
+            c.rounded(b, 3 * s, false, top, bottom, 255);
+            c.rounded_outline(b, 3 * s, false, rgb(110, 130, 160), 255);
+            c.text(b.x + (b.w - Font::Normal.width(s, label)) / 2, b.y + (b.h - Font::Normal.h(s)) / 2, label, rgb(20, 40, 80), Font::Normal);
+        }
+        if !form.error.is_empty() {
+            let b = self.form_button(client, true);
+            let room = ((k.x + k.w - 20 * s - b.x) / Font::Small.w(s)).max(1) as usize;
+            let e: String = form.error.chars().take(room).collect();
+            c.text(b.x, b.y + b.h + 12 * s, &e, rgb(170, 30, 20), Font::Small);
+        }
+    }
+
+    /// Opens "Map network drive", empty or to sign in to saved drive `share` again.
+    fn open_form(&mut self, share: Option<usize>) -> Rect {
+        if !self.files.path.is_empty() {
+            self.navigate(String::new());
+        }
+        let mut fields = [String::new(), String::new(), String::new()];
+        let mut focus = 0;
+        if let Some(i) = share {
+            fields[0] = shares()[i].unc();
+            fields[1] = shares()[i].user.clone();
+            focus = 2;
+        }
+        self.files.form = Some(MapForm { fields, focus, error: String::new(), share });
+        self.files.status = String::from("Tab moves between the boxes, Enter connects, Esc cancels");
+        let c = self.files_client();
+        let f: Vec<String> = (0..3).map(|i| { let r = self.form_field(&c, i); format!("{},{}", r.x + 20 * self.ui, r.y + r.h / 2) }).collect();
+        let b = self.form_button(&c, true);
+        println!("[desktop] map form: fields at {}; Connect at {},{}", f.join(" | "), b.x + b.w / 2, b.y + b.h / 2);
+        self.files_area()
+    }
+
+    /// Connects the drive the form describes.
+    fn form_connect(&mut self) -> Rect {
+        let area = self.files_area();
+        let Some(form) = self.files.form.as_mut() else { return area };
+        let folder = form.fields[0].trim().replace('\\', "/");
+        let mut parts = folder.trim_start_matches('/').split('/').filter(|p| !p.is_empty());
+        let (Some(host), Some(share)) = (parts.next(), parts.next()) else {
+            form.error = String::from("Type the folder as \\\\computer\\share");
+            form.focus = 0;
+            return area;
+        };
+        let (host, share) = (String::from(host), String::from(share));
+        let (user, password) = (String::from(form.fields[1].trim()), form.fields[2].clone());
+        if user.is_empty() {
+            form.error = String::from("Type the user name to sign in with");
+            form.focus = 1;
+            return area;
+        }
+        let again = form.share;
+        let unc = format!("\\\\{}\\{}", host, share);
+        match aero::smb::Client::connect(&host, &share, &user, &password) {
+            Ok(client) => {
+                let existing = again.or_else(|| shares().iter().position(|s| s.host.eq_ignore_ascii_case(&host) && s.share.eq_ignore_ascii_case(&share)));
+                let i = match existing {
+                    Some(i) => {
+                        let sh = &mut shares()[i];
+                        sh.host = host;
+                        sh.share = share;
+                        sh.user = user;
+                        i
+                    }
+                    None => {
+                        let used: Vec<char> = shares().iter().map(|s| s.letter).collect();
+                        let letter = ('M'..='Z').rev().find(|l| !used.contains(l)).unwrap_or('Z');
+                        shares().push(NetShare { host, share, user, password: None, client: None, letter });
+                        shares().len() - 1
+                    }
+                };
+                let sh = &mut shares()[i];
+                sh.password = Some(password);
+                sh.client = Some(client);
+                println!("[desktop] mapped {} as {}: signed in as {}", sh.unc(), sh.letter, sh.user);
+                let root = sh.root();
+                self.files.form = None;
+                self.save_settings();
+                self.navigate(root)
+            }
+            Err(msg) => {
+                println!("[desktop] could not map {}: {}", unc, msg);
+                if let Some(form) = self.files.form.as_mut() {
+                    form.error = format!("Can't connect: {}", msg);
+                    form.focus = if msg.contains("password") { 2 } else { 0 };
+                }
+                area
+            }
+        }
+    }
+
+    /// A key typed while the form is open.
+    fn form_key(&mut self, k: u8) -> Rect {
+        let area = self.files_area();
+        let Some(form) = self.files.form.as_mut() else { return Rect::EMPTY };
+        match k {
+            b'\n' => return self.form_connect(),
+            27 => {
+                self.files.form = None;
+                self.files.status = String::new();
+            }
+            9 | KEY_DOWN => form.focus = (form.focus + 1) % 3,
+            KEY_UP => form.focus = (form.focus + 2) % 3,
+            8 => {
+                form.fields[form.focus].pop();
+            }
+            32..=126 if form.fields[form.focus].len() < 200 => form.fields[form.focus].push(k as char),
+            _ => return Rect::EMPTY,
+        }
+        area
+    }
+
+    /// A click in the content area while the form is open.
+    fn form_click(&mut self, x: i32, y: i32) -> Rect {
+        let c = self.files_client();
+        if self.form_button(&c, true).contains(x, y) {
+            return self.form_connect();
+        }
+        if self.form_button(&c, false).contains(x, y) {
+            return self.form_key(27);
+        }
+        if let Some(i) = (0..3).find(|&i| self.form_field(&c, i).contains(x, y)) {
+            if let Some(form) = self.files.form.as_mut() {
+                form.focus = i;
+            }
+            return self.files_area();
+        }
+        Rect::EMPTY
+    }
+
+    /// Writes /AeroForge.ini: the mouse speed and the network drives
+    /// (where and who; never the password).
+    fn save_settings(&self) -> bool {
+        let mut text = format!("mouse speed = {}\n", self.mouse_speed);
+        for sh in shares().iter() {
+            text.push_str(&format!("network drive = {}|{}|{}\n", sh.unc(), sh.user, sh.letter));
+        }
+        aero::write_file(SETTINGS, text.as_bytes()).is_ok()
     }
 
     /// A folder: column headings, the rows and a scroll bar.
@@ -2442,9 +2850,12 @@ impl Desktop {
         }
         spots.extend(self.crumb_rects(c).into_iter().map(|(r, _, _)| r));
         spots.extend(self.command_buttons(c).into_iter().map(|(_, _, r)| r));
-        spots.extend((0..=self.files.drives.len() + 1).map(|i| self.pane_item(c, i)));
-        if self.files.path.is_empty() {
-            spots.extend((0..self.files.drives.len()).map(|i| self.drive_tile(c, i)));
+        spots.extend((0..self.places().len()).map(|i| self.pane_item(c, i)));
+        if self.files.form.is_some() {
+            spots.push(self.form_button(c, true));
+            spots.push(self.form_button(c, false));
+        } else if self.files.path.is_empty() {
+            spots.extend((0..self.tile_count()).map(|i| self.drive_tile(c, i)));
         } else {
             spots.extend((0..self.files_visible(c)).map(|i| self.files_row(c, i)));
         }
@@ -2458,6 +2869,9 @@ impl Desktop {
     fn open_dir(&mut self, path: String) -> bool {
         self.files.rename = None;
         self.files.confirm = None;
+        if !path.is_empty() {
+            self.files.form = None;
+        }
         if let Ok(drives) = aero::volumes() {
             self.files.drives = drives;
         }
@@ -2473,25 +2887,31 @@ impl Desktop {
             return true;
         }
         if path.is_empty() {
+            self.files.path = path;
             let c = self.files_client();
-            let tiles: Vec<String> = (0..self.files.drives.len())
+            let mut tiles: Vec<String> = (0..self.files.drives.len())
                 .map(|i| {
                     let t = self.drive_tile(&c, i);
                     let v = &self.files.drives[i];
                     format!("{}: {} {} at {},{}", (b'C' + i as u8) as char, v.path, v.kind, t.x + t.w / 2, t.y + t.h / 2)
                 })
                 .collect();
-            let bin = self.pane_item(&c, self.files.drives.len() + 1);
-            println!("[desktop] Computer: drives = {}; Recycle Bin at {},{}", tiles.join(" | "), bin.x + 60 * self.ui, bin.y + bin.h / 2);
-            let n = self.files.drives.len();
+            for (n, sh) in shares().iter().enumerate() {
+                let t = self.drive_tile(&c, self.files.drives.len() + n);
+                tiles.push(format!("{}: {} SMB at {},{}", sh.letter, sh.root(), t.x + t.w / 2, t.y + t.h / 2));
+            }
+            let bin = self.pane_item(&c, self.places().len() - 1);
+            let map = self.command_buttons(&c).into_iter().find(|(cmd, _, _)| *cmd == Command::Map).map(|(_, _, r)| r).unwrap_or(Rect::EMPTY);
+            println!("[desktop] Computer: drives = {}; Recycle Bin at {},{}; Map network drive at {},{}", tiles.join(" | "),
+                bin.x + 60 * self.ui, bin.y + bin.h / 2, map.x + map.w / 2, map.y + map.h / 2);
+            let n = self.tile_count();
             self.files.status = format!("{} drive{}", n, if n == 1 { "" } else { "s" });
-            self.files.path = path;
             self.files.entries.clear();
             self.files.scroll = 0;
             self.files.selected = None;
             return true;
         }
-        match aero::list_dir(&path) {
+        match fs_list(&path) {
             Ok(mut entries) => {
                 // The first drive's root also lists the other drives as
                 // folders; here they are in the pane instead.
@@ -2568,7 +2988,8 @@ impl Desktop {
         if path == BIN {
             return self.navigate(String::new());
         }
-        let at_root = self.drive_of(&path).is_some_and(|d| self.files.drives[d].path.eq_ignore_ascii_case(path.trim_end_matches('/')) || path == "/");
+        let at_root = self.drive_of(&path).is_some_and(|d| self.files.drives[d].path.eq_ignore_ascii_case(path.trim_end_matches('/')) || path == "/")
+            || net_path(&path).is_some_and(|(_, inner)| inner.trim_matches('/').is_empty());
         let up = if at_root { String::new() } else { split_path(&path).0 };
         let name = split_path(&path).1;
         let r = self.navigate(up);
@@ -2609,6 +3030,11 @@ impl Desktop {
     fn select(&mut self, i: usize) {
         let c = self.files_client();
         self.files.selected = Some(i);
+        if self.files.path.is_empty() && i >= self.files.drives.len() {
+            let sh = &shares()[i - self.files.drives.len()];
+            self.files.status = format!("{}  {}", sh.unc(), if sh.client.is_some() { "connected" } else { "not connected: open it to sign in" });
+            return;
+        }
         if self.files.path.is_empty() {
             let v = &self.files.drives[i];
             self.files.status = format!("{}  {} {}{}", self.drive_name(i), space_text(v.size), v.kind, if v.read_only { ", read-only" } else { "" });
@@ -2629,10 +3055,24 @@ impl Desktop {
         self.files.status = if e.is_dir { format!("{}  File folder", e.name) } else { format!("{}  {}  {}", e.name, type_text(e), size_text(e.size)) };
     }
 
+    /// Goes to network drive `n`, asking for the password first if this
+    /// session has not signed in to it yet.
+    fn open_share(&mut self, n: usize) -> Rect {
+        let sh = &shares()[n];
+        if sh.client.is_none() && sh.password.is_none() {
+            return self.open_form(Some(n));
+        }
+        let root = sh.root();
+        self.navigate(root)
+    }
+
     /// Opens the selected entry: a drive or folder is shown, a text file goes to Notes.
     fn open_selected(&mut self) -> Rect {
         let Some(i) = self.files.selected else { return Rect::EMPTY };
         if self.files.path.is_empty() {
+            if i >= self.files.drives.len() {
+                return self.open_share(i - self.files.drives.len());
+            }
             let to = self.files.drives[i].path.clone();
             return self.navigate(to);
         }
@@ -2659,7 +3099,7 @@ impl Desktop {
                 let taken: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
                 let name = free_name("New folder", &taken, true, false);
                 let path = join(&dir, &name);
-                match aero::create_dir(&path) {
+                match fs_mkdir(&path) {
                     Ok(()) => {
                         println!("[desktop] new folder {}", path);
                         self.refresh(Some(name.clone()));
@@ -2753,6 +3193,15 @@ impl Desktop {
                 self.files.confirm = None;
                 self.files.status = String::from("Nothing was deleted");
             }
+            Command::Map => return self.open_form(None),
+            Command::Disconnect => {
+                let n = self.files.selected.unwrap() - self.files.drives.len();
+                let sh = shares().remove(n);
+                println!("[desktop] disconnected {} ({}:)", sh.unc(), sh.letter);
+                self.save_settings();
+                self.refresh(None);
+                self.files.status = format!("Disconnected {}", sh.unc());
+            }
         }
         area
     }
@@ -2774,19 +3223,28 @@ impl Desktop {
         let taken: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
         let new_name = free_name(&name, &taken, clip.is_dir, true);
         let to = join(&dir, &new_name);
+        if clip.cut {
+            let r = move_tree(&clip.path, &to, clip.is_dir, clip.size);
+            match r {
+                Ok(()) => {
+                    println!("[desktop] moved {} to {}", clip.path, to);
+                    self.files.status = format!("Moved \"{}\" here", name);
+                    self.files.clip = None;
+                    self.refresh(Some(new_name));
+                    self.files.status = format!("Moved \"{}\" here", name);
+                }
+                Err(msg) => {
+                    println!("[desktop] move failed: {}", msg);
+                    self.refresh(None);
+                    self.files.status = msg;
+                }
+            }
+            return;
+        }
         match copy_tree(&clip.path, &to, clip.is_dir, clip.size) {
             Ok(n) => {
                 let files = format!("{} file{}", n, if n == 1 { "" } else { "s" });
-                if clip.cut {
-                    match delete_tree(&clip.path, clip.is_dir) {
-                        Ok(_) => {
-                            println!("[desktop] moved {} to {} ({})", clip.path, to, files);
-                            self.files.status = format!("Moved \"{}\" here", name);
-                        }
-                        Err(msg) => self.files.status = format!("Copied, but the old one stayed: {}", msg),
-                    }
-                    self.files.clip = None;
-                } else {
+                {
                     println!("[desktop] pasted {} as {} ({})", clip.path, to, files);
                     self.files.status = format!("Pasted \"{}\" ({})", new_name, files);
                 }
@@ -2817,8 +3275,8 @@ impl Desktop {
         }
         let dir = self.files.path.clone();
         let (from, to) = (join(&dir, &e.name), join(&dir, &new));
-        // No rename call yet: copy under the new name, then delete the old one.
-        let result = copy_tree(&from, &to, e.is_dir, e.size).and_then(|_| delete_tree(&from, e.is_dir));
+        // Locally there is no rename call yet: copy under the new name, then delete the old one.
+        let result = move_tree(&from, &to, e.is_dir, e.size);
         match result {
             Ok(_) => {
                 println!("[desktop] renamed {} to {}", from, to);
@@ -3020,19 +3478,22 @@ impl Desktop {
             return self.command(Command::No);
         }
         if self.files_pane(&c).contains(x, y) {
-            let bin_item = self.files.drives.len() + 1;
-            if let Some(i) = (0..=bin_item).find(|&i| self.pane_item(&c, i).contains(x, y)) {
-                let to = match i {
-                    0 => String::new(),
-                    i if i == bin_item => String::from(BIN),
-                    i => self.files.drives[i - 1].path.clone(),
-                };
-                return self.navigate(to);
+            let places = self.places();
+            if let Some(i) = (0..places.len()).find(|&i| self.pane_item(&c, i).contains(x, y)) {
+                let (_, path, kind) = places[i].clone();
+                if kind == Place::Network {
+                    let n = shares().iter().position(|s| s.root() == path).unwrap_or(0);
+                    return self.open_share(n);
+                }
+                return self.navigate(path);
             }
             return Rect::EMPTY;
         }
+        if self.files.form.is_some() {
+            return if self.files_content(&c).contains(x, y) { self.form_click(x, y) } else { Rect::EMPTY };
+        }
         if self.files.path.is_empty() {
-            let hit = (0..self.files.drives.len()).find(|&i| self.drive_tile(&c, i).contains(x, y));
+            let hit = (0..self.tile_count()).find(|&i| self.drive_tile(&c, i).contains(x, y));
             match hit {
                 Some(i) => {
                     self.select(i);
@@ -3118,6 +3579,9 @@ impl Desktop {
             }
             return area;
         }
+        if self.files.form.is_some() {
+            return self.form_key(k);
+        }
         if self.files.confirm.is_some() {
             return match k {
                 b'\n' | b'y' | b'Y' => self.command(Command::Yes),
@@ -3125,7 +3589,7 @@ impl Desktop {
                 _ => Rect::EMPTY,
             };
         }
-        let count = if self.files.path.is_empty() { self.files.drives.len() } else { self.files.entries.len() };
+        let count = if self.files.path.is_empty() { self.tile_count() } else { self.files.entries.len() };
         let c = self.files_client();
         let page = if self.files.path.is_empty() { self.tile_columns(&c) } else { self.files_visible(&c) };
         let step = if self.files.path.is_empty() { self.tile_columns(&c) } else { 1 };
@@ -3221,7 +3685,7 @@ const SETTINGS: &str = "/AeroForge.ini";
 
 /// The pointer speed saved in the settings file, applied; or the current one.
 fn saved_mouse_speed() -> u64 {
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 4096];
     if let Ok(n) = aero::read_file(SETTINGS, &mut buf) {
         let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
         for line in text.lines() {
@@ -3235,6 +3699,36 @@ fn saved_mouse_speed() -> u64 {
         }
     }
     aero::mouse_speed(None).unwrap_or(5)
+}
+
+/// The network drives saved in the settings file, put back in the Computer
+/// window. No password is saved, so each one asks for it when first opened.
+fn saved_network_drives() {
+    let mut buf = [0u8; 4096];
+    let Ok(n) = aero::read_file(SETTINGS, &mut buf) else { return };
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if key.trim() != "network drive" {
+            continue;
+        }
+        let mut parts = value.trim().split('|');
+        let (Some(unc), Some(user), Some(letter)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let mut names = unc.trim_start_matches('\\').split('\\');
+        let (Some(host), Some(share)) = (names.next(), names.next()) else { continue };
+        let Some(letter) = letter.trim().chars().next().filter(|c| c.is_ascii_uppercase()) else { continue };
+        if host.is_empty() || share.is_empty() || shares().iter().any(|s| s.letter == letter) {
+            continue;
+        }
+        shares().push(NetShare {
+            host: String::from(host),
+            share: String::from(share),
+            user: String::from(user),
+            password: None,
+            client: None,
+            letter,
+        });
+    }
 }
 
 /// A file size the way Explorer shows it: whole kilobytes, rounded up.
@@ -3325,10 +3819,11 @@ fn main() -> i64 {
             confirm: None,
             bin: Vec::new(),
             last_recycled: None,
+            form: None,
         },
         calc: Calc { display: String::from("0"), ..Default::default() },
         icon: None,
-        mouse_speed: saved_mouse_speed(),
+        mouse_speed: { saved_network_drives(); saved_mouse_speed() },
         last_press: (0, 0, 0),
     };
     let mut canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };

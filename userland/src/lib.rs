@@ -483,6 +483,8 @@ impl Drop for Handle {
 /// UDP and TCP sockets over the network card the kernel brought up.
 /// Errors: `E_NOTFOUND` (no network or no DHCP address yet), `E_CLOSED`
 /// (refused or reset), `E_TIMEDOUT`.
+pub mod smb;
+
 pub mod net {
     use super::*;
 
