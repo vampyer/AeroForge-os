@@ -101,7 +101,7 @@ SMBD_PID=$(./tools/smb-server.sh) || { echo "FAIL: could not start the Samba ser
 SUDO=$([ "$(id -u)" = 0 ] && echo "" || echo sudo)
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm build/gop-panes.ppm
+rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm build/gop-panes.ppm build/gop-preview.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -446,8 +446,21 @@ for _ in $(seq "$TIMEOUT"); do
         point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=panescopy
     elif [ $STAGE = panescopy ] && grep -q "\[desktop\] \(pasted /README.TXT as /docs/\|copy failed\|Can't\)" "$LOG"; then
         sleep 1; monitor "screendump build/gop-panes.ppm"
-        # Close the tab (Ctrl+W).
-        type_keys $'\x17'; STAGE=panesclose
+        # The preview pane (Alt+P) on README.TXT, still selected: its text, then its bytes.
+        monitor "sendkey alt-p"; STAGE=preview
+    elif [ $STAGE = preview ] && grep -q "\[desktop\] preview of /README.TXT: " "$LOG"; then
+        XY=$(grep -ao "Hex at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=prevhex
+    elif [ $STAGE = prevhex ] && grep -q "\[desktop\] preview of /README.TXT as hex" "$LOG"; then
+        # A saved game (not text) shows as bytes straight away: s jumps to saves.
+        N=$(grep -c "\[desktop\] Computer: /saves = " "$LOG" || true)
+        sleep 0.5; type_keys 's'; sleep 0.5; type_keys $'\n'; STAGE=prevsaves
+    elif [ $STAGE = prevsaves ] && [ "$(grep -c "\[desktop\] Computer: /saves = " "$LOG")" -gt "$N" ]; then
+        sleep 0.5; monitor "sendkey home"; STAGE=prevbin
+    elif [ $STAGE = prevbin ] && grep -q "\[desktop\] preview of /saves/" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-preview.ppm"
+        # Preview off, and close the tab (Ctrl+W).
+        monitor "sendkey alt-p"; sleep 0.5; type_keys $'\x17'; STAGE=panesclose
     elif [ $STAGE = panesclose ] && grep -q "\[desktop\] tabs: [^|]*; tab 1 in front" "$LOG"; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
@@ -637,6 +650,13 @@ for _ in $(seq "$TIMEOUT"); do
             && mdir -i build/disk.img@@1M "::/docs/README.TXT" >/dev/null 2>&1 \
             || { fail "Copy > did not copy README.TXT to the folder on the other side"; }
         grep -q "\[desktop\] tabs: [^|]*; tab 1 in front" "$LOG" || { fail "Ctrl+W did not close the second tab"; }
+        grep -q "\[desktop\] preview of /README.TXT: 267 bytes read, as text: This file lives on a FAT32 partition of an NVMe disk image\." "$LOG" \
+            && grep -q "\[desktop\] preview of /README.TXT as hex: 0000  54 68 69 73 20 " "$LOG" \
+            || { fail "the preview pane did not show README.TXT as text and then as hex"; }
+        SAV_HEX=$(mtype -i build/disk.img@@1M "::/saves/Slot 1 - Forest Temple.sav" | head -c 8 | od -An -tx1 | tr a-f A-F | xargs)
+        grep -q "\[desktop\] preview of /saves/Slot 1 - Forest Temple.sav: [0-9]* bytes read, as hex: 0000  $SAV_HEX " "$LOG" \
+            || { fail "the preview pane did not show a saved game's first bytes ($SAV_HEX) as hex"; }
+        grep -q "\[desktop\] preview pane off" "$LOG" || { fail "Alt+P did not close the preview pane"; }
         python3 tools/check-screen.py explorer build/gop-panes.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the two-pane screenshot is wrong"; }
         python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
@@ -727,7 +747,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
