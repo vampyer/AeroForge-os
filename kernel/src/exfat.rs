@@ -762,6 +762,10 @@ impl vfs::Volume for ExfatVolume {
     fn kind(&self) -> &'static str {
         "exFAT"
     }
+    fn space(&self) -> (u64, Option<u64>) {
+        let cluster = self.bytes_per_sector as u64 * self.sectors_per_cluster as u64;
+        (self.clusters as u64 * cluster, Some(self.state.lock().free as u64 * cluster))
+    }
     fn label(&self) -> &str {
         &self.label
     }

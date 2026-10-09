@@ -770,6 +770,10 @@ impl vfs::Volume for FatVolume {
     fn kind(&self) -> &'static str {
         "FAT32"
     }
+    fn space(&self) -> (u64, Option<u64>) {
+        let cluster = self.bytes_per_sector as u64 * self.sectors_per_cluster as u64;
+        (self.clusters as u64 * cluster, self.state.lock().free.map(|f| f as u64 * cluster))
+    }
     fn label(&self) -> &str {
         &self.label
     }

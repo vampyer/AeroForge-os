@@ -321,6 +321,9 @@ constexpr uint8_t kHidCapsLock = 0x39;
 // The number pad, 0x54..0x63, read as if Num Lock were on.
 constexpr char kHidKeypad[] = "/*-+\n1234567890.";
 static_assert(sizeof(kHidKeypad) == 0x63 - 0x54 + 2);
+// Usages 0x4A-0x52: Home, Page Up, Delete, End, Page Down, Right, Left, Down, Up.
+constexpr uint8_t kHidNav[] = {DHI_KEY_HOME, DHI_KEY_PGUP, DHI_KEY_DELETE, DHI_KEY_END, DHI_KEY_PGDN,
+                               DHI_KEY_RIGHT, DHI_KEY_LEFT, DHI_KEY_DOWN, DHI_KEY_UP};
 
 class Controller {
 public:
@@ -2032,6 +2035,9 @@ private:
             char c = 0;
             if (usage >= 0x04 && usage <= 0x38) c = (shift ? kHidShifted : kHidNormal)[usage - 0x04];
             else if (usage >= 0x54 && usage <= 0x63) c = kHidKeypad[usage - 0x54];
+            else if (usage >= 0x4A && usage <= 0x52) c = char(kHidNav[usage - 0x4A]);
+            else if (usage == 0x3B) c = char(DHI_KEY_F2);
+            else if (usage == 0x3E) c = char(DHI_KEY_F5);
             if (caps_ && c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
             else if (caps_ && c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
             dhi_input_event ev{};

@@ -98,7 +98,7 @@ python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
 ECHO_PID=$!
 for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
-rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm
+rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -316,7 +316,11 @@ for _ in $(seq "$TIMEOUT"); do
         # Then open Computer from its desktop icon, go into /docs and open
         # the welcome text file in Notes.
         XY=$(grep -ao "Computer icon at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
-        point_at "${XY%,*}" "${XY#*,}"; double_click; STAGE=deskcomp
+        point_at "${XY%,*}" "${XY#*,}"; double_click; STAGE=deskdrives
+    elif [ $STAGE = deskdrives ] && grep -q "\[desktop\] Computer: drives = " "$LOG"; then
+        # It opens on the drives: double-click C: (the NVMe disk, mounted at /).
+        XY=$(grep -ao "C: / FAT32 at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; double_click; STAGE=deskcomp
     elif [ $STAGE = deskcomp ] && grep -q "\[desktop\] Computer: / = " "$LOG"; then
         # Make Computer 100 narrower and 80 taller by its bottom-right corner.
         read -r CX CY CW CH <<< "$(grep -ao "opened Computer at [0-9]*,[0-9]* ([0-9]*x[0-9]*)" "$LOG" | head -1 | tr -c '0-9\n' ' ')"
@@ -332,6 +336,38 @@ for _ in $(seq "$TIMEOUT"); do
         # Type into it and save it with Ctrl+S.
         sleep 0.5; type_keys 'hello aero'; type_keys $'\x13'
         sleep 1; monitor "screendump build/gop-desktop.ppm"
+        # The file manager: pick the text file in /docs (which brings
+        # Computer to the front), copy it, make a folder named Stuff, go in
+        # and paste it there.
+        point_at $(row_of "$DOCS" "Welcome to AeroForge.txt"); monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        type_keys $'\x03'; sleep 0.3; type_keys $'\x0e'; STAGE=exnew
+    elif [ $STAGE = exnew ] && grep -q "\[desktop\] \(new folder /docs/New folder\|Can't\)" "$LOG"; then
+        sleep 0.5; type_keys $'Stuff\n'; STAGE=exrenamed
+    elif [ $STAGE = exrenamed ] && grep -q "\[desktop\] \(renamed /docs/New folder to /docs/Stuff\|rename failed\)" "$LOG"; then
+        sleep 0.5; type_keys $'\n'; STAGE=exstuff
+    elif [ $STAGE = exstuff ] && grep -q "\[desktop\] Computer: /docs/Stuff = " "$LOG"; then
+        sleep 0.5; type_keys $'\x16'; STAGE=expasted
+    elif [ $STAGE = expasted ] && grep -q "\[desktop\] \(pasted /docs/Welcome to AeroForge.txt as /docs/Stuff/\|paste failed\)" "$LOG"; then
+        # Back up to /docs and paste again: it becomes "... - Copy.txt";
+        # delete that (to the Recycle Bin), undo with Ctrl+Z, delete it again.
+        sleep 0.5; type_keys $'\x08'; sleep 0.5; type_keys $'\x16'; STAGE=excopy
+    elif [ $STAGE = excopy ] && grep -q "\[desktop\] \(pasted /docs/Welcome to AeroForge.txt as /docs/Welcome to AeroForge - Copy.txt\|paste failed\)" "$LOG"; then
+        sleep 0.5; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=exbin
+    elif [ $STAGE = exbin ] && grep -q "\[desktop\] \(moved /docs/Welcome to AeroForge - Copy.txt to the Recycle Bin\|Not deleted\)" "$LOG"; then
+        sleep 0.5; type_keys $'\x1a'; STAGE=exundo
+    elif [ $STAGE = exundo ] && grep -q "\[desktop\] \(restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Not restored\)" "$LOG"; then
+        sleep 0.5; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=exbin2
+    elif [ $STAGE = exbin2 ] && [ "$(grep -c "\[desktop\] moved /docs/Welcome to AeroForge - Copy.txt to the Recycle Bin" "$LOG")" -ge 2 ]; then
+        # Open the Recycle Bin from the pane, screenshot it, then delete
+        # what is in it for good.
+        XY=$(grep -ao "Recycle Bin at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=exbinview
+    elif [ $STAGE = exbinview ] && grep -q "\[desktop\] Recycle Bin = " "$LOG"; then
+        sleep 1; monitor "screendump build/gop-bin.ppm"
+        monitor "sendkey home"; sleep 0.3; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=expurged
+    elif [ $STAGE = expurged ] && grep -q "\[desktop\] \(removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Can't\)" "$LOG"; then
+        # Up from the Recycle Bin is Computer: screenshot the drives.
+        sleep 0.5; type_keys $'\x08'; sleep 1.5; monitor "screendump build/gop-explorer.ppm"
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
         monitor "mouse_button 0"; STAGE=desksnap
@@ -464,7 +500,25 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] calculator: 84" "$LOG" || { fail "Calculator did not work out 12+30*2 = 84 from typed keys and a click on ="; }
         python3 tools/check-screen.py start build/gop-start.ppm || { fail "the Start button or the Start menu is wrong in the screenshot"; }
         python3 tools/check-screen.py snap build/gop-snap.ppm || { fail "the snapped window is not on the left half of the screenshot"; }
-        grep -q "\[desktop\] resized Computer to 420x440" "$LOG" || { fail "dragging the Computer window's corner did not resize it to 420x440"; }
+        CXY=$(grep -ao "opened Computer at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
+        grep -q "\[desktop\] resized Computer to 700x560" "$LOG" || { fail "dragging the Computer window's corner did not resize it to 700x560"; }
+        grep -q "\[desktop\] Computer: drives = C: / FAT32 at [0-9,]* | D: /sata0p1 FAT32 at [0-9,]* | E: /sata1p1 NTFS at [0-9,]* | F: /usb0p1 FAT32 at " "$LOG" \
+            || { fail "the Computer window did not open on the four drives ($(grep -ao 'Computer: drives = [^;]*' "$LOG" | head -1))"; }
+        grep -q "\[desktop\] renamed /docs/New folder to /docs/Stuff" "$LOG" || { fail "Ctrl+N and typing a name did not make the folder /docs/Stuff"; }
+        grep -q "\[desktop\] pasted /docs/Welcome to AeroForge.txt as /docs/Stuff/Welcome to AeroForge.txt (1 file)" "$LOG" \
+            || { fail "Ctrl+C and Ctrl+V did not copy the text file into /docs/Stuff"; }
+        grep -q "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin to /docs/Welcome to AeroForge - Copy.txt" "$LOG" \
+            || { fail "Ctrl+Z did not bring a deleted file back from the Recycle Bin"; }
+        grep -q "\[desktop\] Recycle Bin = Welcome to AeroForge - Copy.txt (from /docs/Welcome to AeroForge - Copy.txt)" "$LOG" \
+            || { fail "the Recycle Bin did not list the deleted file"; }
+        grep -q "\[desktop\] removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
+        mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to AeroForge.txt" | head -n 1 | grep -q "Welcome to AeroForge OS" \
+            || { fail "the copy in /docs/Stuff is not on the NVMe disk image"; }
+        ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 && ! mdir -i build/disk.img@@1M "::/docs/Welcome to AeroForge - Copy.txt" >/dev/null 2>&1 \
+            || { fail "the renamed folder or the deleted copy is still on the NVMe disk image"; }
+        [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
+            || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
+        python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
         grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
         grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \
@@ -479,7 +533,6 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "Ctrl+S in Notes did not save the file back to the NVMe disk"; }
         mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge.txt" | tail -n 1 | grep -q "hello aero$" \
             || { fail "the file Notes saved does not end with the typed words on the NVMe disk image"; }
-        CXY=$(grep -ao "opened Computer at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
         python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 "${CXY%,*}" "${CXY#*,}" \
             || { fail "the desktop screenshot is wrong"; }
         grep -q "\[spreadtest\] busy CPUs evened out their threads: OK" "$LOG" \
@@ -554,7 +607,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, was resized by its corner, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

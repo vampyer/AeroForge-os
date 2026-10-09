@@ -178,6 +178,7 @@ pub const SYS_KEYS_READ: u64 = 51;
 pub const SYS_TIME: u64 = 52;
 pub const SYS_DIR_LIST: u64 = 53;
 pub const SYS_MOUSE_SPEED: u64 = 54;
+pub const SYS_VOLUMES: u64 = 55;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -564,6 +565,34 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             }
             check_writable(a2, out.len() as u64)?;
             to_user(a2, &out)?;
+            Ok(out.len() as u64)
+        }
+        SYS_VOLUMES => {
+            // The mounted volumes into a user buffer, root first, one record
+            // each: flags (1 = read-only), size and free bytes (8 bytes each,
+            // little-endian; free is all ones when unknown), then the mount
+            // path, device name, kind and label, each a length byte and text.
+            // Stops at the last record that fits; returns the bytes used.
+            let cap = a1.min(MAX_DIR_LIST) as usize;
+            let mut out = Vec::new();
+            for m in vfs::volumes() {
+                let (size, free) = m.vol.space();
+                let mut rec = Vec::new();
+                rec.push(m.vol.read_only() as u8);
+                rec.extend_from_slice(&size.to_le_bytes());
+                rec.extend_from_slice(&free.unwrap_or(u64::MAX).to_le_bytes());
+                for text in [m.path.as_str(), m.vol.dev().name(), m.vol.kind(), m.vol.label()] {
+                    let t = &text.as_bytes()[..text.len().min(255)];
+                    rec.push(t.len() as u8);
+                    rec.extend_from_slice(t);
+                }
+                if out.len() + rec.len() > cap {
+                    break;
+                }
+                out.extend_from_slice(&rec);
+            }
+            check_writable(a0, out.len() as u64)?;
+            to_user(a0, &out)?;
             Ok(out.len() as u64)
         }
         SYS_DIR_CREATE => {
