@@ -496,6 +496,11 @@ of a name or a pattern such as `*.txt`, and lists what it finds with the folder 
 free space with a pie chart. Programs that own the screen now get the modifier keys held with each key
 (`keys_with_modifiers`) and with the pointer (`Pointer::keys`).
 
+Since 0.52 the file manager has tabs and two panes. Ctrl+T or "+" opens a tab on Computer, Ctrl+W or its x
+closes it, and Ctrl+Tab goes to the next one. "Two panes" splits the window into two folders side by side,
+each with its place along its top; Tab or a click moves between them. "Copy >" and "Move >" (or "< Copy"
+and "< Move") send what is selected to the folder on the other side, and files can be dragged across too.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

@@ -34,6 +34,7 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use aero::display::{self, Pointer, Screen};
@@ -639,6 +640,9 @@ enum Command {
     Map,
     Disconnect,
     Properties,
+    /// Two panes: to the folder on the other side.
+    CopyOver,
+    MoveOver,
     /// The answers to "Delete ...?".
     Yes,
     No,
@@ -752,6 +756,82 @@ enum Place {
     Bin,
 }
 
+impl Files {
+    fn new() -> Self {
+        Files {
+            path: String::new(),
+            entries: Vec::new(),
+            drives: Vec::new(),
+            scroll: 0,
+            selected: None,
+            marked: Vec::new(),
+            anchor: None,
+            status: String::new(),
+            back: Vec::new(),
+            forward: Vec::new(),
+            sort: SortBy::Name,
+            descending: false,
+            rename: None,
+            rename_all: false,
+            confirm: None,
+            bin: Vec::new(),
+            last_recycled: Vec::new(),
+            form: None,
+            query: String::new(),
+            query_focus: false,
+            searched_in: String::new(),
+            results: Vec::new(),
+            found: Vec::new(),
+            props: None,
+        }
+    }
+    /// What tells entry `i` apart from the rest: its name, or in the
+    /// Recycle Bin (where two can have the same name) its number, or in
+    /// search results its full path.
+    fn key(&self, i: usize) -> String {
+        if self.path == BIN {
+            return self.bin.get(i).map(|b| b.id.clone()).unwrap_or_default();
+        }
+        if self.path == SEARCH {
+            return self.found.get(i).cloned().unwrap_or_default();
+        }
+        self.entries.get(i).map(|e| e.name.clone()).unwrap_or_default()
+    }
+    /// Where entry `i` is.
+    fn entry_path(&self, i: usize) -> String {
+        if self.path == SEARCH {
+            return self.found[i].clone();
+        }
+        join(&self.path, &self.entries[i].name)
+    }
+    fn is_marked(&self, i: usize) -> bool {
+        match self.selected {
+            None => false,
+            Some(at) if self.marked.is_empty() => at == i,
+            Some(_) => self.marked.contains(&self.key(i)),
+        }
+    }
+    /// Whether it shows a folder (not Computer, the Recycle Bin or search results).
+    fn in_folder(&self) -> bool {
+        !self.path.is_empty() && self.path != BIN && self.path != SEARCH
+    }
+}
+
+/// A tab of the Computer window: the folder shown, and in two-pane mode
+/// the other side too. The tab in front lives in Desktop's own fields;
+/// its slot here is empty until another tab is brought forward.
+struct Tab {
+    files: Files,
+    other: Option<Box<Files>>,
+    right: bool,
+}
+
+impl Default for Tab {
+    fn default() -> Self {
+        Tab { files: Files::new(), other: None, right: false }
+    }
+}
+
 /// The Properties box: what is selected, in more detail.
 struct Props {
     title: String,
@@ -782,7 +862,6 @@ struct Files {
     forward: Vec<String>,
     sort: SortBy,
     descending: bool,
-    clip: Option<Clip>,
     /// The new name being typed for the selected entry.
     rename: Option<String>,
     /// The whole name is still selected: the first key typed replaces it.
@@ -868,6 +947,16 @@ struct Desktop {
     file_drag: Option<FileDrag>,
     /// The modifier keys held as the key being handled was typed.
     key_mods: u8,
+    /// Two-pane mode: the side not in use (`files` is the one in use), and
+    /// whether the one in use is the right-hand side.
+    other: Option<Box<Files>>,
+    right: bool,
+    /// The Computer window's tabs, and which is in front (its slot in
+    /// `tabs` is empty: it is `files`, `other` and `right`).
+    tabs: Vec<Tab>,
+    tab: usize,
+    /// What Copy or Cut picked up, for any tab or side.
+    clip: Option<Clip>,
 }
 
 impl Desktop {
@@ -1714,6 +1803,11 @@ impl Desktop {
     fn open(&mut self, kind: Kind) -> Rect {
         let at = self.index(kind);
         if kind == Kind::Computer && !self.windows[at].open {
+            // A fresh start: one tab, one pane.
+            self.tabs = alloc::vec![Tab::default()];
+            self.tab = 0;
+            self.other = None;
+            self.right = false;
             self.files.back.clear();
             self.files.forward.clear();
             self.open_dir(String::new());
@@ -2194,24 +2288,87 @@ impl Desktop {
         let w = (c.w / 4).clamp(120 * s, 240 * s);
         Rect::new(c.x + c.w - 8 * s - w, c.y + 6 * s, w, 28 * s)
     }
+    /// The tabs, under the address.
+    fn files_tabs(&self, c: &Rect) -> Rect {
+        Rect::new(c.x, c.y + 40 * self.ui, c.w, 30 * self.ui)
+    }
+    /// Tab `i`'s button in the strip, and its close (x) box.
+    fn tab_rect(&self, c: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let strip = self.files_tabs(c);
+        let room = strip.w - 8 * s - self.new_tab_button(c).w - self.panes_button(c).w - 16 * s;
+        let w = (room / self.tabs.len().max(1) as i32).min(190 * s);
+        Rect::new(strip.x + 6 * s + i as i32 * w, strip.y + 4 * s, w - 4 * s, strip.h - 4 * s)
+    }
+    fn tab_close(&self, c: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let t = self.tab_rect(c, i);
+        Rect::new(t.x + t.w - 20 * s, t.y + (t.h - 16 * s) / 2, 16 * s, 16 * s)
+    }
+    /// "+": a new tab, right after the last one.
+    fn new_tab_button(&self, c: &Rect) -> Rect {
+        let s = self.ui;
+        let strip = self.files_tabs(c);
+        let n = self.tabs.len() as i32;
+        let w = 26 * s;
+        // Placed after the tabs; their width depends on the strip, not on this.
+        let room = strip.w - 8 * s - w - self.panes_button(c).w - 16 * s;
+        let tab_w = (room / n.max(1)).min(190 * s);
+        Rect::new(strip.x + 6 * s + n * tab_w, strip.y + 5 * s, w, strip.h - 8 * s)
+    }
+    /// "Two panes", at the right of the tab strip.
+    fn panes_button(&self, c: &Rect) -> Rect {
+        let s = self.ui;
+        let strip = self.files_tabs(c);
+        let w = Font::Normal.width(s, "Two panes") + 34 * s;
+        Rect::new(strip.x + strip.w - w - 8 * s, strip.y + 4 * s, w, strip.h - 7 * s)
+    }
     fn files_commands(&self, c: &Rect) -> Rect {
-        Rect::new(c.x, c.y + 40 * self.ui, c.w, 34 * self.ui)
+        Rect::new(c.x, c.y + 70 * self.ui, c.w, 34 * self.ui)
     }
     fn files_status_bar(&self, c: &Rect) -> Rect {
         Rect::new(c.x, c.y + c.h - 28 * self.ui, c.w, 28 * self.ui)
     }
     fn files_body(&self, c: &Rect) -> Rect {
         let s = self.ui;
-        Rect::new(c.x, c.y + 74 * s, c.w, c.h - 74 * s - 28 * s)
+        Rect::new(c.x, c.y + 104 * s, c.w, c.h - 104 * s - 28 * s)
     }
     fn files_pane(&self, c: &Rect) -> Rect {
         let b = self.files_body(c);
         Rect::new(b.x, b.y, (200 * self.ui).min(b.w / 3), b.h)
     }
-    fn files_content(&self, c: &Rect) -> Rect {
+    /// Right of the navigation pane: the folder shown, or both sides.
+    fn files_main(&self, c: &Rect) -> Rect {
         let b = self.files_body(c);
         let p = self.files_pane(c);
         Rect::new(p.x + p.w + 1, b.y, b.w - p.w - 1, b.h)
+    }
+    /// In two-pane mode, the left (false) or right (true) side, with its
+    /// path along the top.
+    fn side(&self, c: &Rect, right: bool) -> Rect {
+        let m = self.files_main(c);
+        let half = (m.w - 2 * self.ui) / 2;
+        if right { Rect::new(m.x + m.w - half, m.y, half, m.h) } else { Rect::new(m.x, m.y, half, m.h) }
+    }
+    fn side_header(&self, c: &Rect, right: bool) -> Rect {
+        let r = self.side(c, right);
+        Rect::new(r.x, r.y, r.w, 26 * self.ui)
+    }
+    /// Where the folder in use is shown.
+    fn files_content(&self, c: &Rect) -> Rect {
+        if self.other.is_none() {
+            return self.files_main(c);
+        }
+        self.side_content(c, self.right)
+    }
+    /// Where the other side's folder is shown, in two-pane mode.
+    fn other_content(&self, c: &Rect) -> Rect {
+        self.side_content(c, !self.right)
+    }
+    fn side_content(&self, c: &Rect, right: bool) -> Rect {
+        let r = self.side(c, right);
+        let top = 26 * self.ui;
+        Rect::new(r.x, r.y + top, r.w, r.h - top)
     }
     /// The pane's rows: Computer (0), then the drives.
     fn pane_item(&self, c: &Rect, i: usize) -> Rect {
@@ -2219,47 +2376,72 @@ impl Desktop {
         let p = self.files_pane(c);
         Rect::new(p.x, p.y + 6 * s + i as i32 * 28 * s, p.w, 28 * s)
     }
-    fn files_head(&self, c: &Rect) -> Rect {
-        let k = self.files_content(c);
+    // A folder list's parts, inside content area `k`.
+    fn head_in(&self, k: &Rect) -> Rect {
         Rect::new(k.x, k.y, k.w, 28 * self.ui)
     }
-    fn files_rows(&self, c: &Rect) -> Rect {
+    fn rows_in(&self, k: &Rect) -> Rect {
         let s = self.ui;
-        let k = self.files_content(c);
         Rect::new(k.x, k.y + 28 * s, k.w - 16 * s, k.h - 28 * s)
     }
-    fn files_scrollbar(&self, c: &Rect) -> Rect {
-        let r = self.files_rows(c);
+    fn scrollbar_in(&self, k: &Rect) -> Rect {
+        let r = self.rows_in(k);
         Rect::new(r.x + r.w, r.y, 16 * self.ui, r.h)
+    }
+    fn visible_in(&self, k: &Rect) -> usize {
+        (self.rows_in(k).h / self.files_row_h()).max(1) as usize
+    }
+    fn row_in(&self, k: &Rect, i: usize) -> Rect {
+        let rows = self.rows_in(k);
+        Rect::new(rows.x, rows.y + i as i32 * self.files_row_h(), rows.w, self.files_row_h())
+    }
+    /// Where the Type and Size columns start (Size is left out when narrow).
+    fn columns_in(&self, k: &Rect) -> (i32, i32) {
+        let s = self.ui;
+        let rows = self.rows_in(k);
+        let size_w = if rows.w < 380 * s { 0 } else { 90 * s };
+        let size_x = rows.x + rows.w - size_w;
+        // Narrow (a side of two panes): names get most of the room.
+        let type_w = if size_w == 0 { (rows.w / 3).min(120 * s) } else { ((rows.w - size_w) * 2 / 5).min(170 * s) };
+        (size_x - type_w, size_x)
+    }
+    fn files_head(&self, c: &Rect) -> Rect {
+        self.head_in(&self.files_content(c))
+    }
+    fn files_rows(&self, c: &Rect) -> Rect {
+        self.rows_in(&self.files_content(c))
+    }
+    fn files_scrollbar(&self, c: &Rect) -> Rect {
+        self.scrollbar_in(&self.files_content(c))
     }
     fn files_row_h(&self) -> i32 {
         30 * self.ui
     }
     fn files_visible(&self, c: &Rect) -> usize {
-        (self.files_rows(c).h / self.files_row_h()).max(1) as usize
+        self.visible_in(&self.files_content(c))
     }
     /// Where entry `i` (counted from the first one shown) is drawn.
     fn files_row(&self, c: &Rect, i: usize) -> Rect {
-        let rows = self.files_rows(c);
-        Rect::new(rows.x, rows.y + i as i32 * self.files_row_h(), rows.w, self.files_row_h())
+        self.row_in(&self.files_content(c), i)
     }
-    /// Where the Type and Size columns start.
     fn files_columns(&self, c: &Rect) -> (i32, i32) {
-        let s = self.ui;
-        let rows = self.files_rows(c);
-        let size_x = rows.x + rows.w - 90 * s;
-        let type_w = ((rows.w - 90 * s) * 2 / 5).min(170 * s);
-        (size_x - type_w, size_x)
+        self.columns_in(&self.files_content(c))
     }
     fn tile_columns(&self, c: &Rect) -> usize {
+        self.tile_columns_in(&self.files_content(c))
+    }
+    fn tile_columns_in(&self, k: &Rect) -> usize {
         let s = self.ui;
-        ((self.files_content(c).w - 12 * s) / (262 * s)).max(1) as usize
+        ((k.w - 12 * s) / (262 * s)).max(1) as usize
     }
     /// The tile for drive `i` in Computer: as many columns as fit, sharing the width.
     fn drive_tile(&self, c: &Rect, i: usize) -> Rect {
-        let s = self.ui;
         let k = self.files_content(c);
-        let cols = self.tile_columns(c);
+        self.drive_tile_in(&k, i)
+    }
+    fn drive_tile_in(&self, k: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let cols = self.tile_columns_in(k);
         let w = ((k.w - 12 * s) / cols as i32 - 12 * s).min(340 * s);
         let (col, row) = ((i % cols) as i32, (i / cols) as i32);
         Rect::new(k.x + 12 * s + col * (w + 12 * s), k.y + 40 * s + row * 74 * s, w, 66 * s)
@@ -2280,7 +2462,17 @@ impl Desktop {
         } else {
             &COMMANDS
         };
-        for &(cmd, label) in list {
+        let mut list: Vec<(Command, &'static str)> = list.to_vec();
+        if self.other.is_some() && self.files.confirm.is_none() && self.files.path != BIN && !self.files.path.is_empty() {
+            // Where the other side is, by an arrow.
+            let over: [(Command, &'static str); 2] = if self.right {
+                [(Command::CopyOver, "< Copy"), (Command::MoveOver, "< Move")]
+            } else {
+                [(Command::CopyOver, "Copy >"), (Command::MoveOver, "Move >")]
+            };
+            list.splice(4..4, over);
+        }
+        for &(cmd, label) in &list {
             let w = Font::Normal.width(s, label) + 20 * s;
             if x + w > bar.x + bar.w {
                 break;
@@ -2360,27 +2552,13 @@ impl Desktop {
     /// What tells entry `i` apart from the rest: its name, or in the
     /// Recycle Bin (where two can have the same name) its number.
     fn entry_key(&self, i: usize) -> String {
-        if self.files.path == BIN {
-            return self.files.bin.get(i).map(|b| b.id.clone()).unwrap_or_default();
-        }
-        if self.files.path == SEARCH {
-            return self.files.found.get(i).cloned().unwrap_or_default();
-        }
-        self.files.entries.get(i).map(|e| e.name.clone()).unwrap_or_default()
+        self.files.key(i)
     }
-    /// Where entry `i` is.
     fn entry_path(&self, i: usize) -> String {
-        if self.files.path == SEARCH {
-            return self.files.found[i].clone();
-        }
-        join(&self.files.path, &self.files.entries[i].name)
+        self.files.entry_path(i)
     }
     fn is_marked(&self, i: usize) -> bool {
-        match self.files.selected {
-            None => false,
-            Some(at) if self.files.marked.is_empty() => at == i,
-            Some(_) => self.files.marked.contains(&self.entry_key(i)),
-        }
+        self.files.is_marked(i)
     }
     /// The entries selected, in the order shown.
     fn picked(&self) -> Vec<usize> {
@@ -2412,7 +2590,7 @@ impl Desktop {
             Command::NewFolder => writable,
             Command::Copy => picked,
             Command::Cut | Command::Rename => picked && writable,
-            Command::Paste => writable && self.files.clip.is_some(),
+            Command::Paste => writable && self.clip.is_some(),
             Command::Restore => picked && self.files.path == BIN,
             Command::Delete if self.files.path == BIN => picked,
             Command::Delete => picked && writable,
@@ -2421,6 +2599,11 @@ impl Desktop {
             Command::Disconnect => !folder && self.files.selected.is_some_and(|i| i >= self.files.drives.len()),
             Command::Properties if !folder => self.files.selected.is_some() && self.files.form.is_none(),
             Command::Properties => picked,
+            Command::CopyOver | Command::MoveOver => {
+                let there = self.other.as_ref().is_some_and(|o| o.in_folder() && !self.files_drive_read_only(&o.path));
+                let away = cmd == Command::CopyOver || (writable || (search && all_writable()));
+                there && picked && away && self.files.path != BIN
+            }
             Command::Yes | Command::No => true,
         }
     }
@@ -2505,6 +2688,44 @@ impl Desktop {
         out
     }
 
+    /// What a folder shown is called in a tab: "Computer", "Recycle Bin",
+    /// a drive's name, or the folder's own.
+    fn place_title(&self, f: &Files) -> String {
+        match f.path.as_str() {
+            "" => String::from("Computer"),
+            BIN => String::from("Recycle Bin"),
+            SEARCH => String::from("Search Results"),
+            p => {
+                if let Some(d) = f.drives.iter().position(|v| v.path.eq_ignore_ascii_case(p)) {
+                    return self.drive_name(d);
+                }
+                if let Some(sh) = shares().iter().find(|sh| sh.root().eq_ignore_ascii_case(p)) {
+                    return sh.name();
+                }
+                split_path(p).1
+            }
+        }
+    }
+    /// Where a side shows, in full ("C:/docs/Stuff"), for two-pane headers.
+    fn place_path(&self, f: &Files) -> String {
+        if f.path.is_empty() || f.path == BIN || f.path == SEARCH {
+            return self.place_title(f);
+        }
+        if let Some((i, inner)) = net_path(&f.path) {
+            return format!("{}:/{}", shares()[i].letter, inner.trim_start_matches('/'));
+        }
+        match f.drives.iter().position(|v| v.path != "/" && f.path.to_lowercase().starts_with(&v.path.to_lowercase())) {
+            Some(d) => format!("{}:{}", (b'C' + d as u8) as char, &f.path[f.drives[d].path.len()..]).replace(":", ":/").replace("//", "/"),
+            None => format!("C:{}", f.path),
+        }
+    }
+    fn tab_title(&self, i: usize) -> String {
+        if i == self.tab {
+            self.place_title(&self.files)
+        } else {
+            self.place_title(&self.tabs[i].files)
+        }
+    }
     fn files_view(&self, c: &mut Canvas, client: &Rect) {
         let s = self.ui;
         let f = &self.files;
@@ -2609,6 +2830,59 @@ impl Desktop {
             c.text(r.x + 10 * s, label_y(&r), label, ink, Font::Normal);
         }
 
+        // Tabs, and the two-pane switch.
+        let strip = self.files_tabs(client);
+        c.gradient(strip, rgb(236, 242, 250), rgb(218, 229, 243), 255);
+        c.fill(Rect::new(strip.x, strip.y + strip.h - 1, strip.w, 1), rgb(170, 188, 212));
+        for i in 0..self.tabs.len() {
+            let r = self.tab_rect(client, i);
+            let front = i == self.tab;
+            if front {
+                c.rounded(Rect::new(r.x, r.y, r.w, r.h + 2 * s), 4 * s, true, rgb(255, 255, 255), rgb(248, 251, 255), 255);
+                c.rounded_outline(Rect::new(r.x, r.y, r.w, r.h + 2 * s), 4 * s, true, rgb(140, 165, 200), 255);
+            } else if r.contains(px, py) {
+                c.rounded(r, 4 * s, true, rgb(246, 250, 255), rgb(226, 236, 250), 255);
+                c.rounded_outline(r, 4 * s, true, rgb(170, 188, 212), 255);
+            } else {
+                c.rounded_outline(r, 4 * s, true, rgb(190, 204, 224), 255);
+            }
+            c.folder(r.x + 7 * s, r.y + (r.h - 12 * s) / 2, s);
+            let closable = self.tabs.len() > 1;
+            let room = ((r.w - 32 * s - if closable { 20 * s } else { 0 }) / Font::Normal.w(s)).max(1) as usize;
+            let title: String = self.tab_title(i).chars().take(room).collect();
+            c.text(r.x + 28 * s, r.y + (r.h - Font::Normal.h(s)) / 2, &title, if front { 0x101010 } else { rgb(60, 70, 90) }, Font::Normal);
+            if closable {
+                let x = self.tab_close(client, i);
+                let ink = if x.contains(px, py) { rgb(190, 40, 30) } else { rgb(110, 120, 140) };
+                c.line(x.x + 4 * s, x.y + 4 * s, x.x + x.w - 5 * s, x.y + x.h - 5 * s, s.max(2), ink);
+                c.line(x.x + x.w - 5 * s, x.y + 4 * s, x.x + 4 * s, x.y + x.h - 5 * s, s.max(2), ink);
+            }
+        }
+        let plus = self.new_tab_button(client);
+        if plus.contains(px, py) {
+            c.rounded(plus, 3 * s, false, rgb(250, 252, 255), rgb(205, 225, 248), 255);
+        }
+        let (mx, my) = (plus.x + plus.w / 2, plus.y + plus.h / 2);
+        c.fill(Rect::new(mx - 6 * s, my - s, 12 * s, 2 * s), rgb(50, 70, 110));
+        c.fill(Rect::new(mx - s, my - 6 * s, 2 * s, 12 * s), rgb(50, 70, 110));
+        let pb = self.panes_button(client);
+        if self.other.is_some() {
+            c.rounded(pb, 3 * s, false, rgb(205, 225, 248), rgb(180, 208, 242), 255);
+            c.rounded_outline(pb, 3 * s, false, rgb(110, 140, 185), 255);
+        } else if pb.contains(px, py) {
+            c.rounded(pb, 3 * s, false, rgb(250, 252, 255), rgb(205, 225, 248), 255);
+            c.rounded_outline(pb, 3 * s, false, rgb(130, 155, 190), 255);
+        }
+        // Its icon: two side-by-side panels.
+        let ix = pb.x + 8 * s;
+        let iy = pb.y + (pb.h - 12 * s) / 2;
+        for px0 in [ix, ix + 9 * s] {
+            c.fill(Rect::new(px0, iy, 8 * s, 12 * s), 0xFFFFFF);
+            c.fill(Rect::new(px0, iy, 8 * s, 3 * s), rgb(90, 140, 210));
+            c.frame(Rect::new(px0, iy, 8 * s, 12 * s), rgb(50, 70, 110));
+        }
+        c.text(pb.x + 26 * s, pb.y + (pb.h - Font::Normal.h(s)) / 2, "Two panes", rgb(20, 40, 80), Font::Normal);
+
         // Navigation pane: Computer and the drives.
         let pane = self.files_pane(client);
         c.fill(pane, rgb(241, 245, 251));
@@ -2646,12 +2920,40 @@ impl Desktop {
             c.text(r.x + ix + 22 * s, label_y(&r), &shown, rgb(20, 40, 80), Font::Normal);
         }
 
-        let content = self.files_content(client);
-        c.fill(content, 0xFFFFFF);
+        c.fill(self.files_main(client), 0xFFFFFF);
+        if let Some(other) = &self.other {
+            // Two panes: each side's place along its top, the one in use in blue.
+            for right in [false, true] {
+                let mine = right == self.right;
+                let side_files: &Files = if mine { &self.files } else { other };
+                let h = self.side_header(client, right);
+                if mine {
+                    c.gradient(h, rgb(225, 238, 252), rgb(200, 222, 248), 255);
+                } else {
+                    c.gradient(h, rgb(246, 247, 249), rgb(230, 232, 236), 255);
+                }
+                c.fill(Rect::new(h.x, h.y + h.h - 1, h.w, 1), rgb(190, 200, 215));
+                let room = ((h.w - 16 * s) / Font::Normal.w(s)).max(1) as usize;
+                let place = self.place_path(side_files);
+                let skip = place.chars().count().saturating_sub(room);
+                let shown: String = place.chars().skip(skip).collect();
+                let ink = if mine { rgb(20, 50, 110) } else { rgb(90, 95, 105) };
+                c.text(h.x + 8 * s, h.y + (h.h - Font::Normal.h(s)) / 2, &shown, ink, Font::Normal);
+            }
+            let m = self.files_main(client);
+            let gap = self.side(client, false).x + self.side(client, false).w;
+            c.fill(Rect::new(gap, m.y, self.side(client, true).x - gap, m.h), rgb(190, 200, 215));
+            let k = self.other_content(client);
+            if other.path.is_empty() {
+                self.drives_view(c, client, other, k, false);
+            } else {
+                self.list_view(c, other, k, false);
+            }
+        }
         if in_folder {
-            self.folder_view(c, client);
+            self.list_view(c, &self.files, self.files_content(client), true);
         } else {
-            self.drives_view(c, client);
+            self.drives_view(c, client, &self.files, self.files_content(client), true);
         }
         self.props_view(c, client);
 
@@ -2672,28 +2974,25 @@ impl Desktop {
     }
 
     /// Computer: the drives as tiles, with how full each one is.
-    fn drives_view(&self, c: &mut Canvas, client: &Rect) {
+    fn drives_view(&self, c: &mut Canvas, client: &Rect, f: &Files, k: Rect, active: bool) {
         let s = self.ui;
-        let f = &self.files;
-        let k = self.files_content(client);
         let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
-        if f.form.is_some() {
+        if active && f.form.is_some() {
             self.form_view(c, client);
             return;
         }
-        let heading = format!("Drives ({})", self.tile_count());
+        let heading = format!("Drives ({})", f.drives.len() + shares().len());
         c.text(k.x + 12 * s, k.y + 8 * s, &heading, rgb(30, 57, 145), Font::Normal);
         let line_x = k.x + 24 * s + Font::Normal.width(s, &heading);
         c.fill(Rect::new(line_x, k.y + 8 * s + Font::Normal.h(s) / 2, k.x + k.w - 12 * s - line_x, 1), rgb(200, 215, 235));
         for i in 0..f.drives.len() {
-            let t = self.drive_tile(client, i);
+            let t = self.drive_tile_in(&k, i);
             if t.y + t.h > k.y + k.h {
                 break;
             }
             let v = &f.drives[i];
             if f.selected == Some(i) {
-                c.rounded(t, 3 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
-                c.rounded_outline(t, 3 * s, false, rgb(125, 162, 206), 255);
+                selected_tile(c, t, s, active);
             } else if t.contains(px, py) {
                 c.rounded(t, 3 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
                 c.rounded_outline(t, 3 * s, false, rgb(185, 210, 238), 255);
@@ -2725,13 +3024,12 @@ impl Desktop {
         }
         for (n, sh) in shares().iter().enumerate() {
             let i = f.drives.len() + n;
-            let t = self.drive_tile(client, i);
+            let t = self.drive_tile_in(&k, i);
             if t.y + t.h > k.y + k.h {
                 break;
             }
             if f.selected == Some(i) {
-                c.rounded(t, 3 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
-                c.rounded_outline(t, 3 * s, false, rgb(125, 162, 206), 255);
+                selected_tile(c, t, s, active);
             } else if t.contains(px, py) {
                 c.rounded(t, 3 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
                 c.rounded_outline(t, 3 * s, false, rgb(185, 210, 238), 255);
@@ -2931,14 +3229,15 @@ impl Desktop {
     }
 
     /// A folder: column headings, the rows and a scroll bar.
-    fn folder_view(&self, c: &mut Canvas, client: &Rect) {
+    /// A folder's entries in columns, in area `k`: the folder in use
+    /// (`active`), or in two-pane mode the other side (its selection grey).
+    fn list_view(&self, c: &mut Canvas, f: &Files, k: Rect, active: bool) {
         let s = self.ui;
-        let f = &self.files;
         let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
         let fw = Font::Normal.w(s);
-        let (type_x, size_x) = self.files_columns(client);
-        let head = self.files_head(client);
-        let rows = self.files_rows(client);
+        let (type_x, size_x) = self.columns_in(&k);
+        let head = self.head_in(&k);
+        let rows = self.rows_in(&k);
         let head_y = head.y + (head.h - Font::Normal.h(s)) / 2;
         let type_label = if f.path == BIN {
             "Original location"
@@ -2947,11 +3246,16 @@ impl Desktop {
         } else {
             "Type"
         };
+        // Narrow (one side of two): no Size column.
+        let sizes = size_x < rows.x + rows.w - 4 * s;
         for (by, label, x, end) in [
             (SortBy::Name, "Name", rows.x + 30 * s, type_x),
             (SortBy::Type, type_label, type_x, size_x),
             (SortBy::Size, "Size", size_x, rows.x + rows.w),
         ] {
+            if by == SortBy::Size && !sizes {
+                continue;
+            }
             // Headings that don't fit their column are cut short.
             let fit = ((end - x - 16 * s) / fw).max(1) as usize;
             let label: String = label.chars().take(fit).collect();
@@ -2982,12 +3286,14 @@ impl Desktop {
         }
         let name_cols = ((type_x - 12 * s - rows.x - 30 * s) / fw).max(1) as usize;
         let type_cols = ((size_x - 12 * s - type_x) / fw).max(1) as usize;
-        for (i, e) in f.entries.iter().enumerate().skip(f.scroll).take(self.files_visible(client)) {
-            let r = self.files_row(client, i - f.scroll);
+        for (i, e) in f.entries.iter().enumerate().skip(f.scroll).take(self.visible_in(&k)) {
+            let r = self.row_in(&k, i - f.scroll);
             let box_ = Rect::new(r.x + 2 * s, r.y, r.w - 4 * s, r.h);
-            if self.is_marked(i) {
+            if f.is_marked(i) && active {
                 c.rounded(box_, 2 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
                 c.rounded_outline(box_, 2 * s, false, rgb(125, 162, 206), 255);
+            } else if f.is_marked(i) {
+                c.rounded(box_, 2 * s, false, rgb(236, 238, 242), rgb(222, 225, 231), 255);
             } else if r.contains(px, py) {
                 c.rounded(box_, 2 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
             }
@@ -3017,7 +3323,7 @@ impl Desktop {
                     c.fill(Rect::new(caret, ty + 2 * s, s.max(2), Font::Normal.h(s) - 4 * s), 0x101010);
                 }
                 _ => {
-                    let cut = f.clip.as_ref().is_some_and(|k| k.cut && k.items.iter().any(|it| it.path == self.entry_path(i)));
+                    let cut = self.clip.as_ref().is_some_and(|k| k.cut && k.items.iter().any(|it| it.path == f.entry_path(i)));
                     let ink = if cut { rgb(140, 140, 140) } else { 0x101010 };
                     let name: String = if e.name.chars().count() > name_cols {
                         let mut n: String = e.name.chars().take(name_cols.saturating_sub(3)).collect();
@@ -3036,15 +3342,15 @@ impl Desktop {
             };
             let kind: String = kind.chars().take(type_cols).collect();
             c.text(type_x, ty, &kind, rgb(90, 90, 90), Font::Normal);
-            if !e.is_dir {
+            if !e.is_dir && sizes {
                 c.text(size_x, ty, &size_text(e.size), rgb(80, 80, 80), Font::Normal);
             }
         }
 
         // Scroll bar: arrows at the ends, the thumb showing what part is in view.
-        let sb = self.files_scrollbar(client);
+        let sb = self.scrollbar_in(&k);
         c.fill(sb, rgb(240, 241, 244));
-        let visible = self.files_visible(client);
+        let visible = self.visible_in(&k);
         let n = f.entries.len();
         let arrow = 16 * s;
         for (down, y) in [(false, sb.y), (true, sb.y + sb.h - arrow)] {
@@ -3078,6 +3384,9 @@ impl Desktop {
         spots.extend(self.crumb_rects(c).into_iter().map(|(r, _, _)| r));
         spots.extend(self.command_buttons(c).into_iter().map(|(_, _, r)| r));
         spots.extend((0..self.places().len()).map(|i| self.pane_item(c, i)));
+        spots.extend((0..self.tabs.len()).flat_map(|i| [self.tab_rect(c, i), self.tab_close(c, i)]));
+        spots.push(self.new_tab_button(c));
+        spots.push(self.panes_button(c));
         if self.files.form.is_some() {
             spots.push(self.form_button(c, true));
             spots.push(self.form_button(c, false));
@@ -3245,6 +3554,148 @@ impl Desktop {
             self.select(i);
         }
         r
+    }
+
+    /// Runs `f` with the other side of two panes in use, as if it were
+    /// the side in front (so its rows are where it is drawn).
+    fn with_other<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let mut other = self.other.take()?;
+        core::mem::swap(&mut self.files, &mut *other);
+        self.right = !self.right;
+        self.other = Some(other);
+        let r = f(self);
+        let mut other = self.other.take().unwrap();
+        core::mem::swap(&mut self.files, &mut *other);
+        self.right = !self.right;
+        self.other = Some(other);
+        Some(r)
+    }
+
+    /// Two panes: the other side comes into use.
+    fn switch_side(&mut self) -> Rect {
+        if self.files.rename.is_some() {
+            self.finish_rename();
+        }
+        let Some(mut other) = self.other.take() else { return Rect::EMPTY };
+        self.files.query_focus = false;
+        self.files.confirm = None;
+        self.files.props = None;
+        core::mem::swap(&mut self.files, &mut *other);
+        self.other = Some(other);
+        self.right = !self.right;
+        self.log_panes();
+        self.files_area()
+    }
+
+    /// Two panes on or off. A new side starts in the same folder; the
+    /// side in use stays when they close.
+    fn toggle_panes(&mut self) -> Rect {
+        if self.other.take().is_some() {
+            self.right = false;
+            println!("[desktop] two panes: off, {}", self.place_path(&self.files));
+            return self.files_area();
+        }
+        let path = if self.files.in_folder() { self.files.path.clone() } else { String::new() };
+        let mut other = Box::new(Files::new());
+        other.drives = self.files.drives.clone();
+        self.other = Some(other);
+        self.right = false;
+        self.with_other(|d| d.open_dir(path));
+        self.log_panes();
+        self.files_area()
+    }
+
+    fn log_panes(&self) {
+        let Some(other) = &self.other else { return };
+        let c = self.files_client();
+        let (left, right) = if self.right { (&**other, &self.files) } else { (&self.files, &**other) };
+        let (l, r) = (self.side_header(&c, false), self.side_header(&c, true));
+        let over: Vec<String> = self
+            .command_buttons(&c)
+            .into_iter()
+            .filter(|(cmd, _, _)| matches!(cmd, Command::CopyOver | Command::MoveOver))
+            .map(|(_, label, b)| format!("; {} at {},{}", label, b.x + b.w / 2, b.y + b.h / 2))
+            .collect();
+        println!("[desktop] two panes: left = {}, right = {}, {} in use; headers at {},{} and {},{}{}",
+            self.place_path(left), self.place_path(right), if self.right { "right" } else { "left" },
+            l.x + l.w / 2, l.y + l.h / 2, r.x + r.w / 2, r.y + r.h / 2, over.concat());
+    }
+
+    fn log_tabs(&self) {
+        let c = self.files_client();
+        let tabs: Vec<String> = (0..self.tabs.len())
+            .map(|i| {
+                let t = self.tab_rect(&c, i);
+                format!("{} at {},{}", self.tab_title(i), t.x + t.w / 2, t.y + t.h / 2)
+            })
+            .collect();
+        let (plus, panes) = (self.new_tab_button(&c), self.panes_button(&c));
+        println!("[desktop] tabs: {}; tab {} in front; + at {},{}; Two panes at {},{}", tabs.join(" | "), self.tab + 1,
+            plus.x + plus.w / 2, plus.y + plus.h / 2, panes.x + panes.w / 2, panes.y + panes.h / 2);
+    }
+
+    /// Brings tab `i` to the front.
+    fn switch_tab(&mut self, i: usize) -> Rect {
+        if i == self.tab || i >= self.tabs.len() {
+            return Rect::EMPTY;
+        }
+        if self.files.rename.is_some() {
+            self.finish_rename();
+        }
+        self.files.query_focus = false;
+        self.file_drag = None;
+        let back = core::mem::take(&mut self.tabs[i]);
+        let front = Tab {
+            files: core::mem::replace(&mut self.files, back.files),
+            other: core::mem::replace(&mut self.other, back.other),
+            right: core::mem::replace(&mut self.right, back.right),
+        };
+        self.tabs[self.tab] = front;
+        self.tab = i;
+        // What it shows may have changed while it was behind.
+        let keep = self.selected_entry().map(|e| e.name);
+        if self.files.in_folder() {
+            self.refresh(keep);
+        }
+        self.with_other(|d| {
+            if d.files.in_folder() {
+                let keep = d.selected_entry().map(|e| e.name);
+                d.refresh(keep);
+            }
+        });
+        self.log_tabs();
+        self.files_area()
+    }
+
+    /// A new tab, showing Computer, in front.
+    fn new_tab(&mut self) -> Rect {
+        if self.tabs.len() >= 12 {
+            self.files.status = String::from("That's as many tabs as there is room for");
+            return self.files_area();
+        }
+        let mut tab = Tab::default();
+        tab.files.drives = self.files.drives.clone();
+        self.tabs.push(tab);
+        let n = self.tabs.len() - 1;
+        self.switch_tab(n);
+        self.open_dir(String::new());
+        self.log_tabs();
+        self.files_area()
+    }
+
+    fn close_tab(&mut self, i: usize) -> Rect {
+        if self.tabs.len() < 2 || i >= self.tabs.len() {
+            return Rect::EMPTY;
+        }
+        if i == self.tab {
+            self.switch_tab(if i + 1 < self.tabs.len() { i + 1 } else { i - 1 });
+        }
+        self.tabs.remove(i);
+        if self.tab > i {
+            self.tab -= 1;
+        }
+        self.log_tabs();
+        self.files_area()
     }
 
     /// Reads the folder again, keeping the selection on `keep` if it is there.
@@ -3435,12 +3886,44 @@ impl Desktop {
     }
 
     fn command(&mut self, cmd: Command) -> Rect {
+        let r = self.run_command(cmd);
+        // In two panes, the other side may show what just changed.
+        if self.other.is_some() && !matches!(cmd, Command::Copy | Command::Cut | Command::Properties | Command::No) {
+            self.with_other(|d| {
+                if d.files.in_folder() || d.files.path == BIN {
+                    let keep = d.selected_entry().map(|e| e.name);
+                    d.refresh(keep);
+                }
+            });
+        }
+        r
+    }
+
+    fn run_command(&mut self, cmd: Command) -> Rect {
         let area = self.files_area();
         if !self.command_enabled(cmd) {
             return Rect::EMPTY;
         }
         let dir = self.files.path.clone();
         match cmd {
+            Command::CopyOver | Command::MoveOver => {
+                let to = self.other.as_ref().map(|o| o.path.clone()).unwrap_or_default();
+                let items = self.picked_items();
+                let cut = cmd == Command::MoveOver;
+                let n = items.len();
+                println!("[desktop] {} {} item{} to the other side, {}", if cut { "moving" } else { "copying" }, n, if n == 1 { "" } else { "s" }, to);
+                let (status, _) = self.transfer(&items, &to, cut);
+                if cut {
+                    if let Some(clip) = self.clip.as_mut() {
+                        clip.items.retain(|it| !items.iter().any(|m| m.path == it.path));
+                    }
+                    if self.clip.as_ref().is_some_and(|c| c.items.is_empty()) {
+                        self.clip = None;
+                    }
+                    self.refresh(None);
+                }
+                self.files.status = status;
+            }
             Command::NewFolder => {
                 let taken: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
                 let name = free_name("New folder", &taken, true, false);
@@ -3468,13 +3951,13 @@ impl Desktop {
                     _ => format!("{} items", items.len()),
                 };
                 self.files.status = format!("{} {}: open a folder and Paste", if cut { "Cut" } else { "Copied" }, what);
-                self.files.clip = Some(Clip { items, cut });
+                self.clip = Some(Clip { items, cut });
             }
             Command::Paste => {
-                let Some(clip) = self.files.clip.clone() else { return area };
+                let Some(clip) = self.clip.clone() else { return area };
                 let (status, moved) = self.transfer(&clip.items, &dir, clip.cut);
                 if clip.cut && moved > 0 {
-                    self.files.clip = None;
+                    self.clip = None;
                 }
                 self.files.status = status;
             }
@@ -4187,6 +4670,21 @@ impl Desktop {
                 }
             }
         }
+        // The other side of two panes: a folder on it, or the folder it shows.
+        if let Some(other) = self.other.as_ref().filter(|o| o.in_folder()) {
+            let k = self.other_content(&c);
+            if k.contains(x, y) {
+                let mut hit = (other.path.clone(), self.place_title(other));
+                let rows = self.rows_in(&k);
+                if rows.contains(x, y) {
+                    let i = other.scroll + ((y - rows.y) / self.files_row_h()) as usize;
+                    if let Some(e) = other.entries.get(i).filter(|e| e.is_dir) {
+                        hit = (other.entry_path(i), e.name.clone());
+                    }
+                }
+                target = Some(hit);
+            }
+        }
         if self.files_pane(&c).contains(x, y) {
             let places = self.places();
             if let Some(i) = (0..places.len()).find(|&i| self.pane_item(&c, i).contains(x, y)) {
@@ -4294,20 +4792,26 @@ impl Desktop {
                 if !self.files.path.eq_ignore_ascii_case(&dir) {
                     self.refresh(None);
                 }
-                if let Some(clip) = self.files.clip.as_mut() {
+                if let Some(clip) = self.clip.as_mut() {
                     // What was cut and has now moved can't be pasted.
                     if cut {
                         clip.items.retain(|it| !d.items.iter().any(|m| m.path == it.path));
                     }
                 }
-                if self.files.clip.as_ref().is_some_and(|c| c.items.is_empty()) {
-                    self.files.clip = None;
+                if self.clip.as_ref().is_some_and(|c| c.items.is_empty()) {
+                    self.clip = None;
                 }
                 let _ = name;
                 status
             }
         };
         self.files.status = status;
+        self.with_other(|d| {
+            if d.files.in_folder() || d.files.path == BIN {
+                let keep = d.selected_entry().map(|e| e.name);
+                d.refresh(keep);
+            }
+        });
         area
     }
 
@@ -4328,6 +4832,29 @@ impl Desktop {
             // OK, or a click anywhere else, closes it.
             self.files.props = None;
             return area;
+        }
+        if self.files_tabs(&c).contains(x, y) {
+            if self.panes_button(&c).contains(x, y) {
+                return self.toggle_panes();
+            }
+            if self.new_tab_button(&c).contains(x, y) {
+                return self.new_tab();
+            }
+            for i in 0..self.tabs.len() {
+                if self.tabs.len() > 1 && self.tab_close(&c, i).contains(x, y) {
+                    return self.close_tab(i);
+                }
+                if self.tab_rect(&c, i).contains(x, y) {
+                    return self.switch_tab(i);
+                }
+            }
+            return Rect::EMPTY;
+        }
+        if self.other.is_some() && self.side(&c, !self.right).contains(x, y) {
+            // The other side comes into use, and gets the click.
+            let header = self.side_header(&c, !self.right).contains(x, y);
+            let r = self.switch_side();
+            return if header { r } else { r.union(&self.files_click(x, y, double)) };
         }
         if self.files_search(&c).contains(x, y) {
             self.files.query_focus = true;
@@ -4506,6 +5033,21 @@ impl Desktop {
                 _ => Rect::EMPTY,
             };
         }
+        let ctrl = self.key_mods & aero::display::MOD_CTRL != 0;
+        match k {
+            // Ctrl+T, Ctrl+W: a new tab, close this one.
+            0x14 => return self.new_tab(),
+            0x17 => return self.close_tab(self.tab),
+            // Ctrl+Tab and Ctrl+Shift+Tab: the next or previous tab.
+            9 if ctrl => {
+                let n = self.tabs.len();
+                let back = self.key_mods & aero::display::MOD_SHIFT != 0;
+                return self.switch_tab(if back { (self.tab + n - 1) % n } else { (self.tab + 1) % n });
+            }
+            // Tab: the other side of two panes.
+            9 => return self.switch_side(),
+            _ => {}
+        }
         let count = if self.files.path.is_empty() { self.tile_count() } else { self.files.entries.len() };
         let c = self.files_client();
         let page = if self.files.path.is_empty() { self.tile_columns(&c) } else { self.files_visible(&c) };
@@ -4518,6 +5060,10 @@ impl Desktop {
             KEY_F2 => return self.command(Command::Rename),
             KEY_F5 => {
                 self.refresh(self.selected_entry().map(|e| e.name));
+                self.with_other(|d| {
+                    let keep = d.selected_entry().map(|e| e.name);
+                    d.refresh(keep);
+                });
                 return area;
             }
             0x03 => return self.command(Command::Copy),
@@ -4562,6 +5108,17 @@ impl Desktop {
             self.select(target.min(count - 1));
         }
         area
+    }
+}
+
+/// A selected drive tile; grey on the side of two panes not in use.
+fn selected_tile(c: &mut Canvas, t: Rect, s: i32, active: bool) {
+    if active {
+        c.rounded(t, 3 * s, false, rgb(220, 236, 252), rgb(196, 222, 250), 255);
+        c.rounded_outline(t, 3 * s, false, rgb(125, 162, 206), 255);
+    } else {
+        c.rounded(t, 3 * s, false, rgb(236, 238, 241), rgb(222, 225, 230), 255);
+        c.rounded_outline(t, 3 * s, false, rgb(175, 180, 190), 255);
     }
 }
 
@@ -4811,33 +5368,12 @@ fn main() -> i64 {
         started_us,
         clock: clock(started_us),
         quit: false,
-        files: Files {
-            path: String::new(),
-            entries: Vec::new(),
-            drives: Vec::new(),
-            scroll: 0,
-            selected: None,
-            marked: Vec::new(),
-            anchor: None,
-            status: String::new(),
-            back: Vec::new(),
-            forward: Vec::new(),
-            sort: SortBy::Name,
-            descending: false,
-            clip: None,
-            rename: None,
-            rename_all: false,
-            confirm: None,
-            bin: Vec::new(),
-            last_recycled: Vec::new(),
-            form: None,
-            query: String::new(),
-            query_focus: false,
-            searched_in: String::new(),
-            results: Vec::new(),
-            found: Vec::new(),
-            props: None,
-        },
+        files: Files::new(),
+        other: None,
+        right: false,
+        tabs: alloc::vec![Tab::default()],
+        tab: 0,
+        clip: None,
         calc: Calc { display: String::from("0"), ..Default::default() },
         icon: None,
         mouse_speed: { saved_network_drives(); saved_mouse_speed() },
