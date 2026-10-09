@@ -25,6 +25,9 @@ jobs:
       - name: Display test on virtio-gpu (no firmware framebuffer)
         run: ./tools/display-test.sh
 
+      - name: Display test on virtio-gpu, too big a screen (falls back to 1280x800)
+        run: HUGE=1 ./tools/display-test.sh
+
       - name: Upload ISO and serial log
         if: always()
         uses: actions/upload-artifact@v4
