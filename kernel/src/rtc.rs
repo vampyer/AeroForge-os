@@ -16,6 +16,51 @@ pub struct DateTime {
     pub second: u8,
 }
 
+impl DateTime {
+    /// As one number, YYYYMMDDhhmmss in decimal digits (what directory
+    /// listings carry; 0 means unknown).
+    pub fn packed(&self) -> u64 {
+        ((((self.year as u64 * 100 + self.month as u64) * 100 + self.day as u64) * 100 + self.hour as u64) * 100
+            + self.minute as u64)
+            * 100
+            + self.second as u64
+    }
+
+    /// From FAT's (and exFAT's) date and time words.
+    pub fn from_dos(date: u16, time: u16) -> Option<Self> {
+        let t = DateTime {
+            year: 1980 + (date >> 9),
+            month: (date >> 5 & 0xF) as u8,
+            day: (date & 0x1F) as u8,
+            hour: (time >> 11) as u8,
+            minute: (time >> 5 & 0x3F) as u8,
+            second: ((time & 0x1F) * 2) as u8,
+        };
+        ((1..=12).contains(&t.month) && (1..=31).contains(&t.day) && t.hour < 24 && t.minute < 60).then_some(t)
+    }
+
+    /// From an NTFS time: 100 ns steps since 1601-01-01 (UTC).
+    pub fn from_filetime(ft: u64) -> Option<Self> {
+        if ft == 0 {
+            return None;
+        }
+        let secs = ft / 10_000_000;
+        let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+        // Days since 1601-01-01 to a civil date (Howard Hinnant's method,
+        // counted from 0000-03-01): 1601-01-01 is day 584_694 there.
+        let z = days + 584_694;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+        let year = (yoe + era * 400 + if month <= 2 { 1 } else { 0 }) as u16;
+        Some(DateTime { year, month, day, hour: (rest / 3600) as u8, minute: (rest / 60 % 60) as u8, second: (rest % 60) as u8 })
+    }
+}
+
 fn cmos(reg: u8) -> u8 {
     unsafe {
         arch::outb(0x70, 0x80 | reg); // bit 7 keeps NMIs masked during the access

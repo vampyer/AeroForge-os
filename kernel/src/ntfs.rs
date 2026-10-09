@@ -19,6 +19,7 @@ use crate::vfs;
 
 type Res<T> = Result<T, &'static str>;
 
+const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_LIST: u32 = 0x20;
 const ATTR_VOLUME_NAME: u32 = 0x60;
 const ATTR_DATA: u32 = 0x80;
@@ -490,7 +491,15 @@ impl vfs::Volume for NtfsVolume {
             let Ok(attrs) = self.attributes(e.record) else { continue };
             let is_dir = attrs.iter().any(|a| a.kind == ATTR_INDEX_ROOT);
             let size = if is_dir { 0 } else { self.data_attr(&attrs, &[]).map_or(0, |a| a.size()) };
-            out.push(vfs::DirEntry { name: e.name, is_dir, size });
+            // $STANDARD_INFORMATION's second time is when the data last changed.
+            let modified = attrs
+                .iter()
+                .find(|a| a.kind == ATTR_STANDARD_INFORMATION)
+                .and_then(|a| a.value.as_ref())
+                .filter(|v| v.len() >= 16)
+                .and_then(|v| crate::rtc::DateTime::from_filetime(u64::from_le_bytes(v[8..16].try_into().unwrap())))
+                .map_or(0, |t| t.packed());
+            out.push(vfs::DirEntry { name: e.name, is_dir, size, modified });
         }
         Ok(out)
     }

@@ -547,21 +547,27 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
         }
         SYS_DIR_LIST => {
             // The entries of a directory into a user buffer, one record each:
-            // flags (1 = directory), size (8 bytes, little-endian), name length,
-            // name. Stops at the last record that fits; returns the bytes used.
+            // flags (1 = directory, 2 = a time follows the name), size (8 bytes,
+            // little-endian), name length, name, then when it was last written
+            // (8 bytes, YYYYMMDDhhmmss as a number) if known. Stops at the last
+            // record that fits; returns the bytes used.
             let path = user_str(a0, a1)?;
             let entries = vfs::list(&path).map_err(fs_error)?;
             let cap = a3.min(MAX_DIR_LIST) as usize;
             let mut out = Vec::new();
             for e in entries {
                 let name = &e.name.as_bytes()[..e.name.len().min(255)];
-                if out.len() + 10 + name.len() > cap {
+                let timed = e.modified != 0;
+                if out.len() + 10 + name.len() + if timed { 8 } else { 0 } > cap {
                     break;
                 }
-                out.push(e.is_dir as u8);
+                out.push(e.is_dir as u8 | (timed as u8) << 1);
                 out.extend_from_slice(&e.size.to_le_bytes());
                 out.push(name.len() as u8);
                 out.extend_from_slice(name);
+                if timed {
+                    out.extend_from_slice(&e.modified.to_le_bytes());
+                }
             }
             check_writable(a2, out.len() as u64)?;
             to_user(a2, &out)?;
