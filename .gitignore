@@ -1,3 +1,4 @@
 /build/
 /kernel/target/
 /userland/target/
+/tools/ntfs-check/target/

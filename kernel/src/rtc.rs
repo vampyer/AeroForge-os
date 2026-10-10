@@ -59,6 +59,19 @@ impl DateTime {
         let year = (yoe + era * 400 + if month <= 2 { 1 } else { 0 }) as u16;
         Some(DateTime { year, month, day, hour: (rest / 3600) as u8, minute: (rest / 60 % 60) as u8, second: (rest % 60) as u8 })
     }
+
+    /// As an NTFS time (the inverse of `from_filetime`).
+    pub fn filetime(&self) -> u64 {
+        let (m, d) = (self.month as i64, self.day as i64);
+        let y = self.year as i64 - if m <= 2 { 1 } else { 0 };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 584_694;
+        let secs = days * 86_400 + self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64;
+        secs.max(0) as u64 * 10_000_000
+    }
 }
 
 fn cmos(reg: u8) -> u8 {

@@ -195,15 +195,15 @@ read-only at `/<device>` (never at `/`). The driver reads the Master File Table,
 records split across several MFT entries by an attribute list, walks folder index B-trees,
 follows the cluster runs of fragmented files, and reads holes in sparse files as zeros.
 Lookups use the volume's own `$UpCase` table. Metadata files and `$Recycle.Bin` are hidden
-from the root listing, as in Explorer. Compressed and encrypted files are refused, and so are
-writes: NTFS keeps a journal that a writer has to honour, which is a project of its own. A
+from the root listing, as in Explorer. Compressed and encrypted files are refused, and so were
+writes until 0.57 (see below). A
 BitLocker-encrypted volume gets a warning to unlock it in Windows. The test drive is checked
 in as `tools/ntfs-test.part.xz` (about 110 KiB), because folders and fragmented, sparse and compressed
 files can only be put on NTFS by a real NTFS driver: `tools/make-ntfs-image.sh` rebuilds it with
 ntfs-3g, as root. The boot test attaches it as a second SATA drive. It lists a folder of 300
 photos (deep enough for an index B-tree), reads a file three folders down, and checks the
 fragmented and sparse files against checksums from ntfs-3g. It also checks that a compressed
-file and a write are refused.
+file is refused, and a write too until writing is turned on.
 
 Since 0.22 programs have hardware floating point and a fast way into the kernel. Every CPU
 turns on x87, SSE and AVX (and AVX-512 where the CPU has it) for ring 3, and the scheduler
@@ -470,7 +470,7 @@ sort with a click. New folder, Cut, Copy, Paste, Rename and Delete are on its co
 (Ctrl+N, Ctrl+X, Ctrl+C, Ctrl+V, F2, Delete; arrows, Home, End, Page Up and Down, Enter, Backspace and F5
 work too). Deleting moves things to the drive's Recycle Bin (a "Recycle Bin" folder at its root, with an
 `info.txt` saying where each one came from), where they can be restored or deleted for good; Ctrl+Z puts
-back the last thing deleted. NTFS drives stay read-only. Copies are limited to 8 MB a file for now. Keys
+back the last thing deleted. NTFS drives stay read-only (until 0.57). Copies are limited to 8 MB a file for now. Keys
 with no character (arrows, Delete, F2, F5) now reach programs that own the screen, and an empty file can
 be saved. The boot test makes, renames and fills a folder, deletes to the Recycle Bin, undoes it and
 deletes for good, then checks the disk image with mtools.
@@ -523,6 +523,22 @@ and choose "Show deleted files": it lists what was deleted there, and says which
 whole (their space on the disk has not been used again). Right-click the empty space of the Recycle Bin and
 choose "Show emptied files" for what was emptied from it; those go back where they were deleted from.
 
+Since 0.57 NTFS drives (the ones Windows uses) can be written to. They still start read-only: right-click
+the drive in Computer and choose "Allow changes" (or `writable /<device> on` in the shell), and "Make
+read-only" turns it off again. Writing is only allowed when Windows left the drive clean: not marked for
+chkdsk, nothing left in its journal, and not hibernated (Windows' Fast Startup hibernates too, so shut
+Windows down with Shift held, or turn Fast Startup off). AeroForge saves over files, makes files and
+folders, and deletes them; folder indexes grow and split as Windows' do, and the file table grows when
+it is full. To keep the drive safe if AeroForge stops part way (no journal is kept, as with ntfs-3g):
+the journal is emptied before the first change, every change runs between setting and clearing the
+drive's dirty flag, so Windows runs chkdsk if one was cut off, and space is taken before it is used and
+freed only after nothing refers to it. Compressed, encrypted and sparse files, links, and Windows' own
+files are not changed. Files deleted on an NTFS drive are deleted for good (Windows keeps its own Recycle
+Bin there). `tools/ntfs-write-test.sh` runs the NTFS driver on the build machine against copies of the
+test drive (making, saving over and deleting hundreds of files) and checks the result with ntfsprogs
+(ntfsfix, ntfsresize, ntfsls, ntfscat) and `tools/ntfs-check`; the boot test also writes to the NTFS
+drive from the shell and the desktop and checks it the same way after QEMU exits.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -537,7 +553,7 @@ choose "Show emptied files" for what was emptied from it; those go back where th
 | PCIe | Enumeration through ECAM (ACPI MCFG), 64-bit BARs, bus mastering |
 | C++ drivers | Behind `drivers/include/dhi.h` (ABI v3: logging, port I/O, DMA buffers, MMIO mapping, delays, waiting for an interrupt): PS/2 keyboard, an **NVMe** driver (admin + I/O queue pair, MSI-X completion interrupts, Identify, reads and writes up to 8 KiB per command, flush), an **AHCI** (SATA) driver (one command slot per port, MSI completion interrupts, IDENTIFY DEVICE, LBA48 READ/WRITE DMA EXT, FLUSH CACHE EXT) and an **xHCI** (USB 3) driver (command and event rings, device enumeration through hubs (nested up to the USB limit, transaction translators for slow devices behind fast hubs), HID boot keyboard and mouse, bulk-only mass storage with SCSI reads, writes and cache sync, Bluetooth HCI transport with isochronous voice endpoints, polled from a kernel thread) and an **Intel Ethernet** driver (e1000/e1000e: one receive and one transmit ring of legacy descriptors, MAC from the receive-address registers or EEPROM, link and speed) and an **igb/igc** driver (I210/I211/I350/82576 and I225/I226 at up to 2.5 Gb/s: advanced descriptors, PHY power-up and auto-negotiation over MDIO, I225 EEE workaround) and a **MediaTek Bluetooth** set-up driver (MT7921/MT7922 firmware download over the WMT vendor protocol) and an **HD Audio** driver (CORB/RIRB, codec widget graph, output routing, one 48 kHz stereo output stream) and an **AMD display engine** driver (DCN 2.1: the firmware's display pipe, page flips at vertical blank) and a **virtio-gpu** driver (control queue, 2D resources backed by scattered pages, scanout, transfer and flush of changed rectangles) |
 | Networking | smoltcp (IPv4, ARP, ICMP, UDP, TCP) on the first Intel NIC (e1000, e1000e, igb or igc), run by the `net` kernel thread (woken by MSI-X on igb/igc, polled on e1000); DHCP client; ICMP echo; UDP and TCP sockets for programs, TCP servers (listen and accept) and DNS lookups |
-| Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and **exFAT**, read-only **NTFS**, all with case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
+| Storage | Block device layer, GPT and MBR partitions, read-write **FAT32** with long file names and **exFAT**, **NTFS** (read-only until writing is turned on, drive by drive), all with case-insensitive lookup, first volume at `/` and the others at `/<device>`; `file_read`, `file_write`, `file_delete` and `dir_create` system calls; CMOS real-time clock for file times |
 | Security | NX, SMEP, SMAP, UMIP and CR0.WP on every CPU that has them; W^X kernel image (code read-only, data, heap, stacks and the direct map non-executable); guard pages under every kernel stack (overflow is reported, not silent); random stack canary (RDRAND) checked by the C++ drivers; every system call copies user memory through checked `copy_from_user` / `copy_to_user` (mapped, user-owned, writable for writes); user code W^X, stacks non-executable; a boot audit re-checks all of it |
 | Userland | `libaero` system call library, `aerosmss` (reads its session from disk), `echod`, `client`, `crasher`, `sectest` / `nxtest` / `rotest` (security self-test), `melody` (plays sound), `padtest` (reads the gamepads), `savetest` (saves files), `fputest` (floating point and vector registers), `threadtest` (threads, heap, locks), `balancetest` (threads moving between CPUs), `priotest` (thread priorities), `timertest` (precise sleeps and timeouts), `spreadtest` (balancing between busy CPUs), `nettest` (UDP and TCP sockets, DNS, a TCP server), `waittest` (waiting on several handles), `drawtest` (drawing on the whole screen) and `sleeper` (Rust, `no_std` with `alloc`, hardware floating point) |
 | Shell | `ps`, `sched`, `run <prog>`, `ports`, `lspci`, `display`, `lsusb`, `mouse`, `ifconfig`, `ping <ip>`, `bt`, `bt scan`, `bt pair`, `gamepad`, `mic`, `mic record`, `sound`, `sound test`, `sound use`, `disks`, `ls`, `cat`, `wc`, `mem`, `irq`, `cpu`, `acpi`, `uptime`, `int3`, `panic` |
@@ -561,7 +577,7 @@ The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 3. Handles to threads, and waiting on them with `wait_any`.
 4. An ACPICA port (the current table walker never touches AML), TSC-deadline timer mode, deeper CPU sleep states (MWAIT C-states from the ACPI tables), and x2APIC mode.
 5. `dhi.idl` and a generator for `dhi.h` / `dhi.rs`; one NVMe queue pair per CPU; AHCI NCQ; USB Attached SCSI (UAS) and xHCI hotplug events; virtio-net, e1000 interrupts, waiting on several sockets at once, and IPv6.
-6. Filesystems move to user-space servers behind IPC, as the design says; NTFS writes and compressed NTFS files.
+6. Filesystems move to user-space servers behind IPC, as the design says; compressed NTFS files.
 7. KASLR (needs a position-independent kernel build), Rust stack canaries once they reach stable Rust, and targeted TLB shootdowns (only the CPUs running the program, one page at a time).
 
 ## Layout
@@ -615,6 +631,8 @@ tools/make-usb-disk.sh    builds the USB stick images (MBR + FAT32 or exFAT) fro
 tools/exfat.py            puts files on an exFAT image and reads them back (boot test)
 tools/make-ntfs-disk.sh   builds the NTFS test drive from tools/ntfs-test.part.xz
 tools/make-ntfs-image.sh  rebuilds tools/ntfs-test.part.xz with ntfs-3g (needs root)
+tools/ntfs-write-test.sh  tests the NTFS writer on the build machine, checked with ntfsprogs
+tools/ntfs-check/         runs the kernel's NTFS driver on an image file and checks folder indexes
 tools/fetch-firmware.sh   downloads the pinned MediaTek Bluetooth firmware into build/firmware/
 tools/fakebt/             simulated USB Bluetooth adapter, gamepads and headset for QEMU (usbredir, C)
 tools/qemu-type.py        types at the guest's shell through the QEMU monitor (boot test)

@@ -55,6 +55,11 @@ pub trait Volume: Send + Sync {
     fn create_dir(&self, path: &str) -> Result<(), &'static str>;
     /// Deletes a file or an empty directory.
     fn remove(&self, path: &str) -> Result<(), &'static str>;
+    /// Turns writing on or off, for volumes written to only when asked
+    /// (NTFS); Err says why it can't be.
+    fn set_writable(&self, _on: bool) -> Result<(), &'static str> {
+        Err("this kind of volume is always writable")
+    }
     /// Deleted entries that can still be seen in directory `path`.
     fn deleted(&self, _path: &str) -> Result<Vec<Deleted>, &'static str> {
         Err("not supported on this kind of volume")
@@ -120,7 +125,7 @@ pub fn mount(dev: Arc<dyn BlockDevice>) -> Option<Arc<Mount>> {
     let mut mounts = MOUNTS.lock();
     // "/" goes to the first writable volume; the others get "/<device>".
     let root_taken = mounts.iter().any(|m| m.path == "/");
-    let path = if !root_taken && !vol.read_only() { String::from("/") } else { format!("/{}", vol.dev().name()) };
+    let path = if !root_taken && !vol.read_only() && vol.kind() != "NTFS" { String::from("/") } else { format!("/{}", vol.dev().name()) };
     let m = Arc::new(Mount { path, vol });
     mounts.push(m.clone());
     Some(m)
@@ -228,6 +233,15 @@ pub fn undelete(path: &str, slot: u32) -> Result<String, &'static str> {
         return Err("read-only volume");
     }
     m.vol.undelete(inner, slot)
+}
+
+/// Turns writing to the volume mounted at `path` on or off.
+pub fn set_writable(path: &str, on: bool) -> Result<(), &'static str> {
+    let (m, inner) = resolve(path)?;
+    if !is_root(inner) {
+        return Err("not a drive");
+    }
+    m.vol.set_writable(on)
 }
 
 /// Where a block device is mounted, if anywhere.

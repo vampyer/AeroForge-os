@@ -861,6 +861,8 @@ enum Act {
     View,
     /// What was deleted for good from this folder.
     ShowDeleted,
+    /// Allow changes to the selected (NTFS) drive, or make it read-only again.
+    Writes(bool),
     /// A line between groups.
     Line,
 }
@@ -5139,7 +5141,8 @@ impl Desktop {
     fn recycle_root_of(&self, path: &str) -> Option<String> {
         let d = self.drive_of(path)?;
         let v = &self.files.drives[d];
-        if v.read_only { None } else { Some(v.path.clone()) }
+        // Not on Windows drives: Windows keeps its own Recycle Bin there.
+        if v.read_only || v.kind == "NTFS" { None } else { Some(v.path.clone()) }
     }
 
     fn read_bin(root: &str) -> Vec<Recycled> {
@@ -5907,6 +5910,28 @@ impl Desktop {
                 };
                 self.navigate(String::from(DELETED))
             }
+            Act::Writes(on) => {
+                let Some(d) = self.files.selected.filter(|&d| d < self.files.drives.len()) else { return area };
+                let (path, name) = (self.files.drives[d].path.clone(), self.drive_name(d));
+                match aero::set_writable(&path, on) {
+                    Ok(()) => {
+                        println!("[desktop] {} is {}", name, if on { "writable" } else { "read-only" });
+                        self.files.status = String::from(if on {
+                            "You can now change the files on this drive"
+                        } else {
+                            "This drive is read-only again"
+                        });
+                    }
+                    Err(why) => {
+                        println!("[desktop] can't allow changes to {}: {}", name, why);
+                        self.files.status = format!("Can't allow changes: {}", why);
+                    }
+                }
+                if let Ok(drives) = aero::volumes() {
+                    self.files.drives = drives;
+                }
+                self.files_area()
+            }
             Act::Line => Rect::EMPTY,
         };
         area.union(&r).union(&self.sync_preview())
@@ -5961,6 +5986,10 @@ impl Desktop {
                     let mut v = alloc::vec![(Open, "Open", true), (OpenInTab, "Open in new tab", true), (Line, "", false)];
                     if i >= self.files.drives.len() {
                         v.push((Do(Command::Disconnect), "Disconnect", true));
+                    } else if self.files.drives[i].kind == "NTFS" {
+                        // Windows drives are read-only until asked.
+                        v.push(if self.files.drives[i].read_only { (Writes(true), "Allow changes", true) } else { (Writes(false), "Make read-only", true) });
+                        v.push((Line, "", false));
                     }
                     v.push((Do(Command::Properties), "Properties", true));
                     v
