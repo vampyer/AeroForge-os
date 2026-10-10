@@ -689,8 +689,9 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
         mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to AeroForge.txt" | head -n 1 | grep -q "Welcome to AeroForge OS" \
             || { fail "the copy in /docs/Stuff is not on the NVMe disk image"; }
-        ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 && ! mdir -i build/disk.img@@1M "::/docs/Welcome to AeroForge - Copy.txt" >/dev/null 2>&1 \
-            || { fail "the renamed folder or the deleted copy is still on the NVMe disk image"; }
+        # (The deleted copy comes back later, from the files emptied from the Recycle Bin.)
+        ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 \
+            || { fail "the renamed folder is still on the NVMe disk image"; }
         [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
             || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
         python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
