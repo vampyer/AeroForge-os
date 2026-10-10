@@ -5255,14 +5255,8 @@ impl Desktop {
     /// Deletes something in the Recycle Bin for good.
     /// `emptied`: remember it, so it can still be undeleted (FAT32).
     fn purge(&self, item: &Recycled, emptied: bool) -> Result<(), String> {
-        match delete_tree(&item.stored(), item.is_dir) {
-            Ok(_) => {}
-            // Gone already: just drop it from the list.
-            Err(_) if aero::list_dir(&join(&item.root, BIN_DIR)).is_ok_and(|l| !l.iter().any(|e| e.name == item.id)) => {}
-            Err(m) => return Err(m),
-        }
-        let items: Vec<Recycled> = Self::read_bin(&item.root).into_iter().filter(|b| b.id != item.id).collect();
-        Self::write_bin(&item.root, &items)?;
+        // The list first: written after, a new list file could take the
+        // directory slot of what was just deleted, and lose its name.
         if emptied {
             let mut gone = Self::read_list(&item.root, BIN_GONE);
             gone.push(item.clone());
@@ -5271,6 +5265,14 @@ impl Desktop {
                 println!("[desktop] {}", m);
             }
         }
+        match delete_tree(&item.stored(), item.is_dir) {
+            Ok(_) => {}
+            // Gone already: just drop it from the list.
+            Err(_) if aero::list_dir(&join(&item.root, BIN_DIR)).is_ok_and(|l| !l.iter().any(|e| e.name == item.id)) => {}
+            Err(m) => return Err(m),
+        }
+        let items: Vec<Recycled> = Self::read_bin(&item.root).into_iter().filter(|b| b.id != item.id).collect();
+        Self::write_bin(&item.root, &items)?;
         println!("[desktop] removed {} from the Recycle Bin", item.original);
         Ok(())
     }
