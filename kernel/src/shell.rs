@@ -90,6 +90,7 @@ impl Shell {
                 kprintln!("  write <path> <text>  save a line of text as a file (replacing it); quote a path with spaces");
                 kprintln!("  mkdir <path>  create a directory");
                 kprintln!("  rm <path>   delete a file or an empty directory");
+                kprintln!("  writable <drive> on|off  allow changes to an NTFS drive (Windows must have shut it down fully)");
                 kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
                 kprintln!("  mem         buddy allocator, slab heap and paging");
                 kprintln!("  irq         device interrupts (MSI-X, MSI) and how often they fired");
@@ -394,6 +395,13 @@ impl Shell {
             "mkdir" => match vfs::create_dir(arg) {
                 Ok(()) => kprintln!("  created directory {}", arg),
                 Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
+            },
+            "writable" => match arg.rsplit_once(' ') {
+                Some((path, on @ ("on" | "off"))) => match vfs::set_writable(path, on == "on") {
+                    Ok(()) => kprintln!("  {} is {}", path, if on == "on" { "writable" } else { "read-only" }),
+                    Err(e) => console::print_colored(YELLOW, format_args!("  {}: can't be written to: {}\n", path, e)),
+                },
+                _ => console::print_colored(YELLOW, format_args!("  usage: writable <drive> on|off\n")),
             },
             "rm" => match vfs::remove(arg) {
                 Ok(()) => kprintln!("  deleted {}", arg),

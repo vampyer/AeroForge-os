@@ -181,6 +181,7 @@ pub const SYS_MOUSE_SPEED: u64 = 54;
 pub const SYS_VOLUMES: u64 = 55;
 pub const SYS_DELETED_LIST: u64 = 56;
 pub const SYS_UNDELETE: u64 = 57;
+pub const SYS_SET_WRITABLE: u64 = 58;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -262,7 +263,8 @@ fn fs_error(e: &'static str) -> i64 {
         "disk full" => E_FULL,
         "already exists" => E_EXISTS,
         "its data has been written over" | "its data is gone" => E_FULL,
-        "NTFS volumes are read-only for now" => E_RIGHTS,
+        "writing to this NTFS drive is not turned on" | "that file is marked read-only" | "that is one of Windows' own files" => E_RIGHTS,
+        "the drive's file table is full" => E_FULL,
         _ => E_INVAL,
     }
 }
@@ -611,6 +613,21 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             check_writable(a3, name.len() as u64)?;
             to_user(a3, name)?;
             Ok(name.len() as u64)
+        }
+        SYS_SET_WRITABLE => {
+            // Turns writing to the drive mounted at a0/a1 on (a2 = 1) or off.
+            // When it can't be, writes why to a3 (up to 255 bytes; the caller
+            // zeroes the buffer first) and returns E_RIGHTS.
+            let path = user_str(a0, a1)?;
+            match vfs::set_writable(&path, a2 == 1) {
+                Ok(()) => Ok(0),
+                Err(why) => {
+                    let why = &why.as_bytes()[..why.len().min(255)];
+                    check_writable(a3, why.len() as u64)?;
+                    to_user(a3, why)?;
+                    Err(E_RIGHTS)
+                }
+            }
         }
         SYS_VOLUMES => {
             // The mounted volumes into a user buffer, root first, one record
