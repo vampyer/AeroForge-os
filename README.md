@@ -518,6 +518,11 @@ saved games, disc images), folders can be shown as Large icons ("Large icons" ne
 right-click menu), and Details has a Date modified column. The dates come from the drives themselves: FAT32,
 exFAT and NTFS volumes and network drives all carry them, and clicking the heading sorts by it.
 
+Since 0.56 files deleted for good can be brought back on FAT32 drives. Right-click the empty space of a folder
+and choose "Show deleted files": it lists what was deleted there, and says which ones can still be restored
+whole (their space on the disk has not been used again). Right-click the empty space of the Recycle Bin and
+choose "Show emptied files" for what was emptied from it; those go back where they were deleted from.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

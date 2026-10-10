@@ -179,6 +179,8 @@ pub const SYS_TIME: u64 = 52;
 pub const SYS_DIR_LIST: u64 = 53;
 pub const SYS_MOUSE_SPEED: u64 = 54;
 pub const SYS_VOLUMES: u64 = 55;
+pub const SYS_DELETED_LIST: u64 = 56;
+pub const SYS_UNDELETE: u64 = 57;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -259,6 +261,7 @@ fn fs_error(e: &'static str) -> i64 {
         "file not found" | "not a directory" | "no filesystem mounted" | "no filesystem mounted at /" => E_NOTFOUND,
         "disk full" => E_FULL,
         "already exists" => E_EXISTS,
+        "its data has been written over" | "its data is gone" => E_FULL,
         "NTFS volumes are read-only for now" => E_RIGHTS,
         _ => E_INVAL,
     }
@@ -572,6 +575,42 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             check_writable(a2, out.len() as u64)?;
             to_user(a2, &out)?;
             Ok(out.len() as u64)
+        }
+        SYS_DELETED_LIST => {
+            // Deleted entries still in a directory, one record each: flags
+            // (1 = directory, 2 = its data is all still there), size and
+            // last-written time (8 bytes each, little-endian), its slot in the
+            // directory (4 bytes), name length, name. Returns the bytes used.
+            let path = user_str(a0, a1)?;
+            let entries = vfs::deleted(&path).map_err(fs_error)?;
+            let cap = a3.min(MAX_DIR_LIST) as usize;
+            let mut out = Vec::new();
+            for e in entries {
+                let name = &e.name.as_bytes()[..e.name.len().min(255)];
+                if out.len() + 22 + name.len() > cap {
+                    break;
+                }
+                out.push(e.is_dir as u8 | (e.whole as u8) << 1);
+                out.extend_from_slice(&e.size.to_le_bytes());
+                out.extend_from_slice(&e.modified.to_le_bytes());
+                out.extend_from_slice(&e.slot.to_le_bytes());
+                out.push(name.len() as u8);
+                out.extend_from_slice(name);
+            }
+            check_writable(a2, out.len() as u64)?;
+            to_user(a2, &out)?;
+            Ok(out.len() as u64)
+        }
+        SYS_UNDELETE => {
+            // Brings back deleted entry a2 (its slot) of directory a0/a1, and
+            // writes its name (up to 255 bytes) to a3; returns the name's length.
+            let path = user_str(a0, a1)?;
+            writable_by_programs(&path)?;
+            let name = vfs::undelete(&path, a2 as u32).map_err(fs_error)?;
+            let name = &name.as_bytes()[..name.len().min(255)];
+            check_writable(a3, name.len() as u64)?;
+            to_user(a3, name)?;
+            Ok(name.len() as u64)
         }
         SYS_VOLUMES => {
             // The mounted volumes into a user buffer, root first, one record

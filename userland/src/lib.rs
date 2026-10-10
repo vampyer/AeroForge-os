@@ -68,6 +68,8 @@ pub mod sys {
     pub const DIR_LIST: u64 = 53;
     pub const MOUSE_SPEED: u64 = 54;
     pub const VOLUMES: u64 = 55;
+    pub const DELETED_LIST: u64 = 56;
+    pub const UNDELETE: u64 = 57;
 }
 
 pub mod rights {
@@ -269,6 +271,50 @@ pub struct Volume {
     pub size: u64,
     /// Free bytes, when the volume keeps count.
     pub free: Option<u64>,
+}
+
+/// A deleted file or folder still listed in its folder (FAT32 drives).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deleted {
+    pub name: alloc::string::String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: u64,
+    /// Where it is in its folder: what `undelete` takes.
+    pub slot: u32,
+    /// Its data is all still there: it can come back whole.
+    pub whole: bool,
+}
+
+/// The deleted files and folders still listed in folder `path`.
+pub fn deleted_list(path: &str) -> Result<alloc::vec::Vec<Deleted>, i64> {
+    let mut buf = alloc::vec![0u8; 256 * 1024];
+    let n = check(unsafe {
+        syscall(sys::DELETED_LIST, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    })? as usize;
+    let mut out = alloc::vec::Vec::new();
+    let mut at = 0;
+    while at + 22 <= n {
+        let len = buf[at + 21] as usize;
+        let name = &buf[at + 22..(at + 22 + len).min(n)];
+        out.push(Deleted {
+            name: alloc::string::String::from_utf8_lossy(name).into_owned(),
+            is_dir: buf[at] & 1 != 0,
+            whole: buf[at] & 2 != 0,
+            size: u64::from_le_bytes(buf[at + 1..at + 9].try_into().unwrap()),
+            modified: u64::from_le_bytes(buf[at + 9..at + 17].try_into().unwrap()),
+            slot: u32::from_le_bytes(buf[at + 17..at + 21].try_into().unwrap()),
+        });
+        at += 22 + len;
+    }
+    Ok(out)
+}
+
+/// Brings back deleted entry `slot` of folder `path`; returns its name.
+pub fn undelete(path: &str, slot: u32) -> Result<alloc::string::String, i64> {
+    let mut name = [0u8; 255];
+    let n = check(unsafe { syscall(sys::UNDELETE, path.as_ptr() as u64, path.len() as u64, slot as u64, name.as_mut_ptr() as u64) })? as usize;
+    Ok(alloc::string::String::from_utf8_lossy(&name[..n.min(255)]).into_owned())
 }
 
 /// The mounted volumes, root first.

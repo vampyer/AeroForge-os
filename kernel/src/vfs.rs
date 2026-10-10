@@ -55,6 +55,27 @@ pub trait Volume: Send + Sync {
     fn create_dir(&self, path: &str) -> Result<(), &'static str>;
     /// Deletes a file or an empty directory.
     fn remove(&self, path: &str) -> Result<(), &'static str>;
+    /// Deleted entries that can still be seen in directory `path`.
+    fn deleted(&self, _path: &str) -> Result<Vec<Deleted>, &'static str> {
+        Err("not supported on this kind of volume")
+    }
+    /// Brings back deleted entry `slot` of directory `path`; returns its name.
+    fn undelete(&self, _path: &str, _slot: u32) -> Result<String, &'static str> {
+        Err("not supported on this kind of volume")
+    }
+}
+
+/// A deleted file or directory still listed in its directory.
+#[derive(Clone, Debug)]
+pub struct Deleted {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: u64,
+    /// Where it is in its directory, to ask for it back.
+    pub slot: u32,
+    /// Whether its data is all still there (not written over).
+    pub whole: bool,
 }
 
 pub struct Mount {
@@ -192,6 +213,21 @@ pub fn create_dir(path: &str) -> Result<(), &'static str> {
 pub fn remove(path: &str) -> Result<(), &'static str> {
     let (m, inner) = resolve_entry(path)?;
     m.vol.remove(inner)
+}
+
+/// Deleted entries still in directory `path`.
+pub fn deleted(path: &str) -> Result<Vec<Deleted>, &'static str> {
+    let (m, inner) = resolve(path)?;
+    m.vol.deleted(inner)
+}
+
+/// Brings back deleted entry `slot` of directory `path`; returns its name.
+pub fn undelete(path: &str, slot: u32) -> Result<String, &'static str> {
+    let (m, inner) = resolve(path)?;
+    if m.vol.read_only() {
+        return Err("read-only volume");
+    }
+    m.vol.undelete(inner, slot)
 }
 
 /// Where a block device is mounted, if anywhere.
