@@ -550,6 +550,12 @@ dirty-flag bracket as other changes. `tools/ntfs-write-test.sh` renames and move
 (including files with DOS short names) and checks the volume with ntfsprogs, and the boot test moves files
 and folders on a SATA FAT32 disk, the exFAT stick and the NTFS drive from the shell.
 
+Also since 0.58 AeroForge goes straight to the desktop: aerosmss starts it once the programs in
+`/system/session.cfg` are running. Esc or Start > Exit to console leaves it at the console, and `run
+desktop` brings it back. A line `console` in session.cfg keeps the machine at the console instead (the
+boot test adds one, as it types at the console first); the display test checks that the desktop comes up
+on its own.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
