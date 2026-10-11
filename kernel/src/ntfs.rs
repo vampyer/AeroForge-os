@@ -1887,6 +1887,98 @@ impl NtfsVolume {
         })
     }
 
+    /// Renames or moves a file or folder within the volume. Its record gets
+    /// one new $FILE_NAME (any DOS short name is dropped, as Windows does
+    /// when it renames to a name that needs none), the new folder's index
+    /// gains the name and the old one loses its names. Nothing else moves.
+    fn rename_locked(&self, st: &mut State, from: &str, to: &str) -> Res<()> {
+        if vfs::is_inside(to, from) {
+            return Err("can't move a folder into itself");
+        }
+        let (sdir, name) = self.split(from)?;
+        let n = self.find_in(sdir, name)?.ok_or("file not found")?;
+        let (ddir, new_name) = self.split(to)?;
+        if let Some(why) = bad_name(new_name) {
+            return Err(why);
+        }
+        if let Some(m) = self.find_in(ddir, new_name)? {
+            if m != n {
+                return Err("already exists");
+            }
+        }
+        let rec = self.record(n)?;
+        self.can_change(n, &rec)?;
+        let is_dir = u16_at(&rec, 22) & 2 != 0;
+        // Its names now: the index keys to take out, and to put back if
+        // anything fails.
+        let olds: Vec<Vec<u8>> = attrs_of(&rec, ATTR_FILE_NAME)
+            .into_iter()
+            .filter_map(|(p, _)| resident_value(&rec, p).map(|v| v.to_vec()))
+            .filter(|v| v.len() >= 66)
+            .collect();
+        let main = olds.iter().find(|v| v[65] != NAMESPACE_DOS).ok_or("bad NTFS record")?;
+        let units: Vec<u16> = new_name.encode_utf16().collect();
+        let name_of = |v: &[u8]| -> Vec<u16> { (0..v[64] as usize).map(|i| u16_at(v, 66 + 2 * i)).collect() };
+        if sdir == ddir && olds.len() == 1 && name_of(main) == units {
+            return Ok(());
+        }
+        // The new name keeps the old one's times, sizes and flags.
+        let parent_ref = self.reference(ddir)?;
+        let mut value = file_name_value(parent_ref, &units, is_dir, 0, 0, 0, if is_dos_name(new_name) { NAMESPACE_BOTH } else { NAMESPACE_WIN32 });
+        value[8..64].copy_from_slice(&main[8..64]);
+        put64(&mut value, 0x18, self.now()); // record changed
+        if let Some(p) = find_attr(&rec, ATTR_DATA, &[]) {
+            let (allocated, size) = if rec[p + 8] != 0 {
+                (u64_at(&rec, p + 0x28), u64_at(&rec, p + 0x30))
+            } else {
+                let len = u32_at(&rec, p + 16) as u64;
+                ((len + 7) & !7, len)
+            };
+            put64(&mut value, 40, allocated);
+            put64(&mut value, 48, size);
+        }
+        let mut new_rec = rec.clone();
+        let mut found = attrs_of(&new_rec, ATTR_FILE_NAME);
+        found.reverse();
+        for (p, len) in found {
+            splice(&mut new_rec, p, len, &[])?;
+        }
+        add_attr(&mut new_rec, resident_attr(ATTR_FILE_NAME, &[], &value, true))?;
+        // Taking the old names out first when one is spelled exactly like
+        // the new one (an index can't hold it twice).
+        let clash = sdir == ddir && olds.iter().any(|v| name_of(v) == units);
+        let file_ref = self.reference(n)?;
+        self.change(st, |v, st| {
+            let remove_old = |v: &Self, st: &mut State| -> Res<()> {
+                for old in &olds {
+                    match v.index_remove(st, sdir, &name_of(old)) {
+                        Ok(()) | Err("file not found") => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            };
+            if clash {
+                remove_old(v, st)?;
+            }
+            v.write_record(n, &new_rec)?;
+            if let Err(e) = v.index_add(st, ddir, index_entry(file_ref, &value, None)) {
+                // Put the file back as it was.
+                v.write_record(n, &rec)?;
+                if clash {
+                    for old in &olds {
+                        let _ = v.index_add(st, sdir, index_entry(file_ref, old, None));
+                    }
+                }
+                return Err(e);
+            }
+            if !clash {
+                remove_old(v, st)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Frees a record no folder lists any more, and its clusters.
     fn release(&self, n: u64) -> Res<()> {
         let mut rec = self.record(n)?;
@@ -1913,6 +2005,31 @@ impl NtfsVolume {
         let st = &mut *self.state.lock();
         self.check_writable()?;
         self.begin(st)
+    }
+
+    /// Gives a file a DOS short name beside its long one, as Windows does,
+    /// so the test volume has some (ntfs-3g makes none).
+    pub fn add_dos_name(&self, path: &str, short: &str) -> Res<()> {
+        let st = &mut *self.state.lock();
+        self.check_writable()?;
+        let (dir, name) = self.split(path)?;
+        let n = self.find_in(dir, name)?.ok_or("file not found")?;
+        let mut rec = self.record(n)?;
+        let p = find_attr(&rec, ATTR_FILE_NAME, &[]).ok_or("bad NTFS record")?;
+        let mut long = resident_value(&rec, p).ok_or("bad NTFS record")?.to_vec();
+        if long[65] != NAMESPACE_WIN32 {
+            return Err("its name needs no short one");
+        }
+        let units: Vec<u16> = short.encode_utf16().collect();
+        let mut value = file_name_value(0, &units, false, 0, 0, 0, NAMESPACE_DOS);
+        value[..64].copy_from_slice(&long[..64]);
+        add_attr(&mut rec, resident_attr(ATTR_FILE_NAME, &[], &value, true))?;
+        long.clear();
+        let file_ref = self.reference(n)?;
+        self.change(st, |v, st| {
+            v.write_record(n, &rec)?;
+            v.index_add(st, dir, index_entry(file_ref, &value, None))
+        })
     }
 
     /// Walks every folder's index: names in order, the tree balanced, its
@@ -2116,5 +2233,10 @@ impl vfs::Volume for NtfsVolume {
         let st = &mut *self.state.lock();
         self.check_writable()?;
         self.remove_locked(st, path)
+    }
+    fn rename(&self, from: &str, to: &str) -> Res<()> {
+        let st = &mut *self.state.lock();
+        self.check_writable()?;
+        self.rename_locked(st, from, to)
     }
 }

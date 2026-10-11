@@ -144,8 +144,10 @@ for n in 4 5 6 7 8; do
     EXFAT_CMDS+=("write \"/usb1p1/Games/Saves/Level $n checkpoint.sav\" checkpoint=lava-$n")
     EXFAT_WAIT+=("bytes to /usb1p1/Games/Saves/Level $n checkpoint.sav\|  /usb1p1/Games/Saves/Level $n checkpoint.sav: ")
 done
-EXFAT_CMDS+=('write /usb1p1/AeroForge-OS-Design.md replaced by AeroForge' 'rm /usb1p1/hot.txt' 'mkdir /usb1p1/Music' 'ls /usb1p1/games/saves')
-EXFAT_WAIT+=('bytes to /usb1p1/AeroForge-OS-Design.md' 'deleted /usb1p1/hot.txt\|  /usb1p1/hot.txt: ' 'created directory /usb1p1/Music\|  /usb1p1/Music: ' '  Level 8 checkpoint.sav\|  /usb1p1/games/saves: ')
+EXFAT_CMDS+=('write /usb1p1/AeroForge-OS-Design.md replaced by AeroForge' 'rm /usb1p1/hot.txt' 'mkdir /usb1p1/Music'
+    'mv "/usb1p1/Games/Saves/Level 8 checkpoint.sav" "/usb1p1/Music/Level 8 moved.sav"' 'mv /usb1p1/Music /usb1p1/Tunes' 'ls /usb1p1/games/saves')
+EXFAT_WAIT+=('bytes to /usb1p1/AeroForge-OS-Design.md' 'deleted /usb1p1/hot.txt\|  /usb1p1/hot.txt: ' 'created directory /usb1p1/Music\|  /usb1p1/Music: '
+    'moved /usb1p1/Games/Saves/Level 8\|  /usb1p1/Games/Saves/Level 8 checkpoint.sav: ' 'moved /usb1p1/Music to\|  /usb1p1/Music: ' '  Level 7 checkpoint.sav\|  /usb1p1/games/saves: ')
 EXFAT_STEP=0
 # The same for the NTFS drive (checksums are the files' FNV-1a, as made by tools/make-ntfs-image.sh).
 NTFS_CMDS=('ls /sata1p1' 'ls /sata1p1/Photos' 'cat /sata1p1/users/player/saved games/level 9.sav'
@@ -153,13 +155,17 @@ NTFS_CMDS=('ls /sata1p1' 'ls /sata1p1/Photos' 'cat /sata1p1/users/player/saved g
     'wc /sata1p1/sparse.bin' 'cat /sata1p1/Packed/squeezed.txt' 'write /sata1p1/new.txt hello'
     'writable /sata1p1 on' 'write /sata1p1/new.txt hello from AeroForge'
     'write "/sata1p1/users/player/saved games/level 9.sav" checkpoint=castle-10' 'mkdir /sata1p1/AeroForge Saves'
-    'rm /sata1p1/fragmented.bin' 'cat /sata1p1/new.txt')
+    'rm /sata1p1/fragmented.bin' 'mv /sata1p1/README.TXT /sata1p1/ReadMe.txt'
+    'mv "/sata1p1/users/player/saved games" "/sata1p1/AeroForge Saves/Saved Games"' 'mv /sata1p1/new.txt /usb0p1/new.txt'
+    'cat /sata1p1/new.txt')
 NTFS_WAIT=('  Café ☕.txt\|  /sata1p1: ' '  IMG_0300.JPG\|  /sata1p1/Photos: ' 'checkpoint=castle-9\|  /sata1p1/users/player/saved games/level 9.sav: '
     '  /sata1p1/Program Files/AeroForge/manual.md' '  /sata1p1/fragmented.bin' '  /sata1p1/interleaved.bin'
     '  /sata1p1/sparse.bin' '  /sata1p1/Packed/squeezed.txt: ' '  /sata1p1/new.txt: '
     '  /sata1p1 is writable\|  /sata1p1: ' 'bytes to /sata1p1/new.txt\|  /sata1p1/new.txt: '
     'bytes to /sata1p1/users/player/saved games/level 9.sav\|  /sata1p1/users/player/saved games/level 9.sav: ' 'created directory /sata1p1/AeroForge Saves\|  /sata1p1/AeroForge Saves: '
-    'deleted /sata1p1/fragmented.bin\|  /sata1p1/fragmented.bin: ' 'hello from AeroForge\|  /sata1p1/new.txt: ')
+    'deleted /sata1p1/fragmented.bin\|  /sata1p1/fragmented.bin: ' 'moved /sata1p1/README.TXT\|  /sata1p1/README.TXT: '
+    'moved /sata1p1/users/player/saved games\|  /sata1p1/users/player/saved games: ' '  /sata1p1/new.txt: '
+    'hello from AeroForge\|  /sata1p1/new.txt: ')
 NTFS_STEP=0
 monitor() { python3 tools/qemu-monitor.py build/qemu-monitor.sock "$@" >/dev/null; }
 fast_monitor() { python3 tools/qemu-monitor.py --gap 0.08 build/qemu-monitor.sock "$@" >/dev/null; }
@@ -263,6 +269,12 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = 25 ] && grep -q "created directory /sata0p1/docs\|  /sata0p1/docs: " "$LOG"; then
         sleep 1; type_keys $'write "/sata0p1/docs/Hello World.txt" Saved from AeroForge on SATA\n'; STAGE=26
     elif [ $STAGE = 26 ] && grep -q "bytes to /sata0p1/docs/Hello World.txt\|  /sata0p1/docs/Hello World.txt: " "$LOG"; then
+        sleep 1; type_keys $'mv "/sata0p1/docs/Hello World.txt" "/sata0p1/Hello again.txt"\n'; STAGE=26a
+    elif [ $STAGE = 26a ] && grep -q "moved /sata0p1/docs/Hello World.txt\|  /sata0p1/docs/Hello World.txt: " "$LOG"; then
+        sleep 1; type_keys $'mkdir /sata0p1/Archive\n'; STAGE=26b
+    elif [ $STAGE = 26b ] && grep -q "created directory /sata0p1/Archive\|  /sata0p1/Archive: " "$LOG"; then
+        sleep 1; type_keys $'mv /sata0p1/docs "/sata0p1/Archive/Old docs"\n'; STAGE=26c
+    elif [ $STAGE = 26c ] && grep -q "moved /sata0p1/docs to\|  /sata0p1/docs: " "$LOG"; then
         sleep 1; type_keys $'write /usb0p1/usbnote.txt Saved from AeroForge on USB\n'; STAGE=27
     elif [ $STAGE = 27 ] && grep -q "bytes to /usb0p1/usbnote.txt\|  /usb0p1/usbnote.txt: " "$LOG"; then
         sleep 1; type_keys $'rm /usb0p1/usb.txt\n'; STAGE=28
@@ -820,6 +832,8 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "wrote 22 bytes to /usb1p1/AeroForge-OS-Design.md" "$LOG" || { fail "overwriting a file on the exFAT stick failed"; }
         grep -q "deleted /usb1p1/hot.txt" "$LOG" || { fail "deleting a file on the exFAT stick failed"; }
         grep -q "created directory /usb1p1/Music" "$LOG" || { fail "creating a folder on the exFAT stick failed"; }
+        grep -q "moved /usb1p1/Games/Saves/Level 8 checkpoint.sav to /usb1p1/Music/Level 8 moved.sav" "$LOG" \
+            && grep -q "moved /usb1p1/Music to /usb1p1/Tunes" "$LOG" || { fail "moving a file and renaming a folder on the exFAT stick failed"; }
         grep -q "USB disk usb1 unplugged, /usb1p1 unmounted" "$LOG" || { fail "the unplugged USB stick was not unmounted"; }
         grep -q "  /usb1p1: " "$LOG" || { fail "the unplugged USB stick's files were still reachable"; }
         for d in nvme0 sata0 usb0; do
@@ -834,6 +848,8 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[savetest\] saved 12 slots, read them back, overwrote slot 1 and deleted slots 3-12: OK" "$LOG" || { fail "the savetest program could not save its files"; }
         grep -q "created directory /sata0p1/docs" "$LOG" || { fail "the shell could not create a directory on the SATA disk"; }
         grep -q "wrote 29 bytes to /sata0p1/docs/Hello World.txt" "$LOG" || { fail "the shell could not save a file on the SATA disk"; }
+        grep -q "moved /sata0p1/docs/Hello World.txt to /sata0p1/Hello again.txt" "$LOG" \
+            && grep -q "moved /sata0p1/docs to /sata0p1/Archive/Old docs" "$LOG" || { fail "the shell could not rename and move on the SATA disk"; }
         grep -q "wrote 28 bytes to /usb0p1/usbnote.txt" "$LOG" || { fail "the shell could not save a file on the USB stick"; }
         grep -q "deleted /usb0p1/usb.txt" "$LOG" || { fail "the shell could not delete a file on the USB stick"; }
         python3 tools/check-fat-files.py build || { fail "the saved files are not right on the disk images"; }
@@ -850,13 +866,19 @@ for _ in $(seq "$TIMEOUT"); do
             && grep -q "wrote 21 bytes to /sata1p1/users/player/saved games/level 9.sav" "$LOG" \
             && grep -q "created directory /sata1p1/AeroForge Saves" "$LOG" && grep -q "deleted /sata1p1/fragmented.bin" "$LOG" \
             || { fail "the shell could not change files on the NTFS drive once writing was on"; }
+        grep -q "moved /sata1p1/README.TXT to /sata1p1/ReadMe.txt" "$LOG" \
+            && grep -q "moved /sata1p1/users/player/saved games to /sata1p1/AeroForge Saves/Saved Games" "$LOG" \
+            && grep -q "  /sata1p1/new.txt: not on the same drive" "$LOG" \
+            || { fail "the shell could not rename and move on the NTFS drive (or moved to another drive)"; }
         # What Linux makes of the NTFS volume now.
         dd if=build/ntfs.img of=build/ntfs-after.img bs=512 skip=2048 count=$(( $(xz -dc tools/ntfs-test.part.xz | wc -c) / 512 )) status=none
         ntfsfix -n build/ntfs-after.img >/dev/null && ntfsresize -i -f build/ntfs-after.img >/dev/null 2>&1 \
             && [ "$(ntfsinfo -m build/ntfs-after.img | grep -o "Volume Flags: 0x[0-9a-f]*")" = "Volume Flags: 0x0000" ] \
             || { fail "ntfsprogs found the NTFS volume damaged or left dirty after AeroForge wrote to it"; }
         [ "$(ntfscat build/ntfs-after.img /new.txt)" = "hello from AeroForge" ] \
-            && [ "$(ntfscat build/ntfs-after.img "/Users/Player/Saved Games/Level 9.sav")" = "checkpoint=castle-10" ] \
+            && [ "$(ntfscat build/ntfs-after.img "/AeroForge Saves/Saved Games/Level 9.sav")" = "checkpoint=castle-10" ] \
+            && ! ntfsls -p /Users/Player build/ntfs-after.img | grep -q "Saved Games" \
+            && ntfsls build/ntfs-after.img | grep -qx "ReadMe.txt" && ! ntfsls build/ntfs-after.img | grep -qx "README.TXT" \
             && ntfsls build/ntfs-after.img | grep -qx "AeroForge Saves" && ! ntfsls build/ntfs-after.img | grep -qx "fragmented.bin" \
             || { fail "Linux does not see on the NTFS volume what AeroForge wrote"; }
         grep -q "\[desktop\] .*(E:) is read-only" "$LOG" && grep -q "\[desktop\] .*(E:) is writable" "$LOG" \

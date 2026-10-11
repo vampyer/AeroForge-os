@@ -470,7 +470,7 @@ sort with a click. New folder, Cut, Copy, Paste, Rename and Delete are on its co
 (Ctrl+N, Ctrl+X, Ctrl+C, Ctrl+V, F2, Delete; arrows, Home, End, Page Up and Down, Enter, Backspace and F5
 work too). Deleting moves things to the drive's Recycle Bin (a "Recycle Bin" folder at its root, with an
 `info.txt` saying where each one came from), where they can be restored or deleted for good; Ctrl+Z puts
-back the last thing deleted. NTFS drives stay read-only (until 0.57). Copies are limited to 8 MB a file for now. Keys
+back the last thing deleted. NTFS drives stay read-only (until 0.57). Copies are limited to 8 MB a file for now (moves on one drive are not, since 0.58). Keys
 with no character (arrows, Delete, F2, F5) now reach programs that own the screen, and an empty file can
 be saved. The boot test makes, renames and fills a folder, deletes to the Recycle Bin, undoes it and
 deletes for good, then checks the disk image with mtools.
@@ -533,11 +533,22 @@ it is full. To keep the drive safe if AeroForge stops part way (no journal is ke
 the journal is emptied before the first change, every change runs between setting and clearing the
 drive's dirty flag, so Windows runs chkdsk if one was cut off, and space is taken before it is used and
 freed only after nothing refers to it. Compressed, encrypted and sparse files, links, and Windows' own
-files are not changed. Files deleted on an NTFS drive are deleted for good (Windows keeps its own Recycle
-Bin there). `tools/ntfs-write-test.sh` runs the NTFS driver on the build machine against copies of the
+files are not changed. (Until 0.58, files deleted on an NTFS drive were deleted for good.) `tools/ntfs-write-test.sh` runs the NTFS driver on the build machine against copies of the
 test drive (making, saving over and deleting hundreds of files) and checks the result with ntfsprogs
 (ntfsfix, ntfsresize, ntfsls, ntfscat) and `tools/ntfs-check`; the boot test also writes to the NTFS
 drive from the shell and the desktop and checks it the same way after QEMU exits.
+
+Since 0.58 renaming and moving on one drive happen at once, whatever the size: FAT32, exFAT and NTFS
+volumes have a `rename` system call (and `mv` in the shell) that changes only the directory entries, so a
+renamed or moved file's data stays where it is on the disk. The file manager uses it for F2, cut and paste,
+dragging within a drive and the Recycle Bin, and copies then deletes only between drives. Windows drives
+with changes allowed now have a Recycle Bin too, so a delete there can be undone. FAT32 and exFAT write the
+new name before taking away the old one, so a crash in between leaves two names (a disk check keeps one),
+never none; a folder moved on FAT32 has its ".." entry pointed at its new parent. On NTFS a renamed file
+gets one new name (a DOS short name Windows gave it is dropped, as Windows does) inside the same
+dirty-flag bracket as other changes. `tools/ntfs-write-test.sh` renames and moves files and a folder
+(including files with DOS short names) and checks the volume with ntfsprogs, and the boot test moves files
+and folders on a SATA FAT32 disk, the exFAT stick and the NTFS drive from the shell.
 
 | Area | Status |
 |---|---|
@@ -567,7 +578,7 @@ drive from the shell and the desktop and checks it the same way after QEMU exits
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
 `thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
 `socket_recv`, `socket_listen`, `socket_accept`, `net_info`, `event_create`, `event_set`, `event_reset`,
-`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`, `volumes`.
+`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`, `volumes`, `rename`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1

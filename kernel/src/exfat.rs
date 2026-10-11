@@ -318,6 +318,50 @@ impl ExfatVolume {
         self.finish(st)
     }
 
+    /// Renames or moves within the volume: a new entry set with the old
+    /// one's attributes, times and data is written, then the old set is
+    /// marked unused (a crash in between leaves two names, never none).
+    fn rename(&self, from: &str, to: &str) -> Res<()> {
+        if vfs::is_inside(to, from) {
+            return Err("can't move a folder into itself");
+        }
+        let st = &mut *self.state.lock();
+        let (src, name) = self.parent_of(st, from)?;
+        let e = self.read_dir(st, &src.stream)?.1
+            .into_iter()
+            .find(|e| self.same_name(&e.name, name))
+            .ok_or("file not found")?;
+        let (dst, new_name) = self.parent_of(st, to)?;
+        if new_name.encode_utf16().count() > 255 {
+            return Err("bad file name");
+        }
+        let (dir_clusters, entries) = self.read_dir(st, &dst.stream)?;
+        let same_dir = dst.stream.first == src.stream.first;
+        if same_dir && e.name == new_name {
+            return Ok(());
+        }
+        if entries.iter().any(|t| self.same_name(&t.name, new_name) && !(same_dir && t.slot == e.slot)) {
+            return Err("already exists");
+        }
+        let mut raw = new_set(new_name, e.attrs, &e.stream, &self.upcase);
+        // Keep the old attributes and times, and the old stream extension
+        // apart from the name's length and hash.
+        raw[4..32].copy_from_slice(&e.raw[4..32]);
+        let (len, hash) = (raw[35], [raw[36], raw[37]]);
+        raw[32..64].copy_from_slice(&e.raw[32..64]);
+        raw[35] = len;
+        raw[36..38].copy_from_slice(&hash);
+        let sum = set_checksum(&raw);
+        raw[2..4].copy_from_slice(&sum.to_le_bytes());
+        self.add_set(st, &dst, dir_clusters, raw)?;
+        let mut old = e;
+        for chunk in old.raw.chunks_mut(32) {
+            chunk[0] &= !IN_USE;
+        }
+        self.put_set(st, &old)?;
+        self.finish(st)
+    }
+
     // ----------------------------------------------------------- lookups
 
     fn cluster_bytes(&self) -> usize {
@@ -791,6 +835,9 @@ impl vfs::Volume for ExfatVolume {
     }
     fn create_dir(&self, path: &str) -> Res<()> {
         self.mkdir(path)
+    }
+    fn rename(&self, from: &str, to: &str) -> Res<()> {
+        ExfatVolume::rename(self, from, to)
     }
     fn remove(&self, path: &str) -> Res<()> {
         self.delete(path)

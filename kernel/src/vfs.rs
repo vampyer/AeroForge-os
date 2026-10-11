@@ -68,6 +68,20 @@ pub trait Volume: Send + Sync {
     fn undelete(&self, _path: &str, _slot: u32) -> Result<String, &'static str> {
         Err("not supported on this kind of volume")
     }
+    /// Renames or moves a file or directory within the volume, without
+    /// copying its data.
+    fn rename(&self, _from: &str, _to: &str) -> Result<(), &'static str> {
+        Err("not supported on this kind of volume")
+    }
+}
+
+/// Whether `path` is inside folder `dir` (names compared ignoring case).
+pub fn is_inside(path: &str, dir: &str) -> bool {
+    let (path, dir) = (path.trim_matches('/'), dir.trim_matches('/'));
+    path.len() > dir.len()
+        && path.as_bytes()[dir.len()] == b'/'
+        && path.is_char_boundary(dir.len())
+        && path[..dir.len()].eq_ignore_ascii_case(dir)
 }
 
 /// A deleted file or directory still listed in its directory.
@@ -233,6 +247,20 @@ pub fn undelete(path: &str, slot: u32) -> Result<String, &'static str> {
         return Err("read-only volume");
     }
     m.vol.undelete(inner, slot)
+}
+
+/// Renames or moves a file or directory. Both paths must be on the same
+/// volume ("not on the same drive" otherwise: the caller copies instead).
+pub fn rename(from: &str, to: &str) -> Result<(), &'static str> {
+    let (m, inner_from) = resolve_entry(from)?;
+    let (n, inner_to) = resolve_entry(to)?;
+    if !Arc::ptr_eq(&m, &n) {
+        return Err("not on the same drive");
+    }
+    if m.vol.read_only() {
+        return Err("read-only volume");
+    }
+    m.vol.rename(inner_from, inner_to)
 }
 
 /// Turns writing to the volume mounted at `path` on or off.
