@@ -247,6 +247,116 @@ impl FatVolume {
         self.finish(st)
     }
 
+    /// Deleted entries still in directory `path`, newest slots last.
+    pub fn deleted(&self, path: &str) -> Res<Vec<vfs::Deleted>> {
+        let st = &mut *self.state.lock();
+        let dir = self.lookup(st, path)?;
+        if !dir.is_dir {
+            return Err("not a directory");
+        }
+        let raw = self.read_dir_raw(st, dir.cluster)?.1;
+        let mut out = Vec::new();
+        for d in parse_deleted(&raw) {
+            let clusters = self.lost_clusters(&d);
+            let whole = match &clusters {
+                Some(c) => self.all_free(st, c)?,
+                None => false,
+            };
+            out.push(vfs::Deleted { name: d.name, is_dir: d.is_dir, size: d.size as u64, modified: d.modified, slot: d.slot, whole });
+        }
+        Ok(out)
+    }
+
+    /// Brings back the deleted entry at `slot` of directory `path`, with
+    /// the clusters after its first as they were when it was deleted
+    /// (FAT32 forgets the chain, so a file is taken to be in one piece).
+    /// Returns its name. Refused when those clusters are in use again or
+    /// the name is taken.
+    pub fn undelete(&self, path: &str, slot: u32) -> Res<String> {
+        let st = &mut *self.state.lock();
+        let dir = self.lookup(st, path)?;
+        if !dir.is_dir {
+            return Err("not a directory");
+        }
+        let (chain, raw) = self.read_dir_raw(st, dir.cluster)?;
+        let d = parse_deleted(&raw).into_iter().find(|d| d.slot == slot).ok_or("file not found")?;
+        let clusters = self.lost_clusters(&d).ok_or("its data is gone")?;
+        if !self.all_free(st, &clusters)? {
+            return Err("its data has been written over");
+        }
+        let live = parse_dir(&raw);
+        if live.iter().any(|e| e.name.eq_ignore_ascii_case(&d.name)) {
+            return Err("already exists");
+        }
+        // The 8.3 name's first letter was overwritten by the deleted mark:
+        // the one that matches the long name's checksum, or else '_'.
+        let taken: Vec<[u8; 11]> = live.iter().map(|e| e.short).collect();
+        let mut short = d.short;
+        let first = match d.checksum {
+            Some(sum) => {
+                let hint = d.name.chars().next().map_or(b'_', |c| c.to_ascii_uppercase() as u8);
+                core::iter::once(hint).chain(0x21..0x7F).find(|&c| {
+                    short[0] = c;
+                    short_char_ok(c) && checksum(&short) == sum && !taken.contains(&short)
+                })
+            }
+            None => b"_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".iter().copied().find(|&c| {
+                short[0] = c;
+                !taken.contains(&short)
+            }),
+        };
+        short[0] = first.ok_or("too many similar names")?;
+        self.link(st, &clusters)?;
+        let from = d.slot - d.lfn;
+        let mut slots = Vec::with_capacity(32 * (d.lfn as usize + 1));
+        for s in from..d.slot {
+            let mut b = slot_bytes(&raw, s);
+            // Long-name parts run backwards: the one just before the 8.3
+            // entry is part 1, the first one is the last part and marked so.
+            let part = (d.slot - s) as u8;
+            b[0] = if s == from { 0x40 | part } else { part };
+            slots.extend_from_slice(&b);
+        }
+        let mut b = slot_bytes(&raw, d.slot);
+        b[0] = short[0];
+        slots.extend_from_slice(&b);
+        self.put_slots(&chain, from, &slots)?;
+        self.finish(st)?;
+        if d.checksum.is_some() {
+            return Ok(d.name);
+        }
+        // No long name: its name is the 8.3 one, with the letter just picked.
+        let mut name = d.name;
+        if !name.is_empty() && name.is_char_boundary(1) {
+            let c = short[0] as char;
+            let lower = name[1..].chars().any(|c| c.is_ascii_lowercase()) && !name[1..].chars().any(|c| c.is_ascii_uppercase());
+            let mut first = [0u8; 1];
+            name.replace_range(..1, (if lower { c.to_ascii_lowercase() } else { c }).encode_utf8(&mut first));
+        }
+        Ok(name)
+    }
+
+    /// The clusters a deleted entry had, taken to be in one run from its
+    /// first; None when that does not fit on the volume.
+    fn lost_clusters(&self, d: &Lost) -> Option<Vec<u32>> {
+        if d.cluster == 0 {
+            // An empty file has none; a directory always had one.
+            return (!d.is_dir).then(Vec::new);
+        }
+        let n = if d.is_dir { 1 } else { (d.size as usize).div_ceil(self.cluster_bytes()).max(1) as u32 };
+        let last = d.cluster.checked_add(n - 1)?;
+        (self.valid(d.cluster) && self.valid(last)).then(|| (d.cluster..=last).collect())
+    }
+
+    fn all_free(&self, st: &mut State, clusters: &[u32]) -> Res<bool> {
+        for &c in clusters {
+            if self.fat_get(st, c)? != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     // ----------------------------------------------------------- lookups
 
     fn cluster_bytes(&self) -> usize {
@@ -619,6 +729,85 @@ fn parse_dir(raw: &[u8]) -> Vec<DirEntry> {
     entries
 }
 
+/// A deleted entry found in a directory: its 8.3 entry's slot, the
+/// deleted long-name slots just before it, and what they still say.
+struct Lost {
+    name: String,
+    is_dir: bool,
+    size: u32,
+    modified: u64,
+    cluster: u32,
+    short: [u8; 11],
+    slot: u32,
+    lfn: u32,
+    /// The long name's checksum of the 8.3 name, when it had one.
+    checksum: Option<u8>,
+}
+
+/// Deleted 8.3 entries (first byte 0xE5) and the deleted long-name parts
+/// in front of them. Deleting keeps everything but the first byte, so the
+/// long name reads back whole; the 8.3 name lacks its first letter.
+fn parse_deleted(raw: &[u8]) -> Vec<Lost> {
+    let mut out = Vec::new();
+    let slots: Vec<&[u8]> = raw.chunks(32).collect();
+    for (s, e) in slots.iter().enumerate() {
+        if e[0] == 0x00 {
+            break;
+        }
+        if e[0] != 0xE5 || e[11] == ATTR_LFN || e[11] & 0x08 != 0 {
+            continue;
+        }
+        // Long-name parts: deleted LFN slots right before it with one checksum,
+        // up to the part holding the end of the name.
+        let mut parts: Vec<[u16; 13]> = Vec::new();
+        let mut sum = None;
+        let mut k = s;
+        while k > 0 && parts.len() < 20 {
+            let l = slots[k - 1];
+            if l[0] != 0xE5 || l[11] != ATTR_LFN || sum.is_some_and(|x| x != l[13]) {
+                break;
+            }
+            sum = Some(l[13]);
+            let mut part = [0u16; 13];
+            for (i, o) in [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30].iter().enumerate() {
+                part[i] = u16::from_le_bytes([l[*o], l[*o + 1]]);
+            }
+            let ends = part.contains(&0);
+            parts.push(part);
+            k -= 1;
+            if ends {
+                break;
+            }
+        }
+        let mut short: [u8; 11] = e[0..11].try_into().unwrap();
+        let name = if parts.is_empty() {
+            short[0] = b'_';
+            let mut n = short_name(&short_entry(&short, e[12], e[11], 0, 0, 0, 0));
+            n.replace_range(..1, "_");
+            n
+        } else {
+            let units: Vec<u16> = parts.iter().flatten().copied().take_while(|&c| c != 0 && c != 0xFFFF).collect();
+            char::decode_utf16(units).map(|c| c.unwrap_or('?')).collect()
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        out.push(Lost {
+            name,
+            is_dir: e[11] & ATTR_DIR != 0,
+            size: u32::from_le_bytes(e[28..32].try_into().unwrap()),
+            modified: crate::rtc::DateTime::from_dos(u16::from_le_bytes([e[24], e[25]]), u16::from_le_bytes([e[22], e[23]]))
+                .map_or(0, |t| t.packed()),
+            cluster: cluster_of(e),
+            short,
+            slot: s as u32,
+            lfn: parts.len() as u32,
+            checksum: sum,
+        });
+    }
+    out
+}
+
 fn short_name(e: &[u8]) -> String {
     let lower_base = e[12] & 0x08 != 0;
     let lower_ext = e[12] & 0x10 != 0;
@@ -798,5 +987,11 @@ impl vfs::Volume for FatVolume {
     }
     fn remove(&self, path: &str) -> Res<()> {
         FatVolume::remove(self, path)
+    }
+    fn deleted(&self, path: &str) -> Res<Vec<vfs::Deleted>> {
+        FatVolume::deleted(self, path)
+    }
+    fn undelete(&self, path: &str, slot: u32) -> Res<String> {
+        FatVolume::undelete(self, path, slot)
     }
 }

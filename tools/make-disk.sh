@@ -21,6 +21,22 @@ truncate -s $((SECTORS * 512)) "$PART"
 mkfs.fat -F 32 -s 1 -n AEROFORGE "$PART" >/dev/null
 mcopy -s -i "$PART" tools/disk-files/* ::/
 mcopy -i "$PART" docs/AeroForge-OS-Design.md ::/docs/
+# A file deleted for good (as another system would), for the file
+# manager's "Show deleted files" to bring back: three clusters of text.
+for i in $(seq 1 40); do echo "Line $i of a list that was deleted and should come back."; done > build/undelete-me.txt
+mcopy -i "$PART" build/undelete-me.txt "::/games/Old shopping list.txt"
+LAST=$(mshowfat -i "$PART" "::/games/Old shopping list.txt" | grep -o '[0-9]*>' | tr -d '>')
+mdel -i "$PART" "::/games/Old shopping list.txt"
+# Other systems allocate onwards from where they last did, so the next
+# writes do not land on it straight away: point FSInfo's next free past it.
+python3 - "$PART" "$LAST" <<'PY'
+import struct, sys
+with open(sys.argv[1], 'r+b') as f:
+    bs = f.read(512)
+    at = struct.unpack_from('<H', bs, 48)[0] * struct.unpack_from('<H', bs, 11)[0]
+    f.seek(at + 492)
+    f.write(struct.pack('<I', int(sys.argv[2]) + 1))
+PY
 dd if="$PART" of="$IMG.tmp" bs=512 seek=2048 conv=notrunc status=none
 rm -f "$PART"
 mv "$IMG.tmp" "$IMG"

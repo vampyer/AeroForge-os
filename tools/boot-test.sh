@@ -498,6 +498,37 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = menudetails ] && grep -q "\[desktop\] menu: Details at " "$LOG"; then
         sleep 0.5; point_at $(menu_item Details); monitor "mouse_button 1" "mouse_button 0"; STAGE=viewdetails
     elif [ $STAGE = viewdetails ] && grep -q "\[desktop\] view: Details" "$LOG"; then
+        # The file deleted for good when the disk was made: find it, bring it back.
+        sleep 0.5; point_at "$RX" $((RY + 4 * RH)); monitor "mouse_button 2" "mouse_button 0"; STAGE=menudeleted
+    elif [ $STAGE = menudeleted ] && grep -q "\[desktop\] menu: .*| Show deleted files at " "$LOG"; then
+        sleep 0.5; point_at $(menu_item "Show deleted files"); monitor "mouse_button 1" "mouse_button 0"; STAGE=deleted
+    elif [ $STAGE = deleted ] && grep -q "\[desktop\] deleted files in /games = " "$LOG"; then
+        read -r DX DY <<< "$(grep -ao "deleted files in /games = .*first row at [0-9]*,[0-9]*" "$LOG" | tail -1 | sed 's/.*first row at //' | tr ',' ' ')"
+        sleep 0.5; point_at "$DX" "$DY"; monitor "mouse_button 2" "mouse_button 0"; STAGE=menurestore
+    elif [ $STAGE = menurestore ] && grep -q "\[desktop\] menu: Restore at " "$LOG"; then
+        sleep 1; monitor "screendump build/gop-deleted.ppm"
+        point_at $(menu_item Restore); monitor "mouse_button 1" "mouse_button 0"; STAGE=undeleted
+    elif [ $STAGE = undeleted ] && grep -q "\[desktop\] \(undeleted /games/\|undelete failed\)" "$LOG"; then
+        # The file emptied from the Recycle Bin earlier: up to Computer,
+        # into the Recycle Bin, and bring it back from there.
+        NC=$(grep -c "\[desktop\] Computer: drives = " "$LOG")
+        for i in 1 2 3; do sleep 0.7; type_keys $'\x08'; done; STAGE=emptiedpc
+    elif [ $STAGE = emptiedpc ] && [ "$(grep -c "\[desktop\] Computer: drives = " "$LOG")" -gt "$NC" ]; then
+        XY=$(grep -ao "Recycle Bin at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*")
+        NB=$(grep -c "\[desktop\] Recycle Bin = " "$LOG")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=emptiedbin
+    elif [ $STAGE = emptiedbin ] && [ "$(grep -c "\[desktop\] Recycle Bin = " "$LOG")" -gt "$NB" ]; then
+        sleep 0.5; point_at "$RX" $((RY + 4 * RH)); monitor "mouse_button 2" "mouse_button 0"; STAGE=menuemptied
+    elif [ $STAGE = menuemptied ] && grep -q "\[desktop\] menu: .*| Show emptied files at " "$LOG"; then
+        sleep 0.5; point_at $(menu_item "Show emptied files"); monitor "mouse_button 1" "mouse_button 0"; STAGE=emptied
+    elif [ $STAGE = emptied ] && grep -q "\[desktop\] deleted files in /Recycle Bin = " "$LOG"; then
+        read -r DX DY <<< "$(grep -ao "deleted files in /Recycle Bin = .*first row at [0-9]*,[0-9]*" "$LOG" | tail -1 | sed 's/.*first row at //' | tr ',' ' ')"
+        NR=$(grep -c "\[desktop\] menu: Restore at " "$LOG")
+        sleep 0.5; point_at "$DX" "$DY"; monitor "mouse_button 2" "mouse_button 0"; STAGE=emptiedmenu
+    elif [ $STAGE = emptiedmenu ] && [ "$(grep -c "\[desktop\] menu: Restore at " "$LOG")" -gt "$NR" ]; then
+        sleep 0.5; point_at $(menu_item Restore); monitor "mouse_button 1" "mouse_button 0"; STAGE=emptiedback
+    elif [ $STAGE = emptiedback ] && { [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG")" -ge 2 ] \
+            || grep -q "\[desktop\] \(undelete failed in /Recycle Bin\|Not restored\)" "$LOG"; }; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
@@ -658,8 +689,9 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
         mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to AeroForge.txt" | head -n 1 | grep -q "Welcome to AeroForge OS" \
             || { fail "the copy in /docs/Stuff is not on the NVMe disk image"; }
-        ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 && ! mdir -i build/disk.img@@1M "::/docs/Welcome to AeroForge - Copy.txt" >/dev/null 2>&1 \
-            || { fail "the renamed folder or the deleted copy is still on the NVMe disk image"; }
+        # (The deleted copy comes back later, from the files emptied from the Recycle Bin.)
+        ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 \
+            || { fail "the renamed folder is still on the NVMe disk image"; }
         [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
             || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
         python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
@@ -687,6 +719,14 @@ for _ in $(seq "$TIMEOUT"); do
             && mdir -i build/disk.img@@1M "::/docs/README.TXT" >/dev/null 2>&1 \
             || { fail "Copy > did not copy README.TXT to the folder on the other side"; }
         grep -q "\[desktop\] tabs: [^|]*; tab 1 in front" "$LOG" || { fail "Ctrl+W did not close the second tab"; }
+        grep -q "\[desktop\] deleted files in /games = Old shopping list.txt (whole)" "$LOG" \
+            && grep -q "\[desktop\] undeleted /games/Old shopping list.txt" "$LOG" \
+            && mtype -i build/disk.img@@1M "::/games/Old shopping list.txt" 2>/dev/null | cmp -s - build/undelete-me.txt \
+            || { fail "Show deleted files did not bring back /games/Old shopping list.txt whole"; }
+        grep -q "\[desktop\] deleted files in /Recycle Bin = Welcome to AeroForge - Copy.txt (whole)" "$LOG" \
+            && [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin to /docs/Welcome to AeroForge - Copy.txt" "$LOG")" -ge 2 ] \
+            && mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge - Copy.txt" 2>/dev/null | head -n 1 | grep -q "Welcome to AeroForge OS" \
+            || { fail "Show emptied files did not bring back the file emptied from the Recycle Bin"; }
         grep -q "\[desktop\] Computer: / = .*; [1-9][0-9]* dated" "$LOG" || { fail "the files on C: came without the dates they were written"; }
         grep -q "\[desktop\] view: Large icons; first item at [0-9]*,[0-9]*, [2-9] across" "$LOG" \
             && grep -q "\[desktop\] view: Details" "$LOG" \
@@ -788,7 +828,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
         grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
