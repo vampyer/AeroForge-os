@@ -14,13 +14,16 @@ jobs:
       - name: Install build and emulation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm lld xorriso gdisk dosfstools exfatprogs mtools qemu-system-x86 ovmf libusbredirparser-dev samba
+          sudo apt-get install -y clang llvm lld xorriso gdisk dosfstools exfatprogs mtools qemu-system-x86 ovmf libusbredirparser-dev samba ntfs-3g
 
       - name: Install Rust target
         run: rustup target add x86_64-unknown-none
 
       - name: Build and boot in QEMU (UEFI, 4 CPUs, NVMe disk)
         run: TIMEOUT=300 ./tools/boot-test.sh
+
+      - name: NTFS writer on the build machine, checked with ntfsprogs
+        run: ./tools/ntfs-write-test.sh
 
       - name: Display test on virtio-gpu (no firmware framebuffer)
         run: ./tools/display-test.sh

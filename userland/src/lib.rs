@@ -70,6 +70,7 @@ pub mod sys {
     pub const VOLUMES: u64 = 55;
     pub const DELETED_LIST: u64 = 56;
     pub const UNDELETE: u64 = 57;
+    pub const SET_WRITABLE: u64 = 58;
 }
 
 pub mod rights {
@@ -315,6 +316,20 @@ pub fn undelete(path: &str, slot: u32) -> Result<alloc::string::String, i64> {
     let mut name = [0u8; 255];
     let n = check(unsafe { syscall(sys::UNDELETE, path.as_ptr() as u64, path.len() as u64, slot as u64, name.as_mut_ptr() as u64) })? as usize;
     Ok(alloc::string::String::from_utf8_lossy(&name[..n.min(255)]).into_owned())
+}
+
+/// Turns writing to the drive mounted at `path` on or off (drives written
+/// to only when asked: NTFS). Err says why it can't be.
+pub fn set_writable(path: &str, on: bool) -> Result<(), alloc::string::String> {
+    let mut why = [0u8; 255];
+    match check(unsafe { syscall(sys::SET_WRITABLE, path.as_ptr() as u64, path.len() as u64, on as u64, why.as_mut_ptr() as u64) }) {
+        Ok(_) => Ok(()),
+        Err(E_RIGHTS) => {
+            let n = why.iter().position(|&b| b == 0).unwrap_or(why.len());
+            Err(alloc::string::String::from_utf8_lossy(&why[..n]).into_owned())
+        }
+        Err(_) => Err(alloc::string::String::from("not a drive")),
+    }
 }
 
 /// The mounted volumes, root first.

@@ -34,7 +34,9 @@
 # the saved files back. Last, an NTFS drive (a second SATA disk, from
 # tools/ntfs-test.part.xz) must mount read-only and its folders, a
 # 300-entry folder, fragmented and sparse files read back exactly, while
-# compressed files and writes are refused. Last of all, five copies of
+# compressed files and writes are refused until writing is turned on; then
+# the shell saves, makes a folder and deletes on it, and after QEMU exits
+# ntfsprogs must find the volume clean and the changes there. Last of all, five copies of
 # 'fputest' must keep their x87, SSE, AVX and MXCSR registers while they are
 # switched against each other, and compute a known floating point result.
 # Then 'threadtest' runs four threads under one futex lock, uses the heap,
@@ -148,10 +150,16 @@ EXFAT_STEP=0
 # The same for the NTFS drive (checksums are the files' FNV-1a, as made by tools/make-ntfs-image.sh).
 NTFS_CMDS=('ls /sata1p1' 'ls /sata1p1/Photos' 'cat /sata1p1/users/player/saved games/level 9.sav'
     'wc /sata1p1/Program Files/AeroForge/manual.md' 'wc /sata1p1/fragmented.bin' 'wc /sata1p1/interleaved.bin'
-    'wc /sata1p1/sparse.bin' 'cat /sata1p1/Packed/squeezed.txt' 'write /sata1p1/new.txt hello')
+    'wc /sata1p1/sparse.bin' 'cat /sata1p1/Packed/squeezed.txt' 'write /sata1p1/new.txt hello'
+    'writable /sata1p1 on' 'write /sata1p1/new.txt hello from AeroForge'
+    'write "/sata1p1/users/player/saved games/level 9.sav" checkpoint=castle-10' 'mkdir /sata1p1/AeroForge Saves'
+    'rm /sata1p1/fragmented.bin' 'cat /sata1p1/new.txt')
 NTFS_WAIT=('  Café ☕.txt\|  /sata1p1: ' '  IMG_0300.JPG\|  /sata1p1/Photos: ' 'checkpoint=castle-9\|  /sata1p1/users/player/saved games/level 9.sav: '
     '  /sata1p1/Program Files/AeroForge/manual.md' '  /sata1p1/fragmented.bin' '  /sata1p1/interleaved.bin'
-    '  /sata1p1/sparse.bin' '  /sata1p1/Packed/squeezed.txt: ' '  /sata1p1/new.txt: ')
+    '  /sata1p1/sparse.bin' '  /sata1p1/Packed/squeezed.txt: ' '  /sata1p1/new.txt: '
+    '  /sata1p1 is writable\|  /sata1p1: ' 'bytes to /sata1p1/new.txt\|  /sata1p1/new.txt: '
+    'bytes to /sata1p1/users/player/saved games/level 9.sav\|  /sata1p1/users/player/saved games/level 9.sav: ' 'created directory /sata1p1/AeroForge Saves\|  /sata1p1/AeroForge Saves: '
+    'deleted /sata1p1/fragmented.bin\|  /sata1p1/fragmented.bin: ' 'hello from AeroForge\|  /sata1p1/new.txt: ')
 NTFS_STEP=0
 monitor() { python3 tools/qemu-monitor.py build/qemu-monitor.sock "$@" >/dev/null; }
 fast_monitor() { python3 tools/qemu-monitor.py --gap 0.08 build/qemu-monitor.sock "$@" >/dev/null; }
@@ -429,8 +437,19 @@ for _ in $(seq "$TIMEOUT"); do
         monitor "sendkey home"; sleep 0.3; monitor "sendkey alt-ret"; STAGE=advdrive
     elif [ $STAGE = advdrive ] && grep -q "\[desktop\] properties of .* (C:)" "$LOG"; then
         sleep 1; monitor "screendump build/gop-props.ppm"; monitor "sendkey ret"; sleep 0.5
+        # The NTFS drive's menu: writing was turned on in the shell, so it
+        # offers "Make read-only"; then "Allow changes" turns it back on.
+        read -r EX EY <<< "$(grep -ao "E: /sata1p1 NTFS at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' ')"
+        point_at "$EX" "$EY"; monitor "mouse_button 2" "mouse_button 0"; STAGE=ntfsmenu
+    elif [ $STAGE = ntfsmenu ] && grep -q "\[desktop\] menu: .*| Make read-only at " "$LOG"; then
+        sleep 0.5; point_at $(menu_item "Make read-only"); monitor "mouse_button 1" "mouse_button 0"; STAGE=ntfsro
+    elif [ $STAGE = ntfsro ] && grep -q "\[desktop\] .*(E:) is read-only" "$LOG"; then
+        sleep 0.5; point_at "$EX" "$EY"; monitor "mouse_button 2" "mouse_button 0"; STAGE=ntfsmenu2
+    elif [ $STAGE = ntfsmenu2 ] && grep -q "\[desktop\] menu: .*| Allow changes at " "$LOG"; then
+        sleep 0.5; point_at $(menu_item "Allow changes"); monitor "mouse_button 1" "mouse_button 0"; STAGE=ntfsrw
+    elif [ $STAGE = ntfsrw ] && grep -q "\[desktop\] \(.*(E:) is writable\|can't allow changes\)" "$LOG"; then
         # A new tab (Ctrl+T), split into two panes.
-        type_keys $'\x14'; STAGE=panestab
+        sleep 0.5; type_keys $'\x14'; STAGE=panestab
     elif [ $STAGE = panestab ] && grep -q "\[desktop\] tabs: .*; tab 2 in front" "$LOG"; then
         XY=$(grep -ao "Two panes at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=panesplit
@@ -826,9 +845,27 @@ for _ in $(seq "$TIMEOUT"); do
             && grep -q "393216 bytes, 1536 lines, fnv1a db413e2ace59158d  /sata1p1/interleaved.bin" "$LOG" || { fail "fragmented NTFS files did not read back right"; }
         grep -q "3145747 bytes, 1 lines, fnv1a 25326fd0f3313539  /sata1p1/sparse.bin" "$LOG" || { fail "a sparse NTFS file did not read back right"; }
         grep -q "/sata1p1/Packed/squeezed.txt: compressed NTFS files are not supported yet" "$LOG" || { fail "a compressed NTFS file was not refused"; }
-        grep -q "/sata1p1/new.txt: NTFS volumes are read-only for now" "$LOG" || { fail "a write to the NTFS drive was not refused"; }
+        grep -q "/sata1p1/new.txt: writing to this NTFS drive is not turned on" "$LOG" || { fail "a write to the NTFS drive was not refused before writing was turned on"; }
+        grep -q "  /sata1p1 is writable" "$LOG" && grep -q "wrote 21 bytes to /sata1p1/new.txt" "$LOG" \
+            && grep -q "wrote 21 bytes to /sata1p1/users/player/saved games/level 9.sav" "$LOG" \
+            && grep -q "created directory /sata1p1/AeroForge Saves" "$LOG" && grep -q "deleted /sata1p1/fragmented.bin" "$LOG" \
+            || { fail "the shell could not change files on the NTFS drive once writing was on"; }
+        # What Linux makes of the NTFS volume now.
+        dd if=build/ntfs.img of=build/ntfs-after.img bs=512 skip=2048 count=$(( $(xz -dc tools/ntfs-test.part.xz | wc -c) / 512 )) status=none
+        ntfsfix -n build/ntfs-after.img >/dev/null && ntfsresize -i -f build/ntfs-after.img >/dev/null 2>&1 \
+            && [ "$(ntfsinfo -m build/ntfs-after.img | grep -o "Volume Flags: 0x[0-9a-f]*")" = "Volume Flags: 0x0000" ] \
+            || { fail "ntfsprogs found the NTFS volume damaged or left dirty after AeroForge wrote to it"; }
+        [ "$(ntfscat build/ntfs-after.img /new.txt)" = "hello from AeroForge" ] \
+            && [ "$(ntfscat build/ntfs-after.img "/Users/Player/Saved Games/Level 9.sav")" = "checkpoint=castle-10" ] \
+            && ntfsls build/ntfs-after.img | grep -qx "AeroForge Saves" && ! ntfsls build/ntfs-after.img | grep -qx "fragmented.bin" \
+            || { fail "Linux does not see on the NTFS volume what AeroForge wrote"; }
+        grep -q "\[desktop\] .*(E:) is read-only" "$LOG" && grep -q "\[desktop\] .*(E:) is writable" "$LOG" \
+            || { fail "the NTFS drive's menu did not make it read-only and allow changes again"; }
+        cargo build --release --quiet --manifest-path tools/ntfs-check/Cargo.toml \
+            && echo "v|/" | tools/ntfs-check/target/release/ntfs-check build/ntfs-after.img | grep -q "^v /: [0-9]* names, all in order" \
+            || { fail "a folder index on the NTFS volume is out of order"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
