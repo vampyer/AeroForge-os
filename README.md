@@ -513,6 +513,11 @@ done there (Open, Open in new tab, Cut, Copy, Paste, Delete, Rename, New folder,
 Clicks redraw only what they change, the clock and the Notes caret no longer redraw whole windows twice a
 second, and double-clicks are timed by the system as they happen, so a busy moment doesn't lose them.
 
+Since 0.55 files have icons by what they are (text, settings, pictures, sounds, programs, compressed folders,
+saved games, disc images), folders can be shown as Large icons ("Large icons" next to "Preview", or from the
+right-click menu), and Details has a Date modified column. The dates come from the drives themselves: FAT32,
+exFAT and NTFS volumes and network drives all carry them, and clicking the heading sorts by it.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

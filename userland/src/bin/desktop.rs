@@ -413,6 +413,82 @@ impl Canvas {
         }
     }
 
+    /// A file's icon by what it is (see `file_kind`), 12 x 14 at scale 1
+    /// like `page`; pictures, programs and compressed folders take a
+    /// shape of their own in the same box.
+    fn file_icon(&mut self, x: i32, y: i32, s: i32, kind: FileKind) {
+        match kind {
+            FileKind::Picture => {
+                // A framed landscape: sky, sun and a green hill.
+                let r = Rect::new(x - s, y + s, 14 * s, 12 * s);
+                self.fill(r, 0xFFFFFF);
+                self.frame(r, rgb(120, 130, 150));
+                let sky = Rect::new(r.x + s, r.y + s, r.w - 2 * s, r.h - 2 * s);
+                self.gradient(sky, rgb(110, 180, 245), rgb(200, 230, 255), 255);
+                self.fill(Rect::new(sky.x + 8 * s, sky.y + 2 * s, 2 * s, 2 * s), rgb(255, 210, 60));
+                for i in 0..4 * s {
+                    let w = (sky.w * (i + 2 * s) / (6 * s)).min(sky.w);
+                    self.fill(Rect::new(sky.x, sky.y + sky.h - 4 * s + i, w, 1), rgb(70, 160, 70));
+                }
+            }
+            FileKind::Program => {
+                // A little window: a blue title bar over a grey body.
+                let r = Rect::new(x - s, y + s, 14 * s, 12 * s);
+                self.fill(r, rgb(235, 238, 243));
+                self.frame(r, rgb(70, 85, 110));
+                self.gradient(Rect::new(r.x + s, r.y + s, r.w - 2 * s, 3 * s), rgb(90, 150, 230), rgb(30, 90, 180), 255);
+                self.fill(Rect::new(r.x + 3 * s, r.y + 6 * s, 8 * s, s), rgb(150, 160, 175));
+                self.fill(Rect::new(r.x + 3 * s, r.y + 8 * s, 5 * s, s), rgb(150, 160, 175));
+            }
+            FileKind::Archive => {
+                // A folder with a zipper down the middle.
+                self.folder(x - 2 * s, y + s, s);
+                for i in 0..5 {
+                    self.fill(Rect::new(x + 5 * s + (i % 2) * s, y + (4 + 2 * i) * s, s, s), rgb(70, 60, 40));
+                }
+            }
+            FileKind::Disc => {
+                let (cx, cy) = (x + 6 * s, y + 7 * s);
+                self.orb(cx, cy, 6 * s, rgb(235, 238, 245), rgb(160, 170, 190));
+                self.orb(cx, cy, 2 * s, rgb(255, 255, 255), rgb(200, 205, 215));
+            }
+            _ => {
+                self.fill(Rect::new(x, y, 12 * s, 14 * s), 0xFFFFFF);
+                self.frame(Rect::new(x, y, 12 * s, 14 * s), rgb(120, 130, 150));
+                self.fill(Rect::new(x + 8 * s, y, 4 * s, 4 * s), rgb(210, 220, 235));
+                if kind == FileKind::Text {
+                    for i in 0..3 {
+                        self.fill(Rect::new(x + 2 * s, y + (6 + 2 * i) * s, 8 * s, s), rgb(150, 170, 200));
+                    }
+                }
+                match kind {
+                    FileKind::Settings => {
+                        // A grey cog: a ring with four teeth.
+                        let (cx, cy) = (x + 6 * s, y + 9 * s);
+                        self.fill(Rect::new(cx - s / 2 - s, cy - 4 * s, 2 * s, 8 * s), rgb(110, 115, 125));
+                        self.fill(Rect::new(cx - 4 * s, cy - s / 2 - s, 8 * s, 2 * s), rgb(110, 115, 125));
+                        self.orb(cx, cy, 3 * s, rgb(150, 155, 165), rgb(100, 105, 115));
+                        self.orb(cx, cy, s, rgb(255, 255, 255), rgb(235, 235, 235));
+                    }
+                    FileKind::Sound => {
+                        // A note: a head and a stem with a flag.
+                        self.orb(x + 5 * s, y + 11 * s, 2 * s, rgb(40, 70, 140), rgb(20, 40, 100));
+                        self.fill(Rect::new(x + 6 * s, y + 4 * s, s.max(1), 7 * s), rgb(20, 40, 100));
+                        self.fill(Rect::new(x + 6 * s, y + 4 * s, 3 * s, 2 * s), rgb(20, 40, 100));
+                    }
+                    FileKind::Save => {
+                        // A blue disk with a white label.
+                        let d = Rect::new(x + 2 * s, y + 5 * s, 8 * s, 8 * s);
+                        self.fill(d, rgb(50, 100, 180));
+                        self.fill(Rect::new(d.x + 2 * s, d.y, 4 * s, 3 * s), rgb(200, 205, 215));
+                        self.fill(Rect::new(d.x + s, d.y + 4 * s, 6 * s, 4 * s), 0xFFFFFF);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// The Computer icon: a flat screen on a stand, 40 x 36 at scale 1.
     fn computer(&mut self, x: i32, y: i32, s: i32) {
         let body = Rect::new(x, y, 40 * s, 28 * s);
@@ -621,6 +697,7 @@ impl Edges {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortBy {
     Name,
+    Date,
     Type,
     Size,
 }
@@ -765,6 +842,8 @@ enum Act {
     OpenInTab,
     Do(Command),
     Refresh,
+    /// Large icons or Details.
+    View,
     /// A line between groups.
     Line,
 }
@@ -1013,6 +1092,8 @@ struct Desktop {
     tab: usize,
     /// The preview pane at the right of the Computer window, and what it shows.
     preview_on: bool,
+    /// Folders shown as Large icons instead of Details.
+    icons: bool,
     preview: Option<Preview>,
     /// What Copy or Cut picked up, for any tab or side.
     clip: Option<Clip>,
@@ -2238,6 +2319,38 @@ fn delete_tree(path: &str, is_dir: bool) -> Result<usize, String> {
     Ok(n + 1)
 }
 
+/// What a file is, for its icon.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Text,
+    Settings,
+    Picture,
+    Sound,
+    Program,
+    Archive,
+    Save,
+    Disc,
+    Other,
+}
+
+fn file_kind(name: &str) -> FileKind {
+    let ext = match name.rfind('.') {
+        Some(i) if i > 0 => name[i + 1..].to_ascii_lowercase(),
+        _ => return FileKind::Other,
+    };
+    match ext.as_str() {
+        "txt" | "log" | "md" | "csv" => FileKind::Text,
+        "ini" | "cfg" | "conf" => FileKind::Settings,
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" => FileKind::Picture,
+        "wav" | "mp3" | "ogg" | "flac" => FileKind::Sound,
+        "exe" | "elf" => FileKind::Program,
+        "zip" | "7z" | "gz" | "tar" => FileKind::Archive,
+        "sav" => FileKind::Save,
+        "iso" | "img" => FileKind::Disc,
+        _ => FileKind::Other,
+    }
+}
+
 /// The Type column: "File folder", "Text Document", "PNG File", ...
 fn type_text(e: &aero::DirEntry) -> String {
     if e.is_dir {
@@ -2254,9 +2367,21 @@ fn type_text(e: &aero::DirEntry) -> String {
         "png" | "jpg" | "jpeg" | "bmp" | "gif" => "Picture",
         "wav" | "mp3" => "Sound",
         "exe" | "elf" => "Program",
-        "zip" => "Compressed Folder",
+        "zip" | "7z" | "gz" | "tar" => "Compressed Folder",
+        "sav" => "Saved Game",
+        "iso" | "img" => "Disc Image",
         _ => return format!("{} File", ext.to_ascii_uppercase()),
     })
+}
+
+/// A listing's last-written time (YYYYMMDDhhmmss) as Windows shows it:
+/// "10/9/2026 9:31 PM".
+fn date_text(packed: u64) -> String {
+    let part = |div: u64, m: u64| packed / div % m;
+    let (year, month, day) = (packed / 10_000_000_000, part(100_000_000, 100), part(1_000_000, 100));
+    let (hour, minute) = (part(10_000, 100), part(100, 100));
+    let h12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+    format!("{}/{}/{} {}:{:02} {}", month, day, year, h12, minute, if hour < 12 { "AM" } else { "PM" })
 }
 
 /// A free or total size for a drive: "1.9 GB", "512 MB".
@@ -2387,7 +2512,7 @@ impl Desktop {
     fn tab_rect(&self, c: &Rect, i: usize) -> Rect {
         let s = self.ui;
         let strip = self.files_tabs(c);
-        let room = strip.w - 8 * s - self.new_tab_button(c).w - self.panes_button(c).w - self.preview_button(c).w - 22 * s;
+        let room = strip.w - 8 * s - self.new_tab_button(c).w - self.panes_button(c).w - self.preview_button(c).w - self.view_button(c).w - 28 * s;
         let w = (room / self.tabs.len().max(1) as i32).min(190 * s);
         Rect::new(strip.x + 6 * s + i as i32 * w, strip.y + 4 * s, w - 4 * s, strip.h - 4 * s)
     }
@@ -2403,7 +2528,7 @@ impl Desktop {
         let n = self.tabs.len() as i32;
         let w = 26 * s;
         // Placed after the tabs; their width depends on the strip, not on this.
-        let room = strip.w - 8 * s - w - self.panes_button(c).w - self.preview_button(c).w - 22 * s;
+        let room = strip.w - 8 * s - w - self.panes_button(c).w - self.preview_button(c).w - self.view_button(c).w - 28 * s;
         let tab_w = (room / n.max(1)).min(190 * s);
         Rect::new(strip.x + 6 * s + n * tab_w, strip.y + 5 * s, w, strip.h - 8 * s)
     }
@@ -2419,6 +2544,13 @@ impl Desktop {
         let s = self.ui;
         let p = self.panes_button(c);
         let w = Font::Normal.width(s, "Preview") + 34 * s;
+        Rect::new(p.x - 6 * s - w, p.y, w, p.h)
+    }
+    /// "Large icons" / "Details", left of "Preview".
+    fn view_button(&self, c: &Rect) -> Rect {
+        let s = self.ui;
+        let p = self.preview_button(c);
+        let w = Font::Normal.width(s, "Large icons") + 34 * s;
         Rect::new(p.x - 6 * s - w, p.y, w, p.h)
     }
     fn files_commands(&self, c: &Rect) -> Rect {
@@ -2569,22 +2701,55 @@ impl Desktop {
         let r = self.rows_in(k);
         Rect::new(r.x + r.w, r.y, 16 * self.ui, r.h)
     }
-    fn visible_in(&self, k: &Rect) -> usize {
-        (self.rows_in(k).h / self.files_row_h()).max(1) as usize
+    /// The size of one entry's cell in a folder's `rows`, and how many go
+    /// across: one full-width row each in Details, tiles in Large icons.
+    fn cells(&self, rows: &Rect) -> (i32, i32, usize) {
+        let s = self.ui;
+        if self.icons {
+            let w = 128 * s;
+            (w, 104 * s, (rows.w / w).max(1) as usize)
+        } else {
+            (rows.w, self.files_row_h(), 1)
+        }
     }
+    fn visible_in(&self, k: &Rect) -> usize {
+        let rows = self.rows_in(k);
+        let (_, h, across) = self.cells(&rows);
+        across * (rows.h / h).max(1) as usize
+    }
+    /// Entry `i` (counted from the first one shown).
     fn row_in(&self, k: &Rect, i: usize) -> Rect {
         let rows = self.rows_in(k);
-        Rect::new(rows.x, rows.y + i as i32 * self.files_row_h(), rows.w, self.files_row_h())
+        let (w, h, across) = self.cells(&rows);
+        Rect::new(rows.x + (i % across) as i32 * w, rows.y + (i / across) as i32 * h, w, h)
+    }
+    /// Which entry (counted from the first one shown) is at (x, y) in
+    /// `rows`; a number past any entry when it is beside the last column.
+    fn cell_at(&self, rows: &Rect, x: i32, y: i32) -> usize {
+        let (w, h, across) = self.cells(rows);
+        let col = ((x - rows.x) / w).max(0) as usize;
+        if col >= across {
+            return 1 << 40;
+        }
+        ((y - rows.y) / h).max(0) as usize * across + col
+    }
+    /// How many entries one step down moves: a row of them.
+    fn files_across(&self, c: &Rect) -> usize {
+        self.cells(&self.files_rows(c)).2
     }
     /// Where the Type and Size columns start (Size is left out when narrow).
-    fn columns_in(&self, k: &Rect) -> (i32, i32) {
+    /// Where the Date modified, Type and Size columns start (Date and
+    /// Size are left out when narrow: Date where it starts Type then).
+    fn columns_in(&self, k: &Rect) -> (i32, i32, i32) {
         let s = self.ui;
         let rows = self.rows_in(k);
         let size_w = if rows.w < 380 * s { 0 } else { 90 * s };
         let size_x = rows.x + rows.w - size_w;
         // Narrow (a side of two panes): names get most of the room.
         let type_w = if size_w == 0 { (rows.w / 3).min(120 * s) } else { ((rows.w - size_w) * 2 / 5).min(170 * s) };
-        (size_x - type_w, size_x)
+        let type_x = size_x - type_w;
+        let date_w = if rows.w < 620 * s { 0 } else { Font::Normal.width(s, "12/31/2026 12:00 PM") + 14 * s };
+        (type_x - date_w, type_x, size_x)
     }
     fn files_head(&self, c: &Rect) -> Rect {
         self.head_in(&self.files_content(c))
@@ -2605,7 +2770,7 @@ impl Desktop {
     fn files_row(&self, c: &Rect, i: usize) -> Rect {
         self.row_in(&self.files_content(c), i)
     }
-    fn files_columns(&self, c: &Rect) -> (i32, i32) {
+    fn files_columns(&self, c: &Rect) -> (i32, i32, i32) {
         self.columns_in(&self.files_content(c))
     }
     fn tile_columns(&self, c: &Rect) -> usize {
@@ -3194,6 +3359,26 @@ impl Desktop {
         c.fill(Rect::new(ix + 11 * s, iy, 6 * s, 12 * s), rgb(150, 190, 235));
         c.frame(Rect::new(ix, iy, 17 * s, 12 * s), rgb(50, 70, 110));
         c.text(vb.x + 26 * s, vb.y + (vb.h - Font::Normal.h(s)) / 2, "Preview", rgb(20, 40, 80), Font::Normal);
+        // The view: what a click switches to, with an icon of it.
+        let wb = self.view_button(client);
+        if wb.contains(px, py) {
+            c.rounded(wb, 3 * s, false, rgb(250, 252, 255), rgb(205, 225, 248), 255);
+            c.rounded_outline(wb, 3 * s, false, rgb(130, 155, 190), 255);
+        }
+        let (ix, iy) = (wb.x + 8 * s, wb.y + (wb.h - 12 * s) / 2);
+        if self.icons {
+            for i in 0..3 {
+                c.fill(Rect::new(ix, iy + i * 4 * s, 3 * s, 3 * s), rgb(90, 140, 210));
+                c.fill(Rect::new(ix + 5 * s, iy + i * 4 * s + s, 11 * s, s), rgb(50, 70, 110));
+            }
+        } else {
+            for (dx, dy) in [(0, 0), (9 * s, 0), (0, 7 * s), (9 * s, 7 * s)] {
+                c.fill(Rect::new(ix + dx, iy + dy, 7 * s, 5 * s), rgb(90, 140, 210));
+                c.frame(Rect::new(ix + dx, iy + dy, 7 * s, 5 * s), rgb(50, 70, 110));
+            }
+        }
+        let label = if self.icons { "Details" } else { "Large icons" };
+        c.text(wb.x + 26 * s, wb.y + (wb.h - Font::Normal.h(s)) / 2, label, rgb(20, 40, 80), Font::Normal);
 
         // Navigation pane: Computer and the drives.
         let pane = self.files_pane(client);
@@ -3350,7 +3535,7 @@ impl Desktop {
         if p.entry.is_dir {
             c.folder(r.x + 10 * s, y + 2 * s, s);
         } else {
-            c.page(r.x + 12 * s, y, s);
+            c.file_icon(r.x + 12 * s, y, s, file_kind(&p.entry.name));
         }
         let name: String = p.entry.name.chars().take(room).collect();
         c.text(r.x + 34 * s, y, &name, 0x101010, Font::Normal);
@@ -3651,11 +3836,67 @@ impl Desktop {
     /// A folder: column headings, the rows and a scroll bar.
     /// A folder's entries in columns, in area `k`: the folder in use
     /// (`active`), or in two-pane mode the other side (its selection grey).
+    /// Entry `i` in Large icons: a big icon, its name under it on up to
+    /// two lines (or the name being typed, in an edit box).
+    fn icon_cell(&self, c: &mut Canvas, f: &Files, i: usize, r: Rect) {
+        let s = self.ui;
+        let e = &f.entries[i];
+        let big = 3 * s;
+        let cx = r.x + r.w / 2;
+        if e.is_dir {
+            c.folder(cx - 8 * big, r.y + 8 * s + 2 * big, big);
+        } else {
+            c.file_icon(cx - 6 * big, r.y + 8 * s, big, file_kind(&e.name));
+        }
+        let fw = Font::Normal.w(s);
+        let cols = ((r.w - 4 * s) / fw).max(1) as usize;
+        let line_h = Font::Normal.h(s);
+        let ty = r.y + 8 * s + 14 * big + 4 * s;
+        if let (Some(new), true) = (&f.rename, f.selected == Some(i)) {
+            let skip = new.chars().count().saturating_sub(cols.saturating_sub(1));
+            let shown: String = new.chars().skip(skip).collect();
+            let edit = Rect::new(r.x + 2 * s, ty - 2 * s, r.w - 4 * s, line_h + 4 * s);
+            c.fill(edit, 0xFFFFFF);
+            c.frame(edit, rgb(60, 110, 190));
+            let text_w = shown.chars().count() as i32 * fw;
+            let ink = if f.rename_all {
+                c.fill(Rect::new(r.x + 5 * s, ty, text_w + 2 * s, line_h), rgb(51, 153, 255));
+                0xFFFFFF
+            } else {
+                0x101010
+            };
+            c.text(r.x + 6 * s, ty, &shown, ink, Font::Normal);
+            c.fill(Rect::new(r.x + 6 * s + text_w, ty + 2 * s, s.max(2), line_h - 4 * s), 0x101010);
+            return;
+        }
+        let cut = self.clip.as_ref().is_some_and(|k| k.cut && k.items.iter().any(|it| it.path == f.entry_path(i)));
+        let ink = if cut { rgb(140, 140, 140) } else { 0x101010 };
+        // Two lines: break at a space, a dot or a dash when one is near the end.
+        let chars: Vec<char> = e.name.chars().collect();
+        let (first, rest) = if chars.len() <= cols {
+            (chars.clone(), Vec::new())
+        } else {
+            let cut_at = chars[..cols].iter().rposition(|&ch| matches!(ch, ' ' | '-' | '_' | '.')).filter(|&p| p >= cols / 2).map_or(cols, |p| p + 1);
+            (chars[..cut_at].to_vec(), chars[cut_at..].to_vec())
+        };
+        let mut second: String = rest.iter().collect();
+        if rest.len() > cols {
+            second = rest[..cols.saturating_sub(3)].iter().collect::<String>() + "...";
+        }
+        for (n, line) in [first.iter().collect::<String>(), second].iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let w = line.chars().count() as i32 * fw;
+            c.text(cx - w / 2, ty + n as i32 * line_h, line.trim_end(), ink, Font::Normal);
+        }
+    }
+
     fn list_view(&self, c: &mut Canvas, f: &Files, k: Rect, active: bool) {
         let s = self.ui;
         let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
         let fw = Font::Normal.w(s);
-        let (type_x, size_x) = self.columns_in(&k);
+        let (date_x, type_x, size_x) = self.columns_in(&k);
         let head = self.head_in(&k);
         let rows = self.rows_in(&k);
         let head_y = head.y + (head.h - Font::Normal.h(s)) / 2;
@@ -3668,12 +3909,14 @@ impl Desktop {
         };
         // Narrow (one side of two): no Size column.
         let sizes = size_x < rows.x + rows.w - 4 * s;
+        let dates = date_x < type_x;
         for (by, label, x, end) in [
-            (SortBy::Name, "Name", rows.x + 30 * s, type_x),
+            (SortBy::Name, "Name", rows.x + 30 * s, date_x),
+            (SortBy::Date, "Date modified", date_x, type_x),
             (SortBy::Type, type_label, type_x, size_x),
             (SortBy::Size, "Size", size_x, rows.x + rows.w),
         ] {
-            if by == SortBy::Size && !sizes {
+            if (by == SortBy::Size && !sizes) || (by == SortBy::Date && !dates) {
                 continue;
             }
             // Headings that don't fit their column are cut short.
@@ -3704,7 +3947,7 @@ impl Desktop {
             };
             c.text(rows.x + 30 * s, rows.y + 10 * s, empty, rgb(120, 125, 135), Font::Normal);
         }
-        let name_cols = ((type_x - 12 * s - rows.x - 30 * s) / fw).max(1) as usize;
+        let name_cols = ((date_x - 12 * s - rows.x - 30 * s) / fw).max(1) as usize;
         let type_cols = ((size_x - 12 * s - type_x) / fw).max(1) as usize;
         for (i, e) in f.entries.iter().enumerate().skip(f.scroll).take(self.visible_in(&k)) {
             let r = self.row_in(&k, i - f.scroll);
@@ -3717,10 +3960,14 @@ impl Desktop {
             } else if r.contains(px, py) {
                 c.rounded(box_, 2 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
             }
+            if self.icons {
+                self.icon_cell(c, f, i, r);
+                continue;
+            }
             if e.is_dir {
                 c.folder(r.x + 8 * s, r.y + (r.h - 12 * s) / 2, s);
             } else {
-                c.page(r.x + 10 * s, r.y + (r.h - 14 * s) / 2, s);
+                c.file_icon(r.x + 10 * s, r.y + (r.h - 14 * s) / 2, s, file_kind(&e.name));
             }
             let ty = r.y + (r.h - Font::Normal.h(s)) / 2;
             match (&f.rename, f.selected == Some(i)) {
@@ -3728,7 +3975,7 @@ impl Desktop {
                     // The name being typed, in an edit box with a caret.
                     let skip = new.chars().count().saturating_sub(name_cols.saturating_sub(1));
                     let shown: String = new.chars().skip(skip).collect();
-                    let edit = Rect::new(rows.x + 26 * s, r.y + 2 * s, type_x - 8 * s - rows.x - 26 * s, r.h - 4 * s);
+                    let edit = Rect::new(rows.x + 26 * s, r.y + 2 * s, date_x - 8 * s - rows.x - 26 * s, r.h - 4 * s);
                     c.fill(edit, 0xFFFFFF);
                     c.frame(edit, rgb(60, 110, 190));
                     let text_w = shown.chars().count() as i32 * fw;
@@ -3760,6 +4007,9 @@ impl Desktop {
                 _ if f.path == SEARCH => split_path(&f.found[i]).0,
                 _ => type_text(e),
             };
+            if dates && e.modified != 0 {
+                c.text(date_x, ty, &date_text(e.modified), rgb(90, 90, 90), Font::Normal);
+            }
             let kind: String = kind.chars().take(type_cols).collect();
             c.text(type_x, ty, &kind, rgb(90, 90, 90), Font::Normal);
             if !e.is_dir && sizes {
@@ -3809,6 +4059,7 @@ impl Desktop {
         spots.push(self.new_tab_button(c));
         spots.push(self.panes_button(c));
         spots.push(self.preview_button(c));
+        spots.push(self.view_button(c));
         if self.files.form.is_some() {
             spots.push(self.form_button(c, true));
             spots.push(self.form_button(c, false));
@@ -3906,8 +4157,9 @@ impl Desktop {
                 let names: Vec<&str> = self.files.entries.iter().map(|e| e.name.as_str()).collect();
                 let c = self.files_client();
                 let row = self.files_row(&c, 0);
-                println!("[desktop] Computer: {} = {}; first row at {},{}, rows {} apart",
-                    path, names.join(" | "), row.x + 40 * self.ui, row.y + row.h / 2, row.h);
+                let dated = self.files.entries.iter().filter(|e| e.modified != 0).count();
+                println!("[desktop] Computer: {} = {}; first row at {},{}, rows {} apart; {} dated",
+                    path, names.join(" | "), row.x + 40 * self.ui, row.y + row.h / 2, row.h, dated);
                 self.files.path = path;
                 self.files.scroll = 0;
                 self.files.selected = None;
@@ -4125,6 +4377,22 @@ impl Desktop {
     }
 
     /// The preview pane on or off.
+    /// Large icons or Details, for every folder shown.
+    fn toggle_icons(&mut self) -> Rect {
+        self.icons = !self.icons;
+        let c = self.files_client();
+        let across = self.files_across(&c);
+        self.files.scroll -= self.files.scroll % across;
+        self.with_other(|d| d.files.scroll -= d.files.scroll % across);
+        if let Some(i) = self.files.selected {
+            self.scroll_to(i);
+        }
+        let first = self.files_row(&c, 0);
+        println!("[desktop] view: {}; first item at {},{}, {} across", if self.icons { "Large icons" } else { "Details" },
+            first.x + first.w / 2, first.y + first.h / 2, across);
+        self.files_area()
+    }
+
     fn toggle_preview(&mut self) -> Rect {
         self.preview_on = !self.preview_on;
         self.preview = None;
@@ -4217,6 +4485,7 @@ impl Desktop {
                     SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                     SortBy::Type => pa.to_lowercase().cmp(&pb.to_lowercase()),
                     SortBy::Size => a.size.cmp(&b.size).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    SortBy::Date => a.modified.cmp(&b.modified).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
                 };
                 b.is_dir.cmp(&a.is_dir).then(if desc { order.reverse() } else { order })
             });
@@ -4228,6 +4497,7 @@ impl Desktop {
                 SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortBy::Type => type_text(a).cmp(&type_text(b)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
                 SortBy::Size => a.size.cmp(&b.size).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortBy::Date => a.modified.cmp(&b.modified).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
             };
             b.is_dir.cmp(&a.is_dir).then(if desc { order.reverse() } else { order })
         });
@@ -4237,10 +4507,12 @@ impl Desktop {
     fn scroll_to(&mut self, i: usize) {
         let c = self.files_client();
         let visible = self.files_visible(&c);
+        let across = self.files_across(&c);
         if i < self.files.scroll {
-            self.files.scroll = i;
+            self.files.scroll = i - i % across;
         } else if i >= self.files.scroll + visible {
-            self.files.scroll = i + 1 - visible;
+            let first = i + 1 - visible;
+            self.files.scroll = first.div_ceil(across) * across;
         }
     }
 
@@ -4631,7 +4903,7 @@ impl Desktop {
         let mut binned = 0;
         let mut gone = 0;
         for it in items {
-            let e = aero::DirEntry { name: split_path(&it.path).1, is_dir: it.is_dir, size: it.size };
+            let e = aero::DirEntry { name: split_path(&it.path).1, is_dir: it.is_dir, size: it.size, modified: 0 };
             if self.recycle_root_of(&it.path).is_some() {
                 self.recycle(&it.path, &e)?;
                 binned += 1;
@@ -4735,7 +5007,7 @@ impl Desktop {
         all.reverse();
         self.files.entries = all
             .iter()
-            .map(|b| aero::DirEntry { name: split_path(&b.original).1, is_dir: b.is_dir, size: b.size })
+            .map(|b| aero::DirEntry { name: split_path(&b.original).1, is_dir: b.is_dir, size: b.size, modified: 0 })
             .collect();
         self.files.bin = all;
     }
@@ -5012,7 +5284,7 @@ impl Desktop {
                     }
                 }
                 [one] => {
-                    let e = aero::DirEntry { name: split_path(&one.path).1, is_dir: false, size: one.size };
+                    let e = aero::DirEntry { name: split_path(&one.path).1, is_dir: false, size: one.size, modified: 0 };
                     println!("[desktop] properties of {}: {} bytes", one.path, bytes);
                     Props {
                         title: e.name.clone(),
@@ -5069,7 +5341,7 @@ impl Desktop {
         } else if p.pie.is_some() || p.rows.first().is_some_and(|(_, v)| v.starts_with("Network")) {
             c.small_drive(r.x + 14 * s, r.y + 18 * s, s, p.pie.is_none());
         } else {
-            c.page(r.x + 18 * s, r.y + 16 * s, s);
+            c.file_icon(r.x + 18 * s, r.y + 16 * s, s, file_kind(&p.title));
         }
         let fw = Font::Normal.w(s);
         let title: String = p.title.chars().take(((r.w - 60 * s) / fw).max(1) as usize).collect();
@@ -5158,7 +5430,7 @@ impl Desktop {
         let mut target = None;
         let rows = self.files_rows(&c);
         if rows.contains(x, y) && !self.files.path.is_empty() && self.files.path != BIN {
-            let i = self.files.scroll + ((y - rows.y) / self.files_row_h()) as usize;
+            let i = self.files.scroll + self.cell_at(&rows, x, y);
             if let Some(e) = self.files.entries.get(i) {
                 if e.is_dir && !self.is_marked(i) {
                     target = Some((self.entry_path(i), e.name.clone()));
@@ -5172,7 +5444,7 @@ impl Desktop {
                 let mut hit = (other.path.clone(), self.place_title(other));
                 let rows = self.rows_in(&k);
                 if rows.contains(x, y) {
-                    let i = other.scroll + ((y - rows.y) / self.files_row_h()) as usize;
+                    let i = other.scroll + self.cell_at(&rows, x, y);
                     if let Some(e) = other.entries.get(i).filter(|e| e.is_dir) {
                         hit = (other.entry_path(i), e.name.clone());
                     }
@@ -5434,6 +5706,7 @@ impl Desktop {
                 self.refresh(keep);
                 self.files_area()
             }
+            Act::View => self.toggle_icons(),
             Act::Line => Rect::EMPTY,
         };
         area.union(&r).union(&self.sync_preview())
@@ -5499,7 +5772,7 @@ impl Desktop {
             }
         } else {
             let rows = self.files_rows(&c);
-            let i = if rows.contains(x, y) { self.files.scroll + ((y - rows.y) / self.files_row_h()) as usize } else { usize::MAX };
+            let i = if rows.contains(x, y) { self.files.scroll + self.cell_at(&rows, x, y) } else { usize::MAX };
             if i < self.files.entries.len() {
                 if !self.is_marked(i) {
                     self.select(i);
@@ -5537,6 +5810,7 @@ impl Desktop {
                     alloc::vec![(Do(Command::Empty), "Empty Recycle Bin", on(self, Command::Empty)), (Refresh, "Refresh", true)]
                 } else {
                     alloc::vec![
+                        (View, if self.icons { "Details" } else { "Large icons" }, true),
                         (Refresh, "Refresh", true),
                         (Line, "", false),
                         (Do(Command::Paste), "Paste", on(self, Command::Paste)),
@@ -5573,6 +5847,9 @@ impl Desktop {
             }
             if self.preview_button(&c).contains(x, y) {
                 return self.toggle_preview();
+            }
+            if self.view_button(&c).contains(x, y) {
+                return self.toggle_icons();
             }
             if self.new_tab_button(&c).contains(x, y) {
                 return self.new_tab();
@@ -5667,11 +5944,13 @@ impl Desktop {
         }
         let head = self.files_head(&c);
         if head.contains(x, y) && self.files.path != BIN {
-            let (type_x, size_x) = self.files_columns(&c);
+            let (date_x, type_x, size_x) = self.files_columns(&c);
             let by = if x >= size_x - 8 * self.ui {
                 SortBy::Size
             } else if x >= type_x - 8 * self.ui {
                 SortBy::Type
+            } else if date_x < type_x && x >= date_x - 8 * self.ui {
+                SortBy::Date
             } else {
                 SortBy::Name
             };
@@ -5685,13 +5964,14 @@ impl Desktop {
         let sb = self.files_scrollbar(&c);
         if sb.contains(x, y) {
             let visible = self.files_visible(&c);
-            let last = self.files.entries.len().saturating_sub(visible);
+            let across = self.files_across(&c);
+            let last = self.files.entries.len().div_ceil(across).saturating_sub(visible / across) * across;
             let arrow = 16 * self.ui;
             let scroll = self.files.scroll;
             self.files.scroll = if y < sb.y + arrow {
-                scroll.saturating_sub(1)
+                scroll.saturating_sub(across)
             } else if y >= sb.y + sb.h - arrow {
-                (scroll + 1).min(last)
+                (scroll + across).min(last)
             } else if y < sb.y + sb.h / 2 {
                 scroll.saturating_sub(visible)
             } else {
@@ -5703,7 +5983,7 @@ impl Desktop {
         if !rows.contains(x, y) {
             return Rect::EMPTY;
         }
-        let i = self.files.scroll + ((y - rows.y) / self.files_row_h()) as usize;
+        let i = self.files.scroll + self.cell_at(&rows, x, y);
         let keys = self.pointer.keys;
         if i >= self.files.entries.len() {
             if keys & (aero::display::MOD_CTRL | aero::display::MOD_SHIFT) == 0 {
@@ -5811,7 +6091,7 @@ impl Desktop {
         let count = if self.files.path.is_empty() { self.tile_count() } else { self.files.entries.len() };
         let c = self.files_client();
         let page = if self.files.path.is_empty() { self.tile_columns(&c) } else { self.files_visible(&c) };
-        let step = if self.files.path.is_empty() { self.tile_columns(&c) } else { 1 };
+        let step = if self.files.path.is_empty() { self.tile_columns(&c) } else { self.files_across(&c) };
         let at = self.files.selected;
         let target = match k {
             8 => return self.go_up(),
@@ -5837,8 +6117,8 @@ impl Desktop {
             }
             KEY_DOWN => at.map_or(0, |i| i + step),
             KEY_UP => at.map_or(0, |i| i.saturating_sub(step)),
-            KEY_RIGHT if self.files.path.is_empty() => at.map_or(0, |i| i + 1),
-            KEY_LEFT if self.files.path.is_empty() => at.map_or(0, |i| i.saturating_sub(1)),
+            KEY_RIGHT if self.files.path.is_empty() || step > 1 => at.map_or(0, |i| i + 1),
+            KEY_LEFT if self.files.path.is_empty() || step > 1 => at.map_or(0, |i| i.saturating_sub(1)),
             KEY_PGDN => at.map_or(0, |i| i + page),
             KEY_PGUP => at.map_or(0, |i| i.saturating_sub(page)),
             KEY_HOME => 0,
@@ -6181,6 +6461,7 @@ fn main() -> i64 {
         right: false,
         tabs: alloc::vec![Tab::default()],
         preview_on: false,
+        icons: false,
         preview: None,
         tab: 0,
         clip: None,

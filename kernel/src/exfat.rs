@@ -216,7 +216,15 @@ impl ExfatVolume {
         let st = &mut *self.state.lock();
         let e = self.lookup(st, path)?;
         let entries = if e.is_dir() { self.read_dir(st, &e.stream)?.1 } else { vec![e] };
-        Ok(entries.into_iter().map(|e| vfs::DirEntry { is_dir: e.is_dir(), size: e.stream.len, name: e.name }).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| {
+                // The file entry's last-modified timestamp: time, then date.
+                let stamp = if e.raw.len() >= 16 { u32_at(&e.raw, 12) } else { 0 };
+                let modified = crate::rtc::DateTime::from_dos((stamp >> 16) as u16, stamp as u16).map_or(0, |t| t.packed());
+                vfs::DirEntry { is_dir: e.is_dir(), size: e.stream.len, name: e.name, modified }
+            })
+            .collect())
     }
 
     fn read(&self, path: &str, limit: usize) -> Res<Vec<u8>> {

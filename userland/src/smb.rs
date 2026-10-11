@@ -631,7 +631,8 @@ impl Client {
                 // Hidden and system files stay hidden, as in Explorer.
                 if name != "." && name != ".." && attrs & 0x6 == 0 {
                     let is_dir = attrs & 0x10 != 0;
-                    out.push(DirEntry { name, is_dir, size: if is_dir { 0 } else { size } });
+                    let modified = crate::packed_filetime(u64::from_le_bytes(e[24..32].try_into().unwrap()));
+                    out.push(DirEntry { name, is_dir, size: if is_dir { 0 } else { size }, modified });
                 }
                 if next == 0 {
                     break;
