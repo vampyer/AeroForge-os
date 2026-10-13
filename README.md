@@ -586,6 +586,22 @@ thread now has a 256 KiB stack like the threads it starts (the decoders need mor
 mouse no longer stops answering in the desktop after its eighth double-click (the double-click count
 reached the top bit of the pointer system call's result, which made it read as an error).
 
+Since 0.61 there is a **Control Panel**, opened from the right of the Start menu as in Windows 7. Its home page
+has four categories. Display chooses the desktop background (Aero blue, Aurora, Dusk or Graphite, each drawn
+from its own colours, with previews) and the text and window size (Normal, or Large on screens of at least
+1600 x 1000; everything is laid out again at once). Sound sets the volume of everything played (a new
+`audio_volume` system call, 62: the kernel's mixer scales every stream by the square of the slider, so equal
+steps sound about equally far apart), mutes it, and plays a test sound. Mouse sets the pointer speed, the
+double-click speed (200 to 900 ms, timed by the kernel; `mouse_buttons`, 63) with a folder to double-click
+as a test, and swaps the primary and secondary buttons for the left hand. Date and Time shows the time and
+day of the week, sets the PC's clock (`time_set`, 64, which writes the CMOS clock in whatever BCD or 12-hour
+form the firmware uses) and switches the taskbar clock between 12 and 24 hours. Every setting is kept in
+`/AeroForge.ini` and put back when the desktop starts. The boot test goes through every page: it picks
+the Dusk background and checks it on the screen, sets the volume to half and hears the test sound at a
+quarter of its level, mutes and unmutes, double-clicks the test folder, sets the double-click speed and
+swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
+clock and back, then reads the settings back from the disk image.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
@@ -614,7 +630,7 @@ reached the top bit of the pointer system call's result, which made it read as a
 `mem_unmap`, `thread_create`, `thread_exit`, `thread_join`, `futex_wait`, `futex_wake`, `process_wait`,
 `thread_id`, `thread_priority`, `sleep_us`, `clock_us`, `socket_open`, `socket_connect`, `socket_send`,
 `socket_recv`, `socket_listen`, `socket_accept`, `net_info`, `event_create`, `event_set`, `event_reset`,
-`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`, `volumes`, `rename`.
+`wait_any`, `process_handle`, `process_kill`, `display_acquire`, `display_present`, `display_release`, `pointer`, `keys_read`, `time`, `dir_list`, `mouse_speed`, `volumes`, `deleted_list`, `undelete`, `set_writable`, `rename`, `file_read_at`, `file_append`, `audio_volume`, `mouse_buttons`, `time_set`.
 The numbers are in `kernel/src/syscall.rs` and `userland/src/lib.rs`.
 
 ### Still to do in Phase 1

@@ -12,6 +12,8 @@ Usage: check-screen.py drawtest <ppm>   red, green, blue and white quarters
        check-screen.py snap <ppm>       a window snapped to the left half
        check-screen.py photos <ppm>     Photos showing the sunset picture (its
                                         yellow sun and dark hills)
+       check-screen.py cpanel <ppm>     the Dusk background (warm, not blue) at
+                                        the bottom right, by the Control Panel
        check-screen.py start <ppm>      the Start button (red, white and blue
                                         with a black star) and the open menu
 """
@@ -101,6 +103,15 @@ def main():
         menu = at(60, h - 40 - 380 + 8 + 250)
         if not min(menu) > 225:
             sys.exit(f'{path}: the Start menu is not open (60,{h - 162} is {menu})')
+        want = {}
+    elif mode == 'cpanel':
+        warm = 0
+        for y in range(h - 150, h - 50, 10):
+            for x in range(w - 100, w - 10, 10):
+                r, g, b = at(x, y)
+                warm += r > b + 5
+        if warm < 60:
+            sys.exit(f'{path}: no Dusk background at the bottom right ({warm} of 90 samples warm; {at(w - 30, h - 60)})')
         want = {}
     elif mode == 'photos':
         sun = hills = 0

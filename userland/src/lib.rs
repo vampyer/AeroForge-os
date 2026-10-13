@@ -74,6 +74,9 @@ pub mod sys {
     pub const RENAME: u64 = 59;
     pub const FILE_READ_AT: u64 = 60;
     pub const FILE_APPEND: u64 = 61;
+    pub const AUDIO_VOLUME: u64 = 62;
+    pub const MOUSE_BUTTONS: u64 = 63;
+    pub const TIME_SET: u64 = 64;
 }
 
 pub mod rights {
@@ -167,6 +170,14 @@ pub fn now() -> Option<DateTime> {
     })
 }
 
+/// Sets the PC's clock (local time). Err(E_INVAL) if `t` is not a real date
+/// and time in 2000-2099.
+pub fn set_time(t: &DateTime) -> Result<(), i64> {
+    let v = (t.year as u64) << 40 | (t.month as u64) << 32 | (t.day as u64) << 24 | (t.hour as u64) << 16
+        | (t.minute as u64) << 8 | t.second as u64;
+    check(unsafe { syscall(sys::TIME_SET, v, 0, 0, 0) }).map(|_| ())
+}
+
 pub fn cpu_id() -> u64 {
     unsafe { syscall(sys::CPU_ID, 0, 0, 0, 0) as u64 }
 }
@@ -250,6 +261,16 @@ pub struct DirEntry {
 /// mouse count. `set` = Some(n) changes it first.
 pub fn mouse_speed(set: Option<u64>) -> Result<u64, i64> {
     check(unsafe { syscall(sys::MOUSE_SPEED, set.unwrap_or(0), 0, 0, 0) })
+}
+
+/// The double-click time in milliseconds and whether the left and right
+/// buttons are swapped; with `set`, changes them first (200-900 ms).
+pub fn mouse_buttons(set: Option<(u64, bool)>) -> Result<(u64, bool), i64> {
+    let (op, ms, swap) = match set {
+        Some((ms, swap)) => (1, ms, swap as u64),
+        None => (0, 0, 0),
+    };
+    check(unsafe { syscall(sys::MOUSE_BUTTONS, op, ms, swap, 0) }).map(|v| (v & 0xFFFF, v >> 16 & 1 == 1))
 }
 
 /// The files and directories in `path` ("/" lists the other disks too, as
@@ -394,6 +415,16 @@ pub mod audio {
     use super::*;
 
     pub const RATE: u32 = 48_000;
+
+    /// The master volume (0-100) and whether sound is muted; with `set`,
+    /// changes them first. It applies to every program's sound.
+    pub fn volume(set: Option<(u32, bool)>) -> Result<(u32, bool), i64> {
+        let (op, v, mute) = match set {
+            Some((v, mute)) => (1, v as u64, mute as u64),
+            None => (0, 0, 0),
+        };
+        check(unsafe { syscall(sys::AUDIO_VOLUME, op, v, mute, 0) }).map(|r| ((r & 0xFF) as u32, r >> 8 & 1 == 1))
+    }
 
     /// Queues interleaved left/right samples; returns how many frames (pairs)
     /// were taken. Never blocks: when it returns fewer, wait a little and

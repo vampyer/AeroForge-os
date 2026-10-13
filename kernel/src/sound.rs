@@ -8,7 +8,7 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::dhi::{self, HdaInfo, HdaOutput};
 use crate::sync::IrqMutex;
@@ -31,6 +31,26 @@ impl Card {
 }
 
 pub static CARDS: IrqMutex<Vec<Card>> = IrqMutex::new(Vec::new());
+/// The master volume, 0-100, and mute: every stream is scaled by it.
+static VOLUME: AtomicU32 = AtomicU32::new(100);
+static MUTED: AtomicBool = AtomicBool::new(false);
+
+/// The master volume (0-100) and whether sound is muted.
+pub fn volume() -> (u32, bool) {
+    (VOLUME.load(Ordering::Relaxed), MUTED.load(Ordering::Relaxed))
+}
+
+pub fn set_volume(volume: u32, muted: bool) {
+    VOLUME.store(volume.min(100), Ordering::Relaxed);
+    MUTED.store(muted, Ordering::Relaxed);
+}
+
+/// What the mix is multiplied by, out of 65536: the square of the volume,
+/// so equal steps of the slider sound about equally far apart.
+fn gain() -> i64 {
+    let (v, muted) = volume();
+    if muted { 0 } else { (v * v) as i64 * 65536 / 10_000 }
+}
 /// The output sound goes to: (card, output index).
 static SELECTED: IrqMutex<Option<(usize, usize)>> = IrqMutex::new(None);
 
@@ -309,7 +329,8 @@ pub fn mixer_thread(_: u64) {
                 }
             }
             if !mix.is_empty() {
-                let out: Vec<i16> = mix.iter().map(|&v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16).collect();
+                let g = gain();
+                let out: Vec<i16> = mix.iter().map(|&v| ((v as i64 * g) >> 16).clamp(i16::MIN as i64, i16::MAX as i64) as i16).collect();
                 unsafe { dhi::aero_hda_write(id, out.as_ptr(), (out.len() / 2) as u32) };
                 idle = 0;
             } else if pending == 0 {
