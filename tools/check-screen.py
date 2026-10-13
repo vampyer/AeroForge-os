@@ -10,6 +10,8 @@ Usage: check-screen.py drawtest <ppm>   red, green, blue and white quarters
        check-screen.py explorer <ppm> cx cy  the Computer window at cx,cy
                                         showing the drives
        check-screen.py snap <ppm>       a window snapped to the left half
+       check-screen.py photos <ppm>     Photos showing the sunset picture (its
+                                        yellow sun and dark hills)
        check-screen.py start <ppm>      the Start button (red, white and blue
                                         with a black star) and the open menu
 """
@@ -99,6 +101,17 @@ def main():
         menu = at(60, h - 40 - 380 + 8 + 250)
         if not min(menu) > 225:
             sys.exit(f'{path}: the Start menu is not open (60,{h - 162} is {menu})')
+        want = {}
+    elif mode == 'photos':
+        sun = hills = 0
+        for y in range(0, h, 2):
+            for x in range(0, w, 2):
+                r, g, b = at(x, y)
+                sun += abs(r - 255) < 20 and abs(g - 220) < 25 and abs(b - 120) < 35
+                hills += abs(r - 25) < 12 and abs(g - 20) < 12 and abs(b - 35) < 12
+        # Sampling every other pixel both ways: a quarter of each area.
+        if sun < 1500 or hills < 15000:
+            sys.exit(f'{path}: no sunset picture on the screen (sun {sun * 4} pixels, hills {hills * 4})')
         want = {}
     elif mode == 'snap':
         # Welcome's white client area fills the left half below its text;

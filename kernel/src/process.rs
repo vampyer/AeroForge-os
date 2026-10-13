@@ -103,7 +103,9 @@ pub static PROCESSES: IrqMutex<BTreeMap<u64, Arc<Process>>> = IrqMutex::new(BTre
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-pub const USER_STACK_SIZE: u64 = 64 * 1024;
+/// A program's first thread gets the same 256 KiB stack as the threads it
+/// starts (picture and sound decoders need more than 64 KiB).
+pub const USER_STACK_SIZE: u64 = 256 * 1024;
 /// Where SYS_MEM_MAP regions start (16 TiB, far from the program and stack).
 const HEAP_BASE: u64 = 0x0000_1000_0000_0000;
 /// Largest single SYS_MEM_MAP.

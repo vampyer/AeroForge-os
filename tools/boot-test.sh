@@ -594,6 +594,37 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at $(menu_item Restore); monitor "mouse_button 1" "mouse_button 0"; STAGE=emptiedback
     elif [ $STAGE = emptiedback ] && { [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG")" -ge 2 ] \
             || grep -q "\[desktop\] \(undelete failed in /Recycle Bin\|Not restored\)" "$LOG"; }; then
+        # Pictures: C:/Pictures from the navigation pane, then a double-click
+        # opens Sunset.jpg in Photos.
+        XY=$(grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o "  Pictures at [0-9]*,[0-9]*" | grep -o "[0-9]*,[0-9]*$")
+        NP=$(grep -c "\[desktop\] Computer: /Pictures = " "$LOG" || true)
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=pictures
+    elif [ $STAGE = pictures ] && [ "$(grep -c "\[desktop\] Computer: /Pictures = " "$LOG")" -gt "${NP:-0}" ]; then
+        sleep 0.5; point_at $(row_of /Pictures Sunset.jpg); double_click; STAGE=photo1
+    elif [ $STAGE = photo1 ] && grep -q "\[desktop\] Photos: /Pictures/Sunset.jpg\(, \|: \)" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-photos.ppm"
+        # Next goes round to the first picture, Flag.bmp, then Green orb.png.
+        XY=$(grep -ao "Photos: Previous at [0-9]*,[0-9]*; Next at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=photo2
+    elif [ $STAGE = photo2 ] && grep -q "\[desktop\] Photos: /Pictures/Flag.bmp" "$LOG"; then
+        sleep 0.5; monitor "mouse_button 1" "mouse_button 0"; STAGE=photo3
+    elif [ $STAGE = photo3 ] && grep -q "\[desktop\] Photos: /Pictures/Green orb.png" "$LOG"; then
+        XY=$(grep -ao "Photos window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=photoclose
+    elif [ $STAGE = photoclose ] && grep -q "\[desktop\] closed Photos" "$LOG"; then
+        # Music: C:/Music, then Chimes.wav plays, and Little Tune.mp3 after it.
+        XY=$(grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o "  Music at [0-9]*,[0-9]*" | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=music
+    elif [ $STAGE = music ] && grep -q "\[desktop\] Computer: /Music = " "$LOG"; then
+        sleep 0.5; point_at $(row_of /Music Chimes.wav); double_click; STAGE=music1
+    elif [ $STAGE = music1 ] && grep -q "\[desktop\] Music: /Music/Little Tune.mp3, \|\[desktop\] Music: /Music/Chimes.wav: \|no sound output" "$LOG"; then
+        sleep 2; monitor "screendump build/gop-music.ppm"
+        XY=$(grep -ao "Music: Previous at .*; Stop at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musicstop
+    elif [ $STAGE = musicstop ] && grep -q "\[desktop\] music stopped" "$LOG"; then
+        XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musicclose
+    elif [ $STAGE = musicclose ] && grep -q "\[desktop\] closed Music" "$LOG"; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
@@ -778,6 +809,19 @@ for _ in $(seq "$TIMEOUT"); do
             && grep -q "\[desktop\] two panes: left = Computer, right = Computer, left in use" "$LOG" \
             && grep -q "\[desktop\] two panes: left = C:/, right = C:/docs, left in use" "$LOG" \
             || { fail "Ctrl+T did not open a second tab, or it did not split into C:/ and C:/docs"; }
+        # Photos and Music.
+        grep -q "\[desktop\] Photos: /Pictures/Sunset.jpg, JPEG 1280x800 (3 of 3)" "$LOG" \
+            && grep -q "\[desktop\] Photos: /Pictures/Flag.bmp, BMP 90x60 (1 of 3)" "$LOG" \
+            && grep -q "\[desktop\] Photos: /Pictures/Green orb.png, PNG 256x256 (2 of 3)" "$LOG" \
+            || { fail "Photos did not show the JPEG, BMP and PNG pictures in turn"; }
+        python3 tools/check-screen.py photos build/gop-photos.ppm || { fail "the sunset picture was not on the screen in Photos"; }
+        grep -q "\[desktop\] Music: /Music/Chimes.wav, WAV 44100 Hz, 1 channel, 0:04 (1 of 2)" "$LOG" \
+            && grep -q "\[desktop\] Music: played /Music/Chimes.wav to the end" "$LOG" \
+            && grep -q "\[desktop\] Music: /Music/Little Tune.mp3, MP3 44100 Hz, 2 channels, 0:09 (2 of 2)" "$LOG" \
+            || { fail "Music did not play the WAV song and go on to the MP3 one"; }
+        echo "$TONE" | grep -qE "^tone (3\.[5-9]|4\.[0-6])[0-9] s, .*peak (9[0-9]{3}|1[0-2][0-9]{3})$" \
+            || { fail "the WAV song (4.5 s of chimes) was not heard on the sound card ($TONE)"; }
+        echo "$TONE" | tail -1 | grep -qE "^tone ([1-9]|[1-9][0-9])\.[0-9]+ s" || { fail "the MP3 song was not heard on the sound card ($TONE)"; }
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \
             && grep -q "\[desktop\] pasted /Big.bin as /docs/Big.bin (1 file)" "$LOG" \
             && mtype -i build/disk.img@@1M ::/docs/Big.bin | cmp -s - build/Big.bin \
@@ -940,7 +984,7 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "a folder index on the NTFS volume is out of order"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
         grep -q "\[aerosmss\] staying at the console (/system/session.cfg says so)" "$LOG" || { fail "aerosmss did not keep the console for the test as session.cfg asks"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

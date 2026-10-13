@@ -571,6 +571,21 @@ the progress window up, then cancels a second copy, checking every copy with mto
 ntfscat; `tools/ntfs-write-test.sh` adds to files a piece at a time (including two that grow in turns, so
 their clusters interleave) and reads pieces back.
 
+Since 0.60 pictures and music open from the file manager. Double-clicking a JPEG, PNG or BMP picture opens
+it in **Photos**, fitted to the window (never enlarged past its own size); "<" and ">" (or the Left and Right
+keys) go through the other pictures in the same folder. Double-clicking a WAV or MP3 song opens **Music**:
+it plays the song through the sound card, shows a bar (click it to jump) and the time, has Previous,
+Play/Pause, Stop and Next buttons (Space plays and pauses) and goes on to the next song in the folder.
+Pictures are decoded by zune-jpeg and zune-png, BMP files (1, 4, 8, 24 and 32 bits) by AeroForge's own
+code, and MP3 by nanomp3 (a Rust port of minimp3); WAV files can be 8, 16, 24 or 32-bit PCM with one to
+eight channels. Songs are decoded a piece at a time and resampled to the sound card's 48 kHz stereo.
+C:/Pictures and C:/Music on the test disk hold a few original pictures and songs made by
+`tools/make-media.py`; the boot test opens each picture in turn, checks the sunset picture is on the screen,
+plays the WAV song and then the MP3 one, and finds both in the sound card's output. A program's first
+thread now has a 256 KiB stack like the threads it starts (the decoders need more than 64 KiB), and the
+mouse no longer stops answering in the desktop after its eighth double-click (the double-click count
+reached the top bit of the pointer system call's result, which made it read as an error).
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |
