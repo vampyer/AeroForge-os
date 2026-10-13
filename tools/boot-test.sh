@@ -520,7 +520,8 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = bigcopy ] && grep -q "\[desktop\] \(pasted /Big.bin as /docs/Big.bin\|paste failed\|Can't\)" "$LOG"; then
         # Again with Ctrl+C, Tab and Ctrl+V, the pointer waiting on Cancel,
         # pressed as soon as the window is up.
-        XY=$(grep -ao "copying window up: .* Cancel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        XY=$(grep -ao "copying window up: .* Cancel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$" || true)
+        [ -n "$XY" ] || fail "no progress window came up while copying /Big.bin ($(grep -a '\[desktop\] \(copying\|pasted\|paste failed\|Can.t\)' "$LOG" | tail -4 | tr -d '\r' | tr '\n' ';'))"
         sleep 0.5; type_keys $'\x03'; sleep 0.5; monitor "sendkey tab"; sleep 0.5
         # The button goes down once the copy has started, before the window
         # is up, and is held until Cancel takes it.
