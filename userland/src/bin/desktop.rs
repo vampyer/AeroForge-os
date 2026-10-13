@@ -6924,8 +6924,9 @@ impl Desktop {
         if p.file != file {
             p.file = String::from(file);
         }
-        // Shown only once a copy takes a moment, so small ones don't flash it.
-        if !p.shown && now - p.started_us >= 400_000 {
+        // Shown only once a copy takes a moment (a fifth of a second), so
+        // small ones don't flash it.
+        if !p.shown && now - p.started_us >= 200_000 {
             p.shown = true;
             p.drawn_us = 0;
             let c = self.progress_cancel();
