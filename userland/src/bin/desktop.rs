@@ -35,6 +35,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use aero::display::{self, Pointer, Screen};
@@ -2027,7 +2028,7 @@ impl Desktop {
                     Kind::Photos => self.photo = None,
                     Kind::ControlPanel => self.cp_page = CpPage::Home,
                     Kind::Music => {
-                        if self.player.take().is_some_and(|p| p.playing) {
+                        if self.player.take().is_some_and(|p| p.deck.lock().playing) {
                             println!("[desktop] music stopped");
                         }
                     }
@@ -2069,13 +2070,16 @@ impl Desktop {
                     dirty = dirty.union(&self.music_command(b));
                 } else if self.music_bar(&client).contains(x, y) {
                     let bar = self.music_bar(&client);
-                    if let Some(song) = self.player.as_mut().and_then(|p| p.song.as_mut()) {
-                        let to = song.frames * (x - bar.x) as u64 / bar.w.max(1) as u64;
-                        song.seek(to);
-                        println!("[desktop] music: moved to {}", minutes(to / 48_000));
-                        let p = self.player.as_mut().unwrap();
-                        p.spare.clear();
-                        p.heard = to;
+                    if let Some(p) = self.player.as_mut() {
+                        let mut d = p.deck.lock();
+                        if let Some(song) = d.song.as_mut() {
+                            let to = song.frames * (x - bar.x) as u64 / bar.w.max(1) as u64;
+                            song.seek(to);
+                            println!("[desktop] music: moved to {}", minutes(to / 48_000));
+                            d.spare.clear();
+                            drop(d);
+                            p.heard = to;
+                        }
                     }
                     dirty = dirty.union(&client);
                 }
@@ -2362,13 +2366,92 @@ struct Photo {
 struct Player {
     list: Vec<String>,
     at: usize,
+    /// Shared with the thread that feeds the sound card.
+    deck: Arc<aero::sync::Mutex<Deck>>,
+    feeder: Option<aero::thread::JoinHandle<()>>,
+    /// 48 kHz frames heard so far (made, less those still queued).
+    heard: u64,
+    error: String,
+}
+
+/// What the feeding thread plays.
+struct Deck {
     song: Option<aero::media::Song>,
     playing: bool,
     /// Samples made that the audio queue had no room for yet.
     spare: Vec<i16>,
-    /// 48 kHz frames heard so far (made, less those still queued).
-    heard: u64,
-    error: String,
+    /// Set by the feeding thread when there is no sound card to write to.
+    no_output: bool,
+    quit: bool,
+}
+
+impl Player {
+    fn new(list: Vec<String>, at: usize) -> Player {
+        let deck = Arc::new(aero::sync::Mutex::new(Deck { song: None, playing: false, spare: Vec::new(), no_output: false, quit: false }));
+        let shared = deck.clone();
+        let feeder = aero::thread::spawn(move || feed_music(shared)).ok();
+        Player { list, at, deck, feeder, heard: 0, error: String::new() }
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.deck.lock().quit = true;
+        if let Some(t) = self.feeder.take() {
+            t.join();
+        }
+    }
+}
+
+/// Music's own thread: keeps the audio queue about a third of a second
+/// ahead while a song plays. It runs at high priority so that a busy
+/// desktop (drawing, a big folder) does not leave gaps in the sound.
+fn feed_music(deck: Arc<aero::sync::Mutex<Deck>>) {
+    let _ = aero::thread::set_priority(aero::thread::Priority::High);
+    loop {
+        {
+            let mut d = deck.lock();
+            if d.quit {
+                return;
+            }
+            if d.playing {
+                feed_deck(&mut d);
+            }
+        }
+        aero::sleep_ms(10);
+    }
+}
+
+fn feed_deck(d: &mut Deck) {
+    let queued = match aero::audio::queued() {
+        Ok(n) => n as u64,
+        Err(_) => {
+            d.playing = false;
+            d.no_output = true;
+            return;
+        }
+    };
+    let mut room = (48_000 / 3u64).saturating_sub(queued);
+    while room > 0 {
+        if d.spare.is_empty() {
+            let Some(song) = d.song.as_mut() else { break };
+            let mut buf = alloc::vec![0i16; 2 * 2400];
+            let n = song.fill(&mut buf);
+            if n == 0 {
+                break;
+            }
+            buf.truncate(2 * n);
+            d.spare = buf;
+        }
+        match aero::audio::write(&d.spare) {
+            Ok(0) => break,
+            Ok(n) => {
+                d.spare.drain(..2 * n);
+                room = room.saturating_sub(n as u64);
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// The biggest picture or song opened (read whole into memory).
@@ -6256,7 +6339,8 @@ impl Desktop {
     /// Opens a song in Music and plays it, with the others in its folder after it.
     fn open_song(&mut self, path: String) -> Rect {
         let (list, at) = siblings(&path, FileKind::Sound);
-        self.player = Some(Player { list, at, song: None, playing: false, spare: Vec::new(), heard: 0, error: String::new() });
+        self.player = None;
+        self.player = Some(Player::new(list, at));
         self.load_song(true);
         self.log_window(Kind::Music);
         self.bring(Kind::Music)
@@ -6265,21 +6349,24 @@ impl Desktop {
     fn load_song(&mut self, play: bool) {
         let Some(p) = self.player.as_mut() else { return };
         let path = p.list[p.at].clone();
-        p.song = None;
-        p.spare.clear();
+        let mut d = p.deck.lock();
+        d.song = None;
+        d.playing = false;
+        d.spare.clear();
+        drop(d);
         p.heard = 0;
         p.error = String::new();
         match read_whole(&path).and_then(|data| aero::media::Song::open(data).map_err(String::from)) {
             Ok(song) => {
                 println!("[desktop] Music: {}, {} {} Hz, {} channel{}, {} ({} of {})", path, song.format, song.rate, song.channels,
                     if song.channels == 1 { "" } else { "s" }, minutes(song.frames / 48_000), p.at + 1, p.list.len());
-                p.song = Some(song);
-                p.playing = play;
+                let mut d = p.deck.lock();
+                d.song = Some(song);
+                d.playing = play;
             }
             Err(e) => {
                 println!("[desktop] Music: {}: {}", path, e);
                 p.error = e;
-                p.playing = false;
             }
         }
         let at = self.index(Kind::Music);
@@ -6301,84 +6388,67 @@ impl Desktop {
             0 | 3 => {
                 let n = p.list.len();
                 p.at = if b == 3 { (p.at + 1) % n } else { (p.at + n - 1) % n };
-                let play = p.playing;
+                let play = p.deck.lock().playing;
                 self.load_song(play);
             }
             1 => {
-                if p.song.is_some() {
-                    p.playing = !p.playing;
-                    println!("[desktop] music {} at {}", if p.playing { "playing" } else { "paused" }, minutes(p.heard / 48_000));
+                let mut d = p.deck.lock();
+                if d.song.is_some() {
+                    d.playing = !d.playing;
+                    println!("[desktop] music {} at {}", if d.playing { "playing" } else { "paused" }, minutes(p.heard / 48_000));
                 }
             }
             _ => {
-                p.playing = false;
-                p.spare.clear();
-                p.heard = 0;
-                if let Some(song) = p.song.as_mut() {
+                let mut d = p.deck.lock();
+                d.playing = false;
+                d.spare.clear();
+                if let Some(song) = d.song.as_mut() {
                     song.seek(0);
                 }
+                drop(d);
+                p.heard = 0;
                 println!("[desktop] music stopped");
             }
         }
         client
     }
 
-    /// Keeps the audio queue topped up while a song plays (about a third of
-    /// a second ahead), and goes on to the next song at the end of one.
-    /// Returns what to redraw: Music's inside, when the time shown changes.
+    /// Follows the song the feeding thread plays: the time heard, and on
+    /// to the next song at the end of one. Returns what to redraw: Music's
+    /// inside, when the time shown changes.
     fn pump_music(&mut self) -> Rect {
         let at = self.index(Kind::Music);
         let client = self.client(&self.windows[at].rect);
         let Some(p) = self.player.as_mut() else { return Rect::EMPTY };
-        if !p.playing {
+        let mut d = p.deck.lock();
+        if d.no_output {
+            d.no_output = false;
+            drop(d);
+            p.error = String::from("There is no sound output");
+            println!("[desktop] Music: no sound output");
+            return client;
+        }
+        if !d.playing {
             return Rect::EMPTY;
         }
-        let queued = match aero::audio::queued() {
-            Ok(n) => n as u64,
-            Err(_) => {
-                p.playing = false;
-                p.error = String::from("There is no sound output");
-                println!("[desktop] Music: no sound output");
-                return client;
-            }
-        };
         let before = p.heard / 48_000;
-        let mut room = (48_000 / 3u64).saturating_sub(queued);
-        while room > 0 {
-            if p.spare.is_empty() {
-                let Some(song) = p.song.as_mut() else { break };
-                let mut buf = alloc::vec![0i16; 2 * 2400];
-                let n = song.fill(&mut buf);
-                if n == 0 {
-                    break;
-                }
-                buf.truncate(2 * n);
-                p.spare = buf;
-            }
-            match aero::audio::write(&p.spare) {
-                Ok(0) => break,
-                Ok(n) => {
-                    p.spare.drain(..2 * n);
-                    room = room.saturating_sub(n as u64);
-                }
-                Err(_) => break,
-            }
-        }
-        let made = p.song.as_ref().map_or(0, |s| s.made);
+        let made = d.song.as_ref().map_or(0, |s| s.made);
         let queued = aero::audio::queued().unwrap_or(0) as u64;
-        p.heard = made.saturating_sub(queued + p.spare.len() as u64 / 2);
-        let done = p.song.as_ref().is_none_or(|s| s.ended()) && p.spare.is_empty() && queued == 0;
+        p.heard = made.saturating_sub(queued + d.spare.len() as u64 / 2);
+        let done = d.song.as_ref().is_none_or(|s| s.ended()) && d.spare.is_empty() && queued == 0;
         if done {
             println!("[desktop] Music: played {} to the end", p.list[p.at]);
             if p.at + 1 < p.list.len() {
+                drop(d);
                 p.at += 1;
                 self.load_song(true);
             } else {
-                p.playing = false;
-                p.heard = 0;
-                if let Some(song) = p.song.as_mut() {
+                d.playing = false;
+                if let Some(song) = d.song.as_mut() {
                     song.seek(0);
                 }
+                drop(d);
+                p.heard = 0;
             }
             return client;
         }
@@ -6402,7 +6472,8 @@ impl Desktop {
         };
         let name: String = split_path(&p.list[p.at]).1.chars().take(room).collect();
         c.text(tx, client.y + 18 * s, &name, rgb(30, 57, 145), Font::Normal);
-        let line = match (&p.song, p.error.is_empty()) {
+        let d = p.deck.lock();
+        let line = match (&d.song, p.error.is_empty()) {
             (_, false) => p.error.clone(),
             (Some(song), true) => format!("{}, {}.{} kHz, {}", song.format, song.rate / 1000, song.rate % 1000 / 100,
                 if song.channels == 1 { "mono" } else { "stereo" }),
@@ -6415,7 +6486,7 @@ impl Desktop {
         let bar = self.music_bar(client);
         c.fill(bar, rgb(225, 228, 233));
         c.frame(bar, rgb(150, 155, 165));
-        let total = p.song.as_ref().map_or(0, |s| s.frames);
+        let total = d.song.as_ref().map_or(0, |s| s.frames);
         let heard = p.heard.min(total);
         if total > 0 {
             let fill = ((bar.w - 2 * s) as u64 * heard / total) as i32;
@@ -6425,7 +6496,8 @@ impl Desktop {
         c.text(bar.x, bar.y + bar.h + 8 * s, &time, rgb(60, 65, 75), Font::Small);
         let place = format!("{} of {}", p.at + 1, p.list.len());
         c.text(bar.x + bar.w - Font::Small.width(s, &place), bar.y + bar.h + 8 * s, &place, rgb(60, 65, 75), Font::Small);
-        let labels = ["|<", if p.playing { "Pause" } else { "Play" }, "Stop", ">|"];
+        let labels = ["|<", if d.playing { "Pause" } else { "Play" }, "Stop", ">|"];
+        drop(d);
         for (i, label) in labels.iter().enumerate() {
             self.round_button(c, self.music_button(client, i), label);
         }
