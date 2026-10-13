@@ -183,6 +183,8 @@ pub const SYS_DELETED_LIST: u64 = 56;
 pub const SYS_UNDELETE: u64 = 57;
 pub const SYS_SET_WRITABLE: u64 = 58;
 pub const SYS_RENAME: u64 = 59;
+pub const SYS_FILE_READ_AT: u64 = 60;
+pub const SYS_FILE_APPEND: u64 = 61;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -627,6 +629,32 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             writable_by_programs(&to)?;
             vfs::rename(&from, &to).map_err(fs_error)?;
             Ok(0)
+        }
+        SYS_FILE_READ_AT => {
+            // Part of a file: a2 points at {buf, len, offset} (three u64s).
+            // Returns the bytes copied; 0 at or past the end.
+            let path = user_str(a0, a1)?;
+            let args = user_bytes(a2, 24)?;
+            let word = |i: usize| u64::from_le_bytes(args[i * 8..i * 8 + 8].try_into().unwrap());
+            let (buf, len, offset) = (word(0), word(1), word(2));
+            if len > MAX_FILE_WRITE {
+                return Err(E_INVAL);
+            }
+            check_writable(buf, len)?;
+            let data = vfs::read_at(&path, offset, len as usize).map_err(fs_error)?;
+            to_user(buf, &data)?;
+            Ok(data.len() as u64)
+        }
+        SYS_FILE_APPEND => {
+            // Adds a2/a3 to the end of an existing file; returns the bytes added.
+            let path = user_str(a0, a1)?;
+            writable_by_programs(&path)?;
+            if a3 > MAX_FILE_WRITE {
+                return Err(E_INVAL);
+            }
+            let data = user_bytes(a2, a3)?;
+            vfs::append(&path, &data).map_err(fs_error)?;
+            Ok(a3)
         }
         SYS_SET_WRITABLE => {
             // Turns writing to the drive mounted at a0/a1 on (a2 = 1) or off.

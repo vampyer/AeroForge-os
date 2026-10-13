@@ -1119,6 +1119,8 @@ struct Desktop {
     tree_open: Vec<String>,
     tree_kids: Vec<(String, Vec<String>)>,
     popup: Option<Popup>,
+    /// A copy or move under way, with its progress window.
+    progress: Option<Progress>,
     /// Two-pane mode: the side not in use (`files` is the one in use), and
     /// whether the one in use is the right-hand side.
     other: Option<Box<Files>>,
@@ -1741,6 +1743,7 @@ impl Desktop {
         self.snap_preview(c);
         self.taskbar_and_menu(c);
         self.popup_view(c);
+        self.progress_view(c);
         self.cursor(c);
     }
 
@@ -2161,8 +2164,11 @@ const KEY_DELETE: u8 = 0x88;
 const KEY_F2: u8 = 0x89;
 const KEY_F5: u8 = 0x8A;
 
-/// The biggest file Copy and Paste handle for now (one write system call).
-const MAX_COPY: u64 = 8 * 1024 * 1024;
+/// How much of a file is copied at a time.
+const COPY_CHUNK: usize = 1024 * 1024;
+
+/// What copy_tree returns when Cancel was pressed.
+const CANCELLED: &str = "Cancelled";
 
 /// Characters Windows does not allow in names (AeroForge keeps to the same).
 const BAD_NAME_CHARS: &str = "\\/:*?\"<>|";
@@ -2199,6 +2205,38 @@ fn fs_error_text(e: i64) -> &'static str {
 }
 
 // ------------------------------------------------------- network drives
+
+/// How a copy or move is going, for its progress window.
+struct Progress {
+    moving: bool,
+    /// How many things were picked, and the folder they go to.
+    count: usize,
+    to: String,
+    /// The file being copied now.
+    file: String,
+    done: u64,
+    total: u64,
+    started_us: u64,
+    drawn_us: u64,
+    shown: bool,
+    cancel: bool,
+}
+
+/// The screen and the frame drawn for it. The desktop has one thread; a
+/// copy draws its progress from inside a click, so they live here.
+struct Gfx {
+    screen: Screen,
+    canvas: Canvas,
+}
+struct GfxCell(core::cell::UnsafeCell<Option<Gfx>>);
+unsafe impl Sync for GfxCell {}
+static GFX: GfxCell = GfxCell(core::cell::UnsafeCell::new(None));
+
+fn gfx() -> &'static mut Gfx {
+    // SAFETY: only the desktop's one thread touches it, and no reference
+    // is kept across calls.
+    unsafe { (*GFX.0.get()).as_mut().expect("screen not set up") }
+}
 
 /// A mapped network drive: a share on another computer (SMB 2).
 struct NetShare {
@@ -2292,6 +2330,27 @@ fn fs_read(path: &str, limit: usize) -> Result<Vec<u8>, i64> {
     }
 }
 
+/// Up to `len` bytes of a file from byte `offset`.
+fn fs_read_at(path: &str, offset: u64, len: usize) -> Result<Vec<u8>, i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.read_at(&inner, offset, len)),
+        None => {
+            let mut buf = alloc::vec![0u8; len];
+            let n = aero::read_file_at(path, offset, &mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+    }
+}
+
+/// Adds `data` to the end of a file.
+fn fs_append(path: &str, data: &[u8]) -> Result<(), i64> {
+    match net_path(path) {
+        Some((i, inner)) => with_share(i, |c| c.append(&inner, data)),
+        None => aero::append_file(path, data).map(|_| ()),
+    }
+}
+
 fn fs_write(path: &str, data: &[u8]) -> Result<(), i64> {
     match net_path(path) {
         Some((i, inner)) => with_share(i, |c| c.write(&inner, data)),
@@ -2326,33 +2385,68 @@ fn fs_rename(from: &str, to: &str) -> Option<Result<(), i64>> {
     }
 }
 
+/// Hears how a copy is going: the file being copied and the bytes just
+/// copied of it; says whether to go on (false once Cancel is pressed).
+type Tick<'a> = &'a mut dyn FnMut(&str, u64) -> bool;
+
 /// Moves a file or folder: a rename on one drive or network share, else
-/// copy and delete.
-fn move_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<(), String> {
+/// copy and delete. A cancelled move leaves the original where it was.
+fn move_tree(from: &str, to: &str, is_dir: bool, tick: Tick) -> Result<(), String> {
     if let Some(r) = fs_rename(from, to) {
         return r.map_err(|e| format!("Can't move {}: {}", from, fs_error_text(e)));
     }
-    copy_tree(from, to, is_dir, size)?;
+    copy_tree(from, to, is_dir, tick)?;
     delete_tree(from, is_dir).map(|_| ())
 }
 
 /// Copies a file, or a folder and all it holds, to `to`. Returns how many
 /// files it copied.
-fn copy_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<usize, String> {
+fn copy_tree(from: &str, to: &str, is_dir: bool, tick: Tick) -> Result<usize, String> {
     if is_dir {
         fs_mkdir(to).map_err(|e| format!("Can't make {}: {}", to, fs_error_text(e)))?;
         let mut n = 0;
         for e in fs_list(from).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))? {
-            n += copy_tree(&join(from, &e.name), &join(to, &e.name), e.is_dir, e.size)?;
+            n += copy_tree(&join(from, &e.name), &join(to, &e.name), e.is_dir, &mut *tick)?;
         }
         return Ok(n);
     }
-    if size > MAX_COPY {
-        return Err(format!("{} is too big to copy here yet (8 MB at most)", split_path(from).1));
-    }
-    let data = fs_read(from, size as usize + 1).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))?;
-    fs_write(to, &data).map_err(|e| format!("Can't write {}: {}", to, fs_error_text(e)))?;
+    copy_file(from, to, tick)?;
     Ok(1)
+}
+
+/// Copies one file of any size, a piece at a time: the first piece makes
+/// the new file and the rest are added to its end. Cancelled part way,
+/// the part copied is deleted again.
+fn copy_file(from: &str, to: &str, tick: Tick) -> Result<(), String> {
+    if !tick(from, 0) {
+        return Err(String::from(CANCELLED));
+    }
+    let mut at = 0u64;
+    loop {
+        let piece = fs_read_at(from, at, COPY_CHUNK).map_err(|e| format!("Can't read {}: {}", from, fs_error_text(e)))?;
+        let wrote = if at == 0 {
+            fs_write(to, &piece)
+        } else if piece.is_empty() {
+            Ok(())
+        } else {
+            fs_append(to, &piece)
+        };
+        if let Err(e) = wrote {
+            if at > 0 {
+                let _ = fs_delete(to, false);
+            }
+            return Err(format!("Can't write {}: {}", to, fs_error_text(e)));
+        }
+        at += piece.len() as u64;
+        let go_on = tick(from, piece.len() as u64);
+        if piece.len() < COPY_CHUNK {
+            return Ok(());
+        }
+        if !go_on {
+            let _ = fs_delete(to, false);
+            return Err(String::from(CANCELLED));
+        }
+    }
 }
 
 /// Deletes a file, or a folder and all it holds. Returns how many things it deleted.
@@ -5014,7 +5108,14 @@ impl Desktop {
         let mut arrived = Vec::new();
         let mut files = 0;
         let mut problem = None;
+        let total = items.iter().map(|it| if it.is_dir { tree_size(&it.path).0 } else { it.size }).sum();
+        let now = aero::clock_us();
+        let to_name = if dir.is_empty() || dir == "/" { String::from(dir) } else { split_path(dir).1 };
+        self.progress = Some(Progress { moving: cut, count: items.len(), to: to_name, file: String::new(), done: 0, total, started_us: now, drawn_us: 0, shown: false, cancel: false });
         for it in items {
+            if self.progress.as_ref().is_some_and(|p| p.cancel) {
+                break;
+            }
             let (from_dir, name) = split_path(&it.path);
             let lower = it.path.to_lowercase();
             if it.is_dir && (dir.eq_ignore_ascii_case(&it.path) || dir.to_lowercase().starts_with(&format!("{}/", lower))) {
@@ -5028,13 +5129,14 @@ impl Desktop {
             let names: Vec<&str> = taken.iter().map(|t| t.as_str()).collect();
             let new_name = free_name(&name, &names, it.is_dir, true);
             let to = join(dir, &new_name);
+            let tick: Tick = &mut |file, bytes| self.copy_tick(file, bytes);
             let result = if cut {
-                move_tree(&it.path, &to, it.is_dir, it.size).map(|()| {
+                move_tree(&it.path, &to, it.is_dir, tick).map(|()| {
                     println!("[desktop] moved {} to {}", it.path, to);
                     0
                 })
             } else {
-                copy_tree(&it.path, &to, it.is_dir, it.size).map(|n| {
+                copy_tree(&it.path, &to, it.is_dir, tick).map(|n| {
                     println!("[desktop] pasted {} as {} ({} file{})", it.path, to, n, if n == 1 { "" } else { "s" });
                     n
                 })
@@ -5045,12 +5147,22 @@ impl Desktop {
                     taken.push(new_name.clone());
                     arrived.push(new_name);
                 }
+                Err(msg) if msg == CANCELLED => {
+                    println!("[desktop] {} cancelled at {}", if cut { "move" } else { "paste" }, it.path);
+                    problem = Some(String::from(if cut { "Moving was cancelled" } else { "Copying was cancelled" }));
+                    // What was copied of a folder stays where it got to.
+                    if it.is_dir && fs_list(&to).is_ok() {
+                        taken.push(new_name.clone());
+                        arrived.push(new_name);
+                    }
+                }
                 Err(msg) => {
                     println!("[desktop] {} failed: {}", if cut { "move" } else { "paste" }, msg);
                     problem = Some(msg);
                 }
             }
         }
+        self.end_progress();
         if self.files.path.eq_ignore_ascii_case(dir) {
             self.refresh(None);
             self.files.marked.clear();
@@ -5118,7 +5230,7 @@ impl Desktop {
         }
         let dir = self.files.path.clone();
         let (from, to) = (join(&dir, &e.name), join(&dir, &new));
-        let result = move_tree(&from, &to, e.is_dir, e.size);
+        let result = move_tree(&from, &to, e.is_dir, &mut |_, _| true);
         match result {
             Ok(_) => {
                 println!("[desktop] renamed {} to {}", from, to);
@@ -5230,7 +5342,7 @@ impl Desktop {
         // dropped from it, rather than the bin holding something unlisted.
         items.push(item.clone());
         Self::write_bin(&root, &items).map_err(|m| format!("Not deleted: {}", m))?;
-        if let Err(m) = move_tree(path, &item.stored(), e.is_dir, e.size) {
+        if let Err(m) = move_tree(path, &item.stored(), e.is_dir, &mut |_, _| true) {
             items.pop();
             let _ = Self::write_bin(&root, &items);
             return Err(format!("Not deleted: {}", m));
@@ -5257,7 +5369,7 @@ impl Desktop {
         let taken: Vec<String> = aero::list_dir(&dir).unwrap_or_default().into_iter().map(|e| e.name).collect();
         let taken: Vec<&str> = taken.iter().map(|t| t.as_str()).collect();
         let to = join(&dir, &free_name(&name, &taken, item.is_dir, false));
-        move_tree(&item.stored(), &to, item.is_dir, item.size).map_err(|m| format!("Not restored: {}", m))?;
+        move_tree(&item.stored(), &to, item.is_dir, &mut |_, _| true).map_err(|m| format!("Not restored: {}", m))?;
         let items: Vec<Recycled> = Self::read_bin(&item.root).into_iter().filter(|b| b.id != item.id).collect();
         Self::write_bin(&item.root, &items)?;
         println!("[desktop] restored {} from the Recycle Bin to {}", item.original, to);
@@ -5787,6 +5899,146 @@ impl Desktop {
             }
         });
         area
+    }
+
+    // ------------------------------------------------------ copy progress
+    //
+    // Copying and moving run here, a piece at a time; between pieces the
+    // progress window is drawn (once the copy has taken a moment) and the
+    // pointer and keys are looked at for Cancel or Esc. Other clicks and
+    // keys wait until it is done, as with a dialog box.
+
+    fn progress_rect(&self) -> Rect {
+        let s = self.ui;
+        let (w, h) = (460 * s, 172 * s);
+        Rect::new((self.w - w) / 2, (self.h - h) / 2 - 40 * s, w, h)
+    }
+    fn progress_area(&self) -> Rect {
+        let r = self.progress_rect();
+        let m = 8 * self.ui;
+        Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m)
+    }
+    fn progress_cancel(&self) -> Rect {
+        let s = self.ui;
+        let r = self.progress_rect();
+        Rect::new(r.x + r.w - 122 * s, r.y + r.h - 46 * s, 106 * s, 32 * s)
+    }
+
+    /// Called as each piece is copied: counts it, draws, and looks for Cancel.
+    fn copy_tick(&mut self, file: &str, bytes: u64) -> bool {
+        let now = aero::clock_us();
+        let mut dirty = Rect::EMPTY;
+        let Some(p) = self.progress.as_mut() else { return true };
+        p.done += bytes;
+        if p.file != file {
+            p.file = String::from(file);
+        }
+        // Shown only once a copy takes a moment, so small ones don't flash it.
+        if !p.shown && now - p.started_us >= 400_000 {
+            p.shown = true;
+            p.drawn_us = 0;
+            let c = self.progress_cancel();
+            println!("[desktop] {} window up: {} bytes to copy; Cancel at {},{}", if self.progress.as_ref().unwrap().moving { "moving" } else { "copying" },
+                self.progress.as_ref().unwrap().total, c.x + c.w / 2, c.y + c.h / 2);
+        }
+        let shown = self.progress.as_ref().unwrap().shown;
+        // The pointer: drawn where it is, and the button pressed (or held
+        // down) on Cancel cancels.
+        let g = gfx();
+        let pt = g.screen.pointer().unwrap_or(self.pointer);
+        let mut pressed = pt.buttons & 1 != 0;
+        if pt != self.pointer {
+            let old = self.pointer;
+            dirty = dirty.union(&self.cursor_rect());
+            self.pointer = pt;
+            dirty = dirty.union(&self.cursor_rect());
+            pressed |= pt.presses.wrapping_sub(old.presses) & 0xF_FFFF != 0;
+            if shown {
+                dirty = dirty.union(&self.progress_cancel());
+            }
+        }
+        if shown && pressed && self.progress_cancel().contains(pt.x as i32, pt.y as i32) {
+            self.cancel_copy();
+        }
+        let mut keys = [(0u8, 0u8); 16];
+        if let Ok(n) = g.screen.keys_with_modifiers(&mut keys) {
+            if keys[..n].iter().any(|&(k, _)| k == 27) {
+                self.cancel_copy();
+            }
+        }
+        let p = self.progress.as_mut().unwrap();
+        if p.shown && (now - p.drawn_us >= 60_000 || p.cancel) {
+            p.drawn_us = now;
+            dirty = dirty.union(&self.progress_area());
+        }
+        if !dirty.is_empty() {
+            present(&g.screen, &mut g.canvas, self, dirty);
+        }
+        !self.progress.as_ref().unwrap().cancel
+    }
+
+    fn cancel_copy(&mut self) {
+        if let Some(p) = self.progress.as_mut() {
+            if !p.cancel {
+                p.cancel = true;
+                println!("[desktop] Cancel pressed with {} of {} bytes copied", p.done, p.total);
+            }
+        }
+    }
+
+    /// Takes the progress window away, if it was up.
+    fn end_progress(&mut self) {
+        let Some(p) = self.progress.take() else { return };
+        if p.shown {
+            let g = gfx();
+            present(&g.screen, &mut g.canvas, self, self.progress_area());
+        }
+    }
+
+    fn progress_view(&self, c: &mut Canvas) {
+        let s = self.ui;
+        let Some(p) = self.progress.as_ref().filter(|p| p.shown) else { return };
+        let r = self.progress_rect();
+        if r.intersect(&c.clip).is_empty() && self.progress_area().intersect(&c.clip).is_empty() {
+            return;
+        }
+        c.shade(Rect::new(r.x + 5 * s, r.y + 5 * s, r.w, r.h), 0x000000, 60);
+        c.rounded(r, 5 * s, false, rgb(252, 253, 255), rgb(234, 240, 249), 255);
+        c.rounded_outline(r, 5 * s, false, rgb(100, 125, 165), 255);
+        let fw = Font::Normal.w(s);
+        let room = ((r.w - 40 * s) / fw).max(1) as usize;
+        let verb = if p.moving { "Moving" } else { "Copying" };
+        let what = if p.count == 1 { String::from("1 item") } else { format!("{} items", p.count) };
+        let head: String = format!("{} {} to {}", verb, what, p.to).chars().take(room).collect();
+        c.text(r.x + 20 * s, r.y + 16 * s, &head, rgb(30, 57, 145), Font::Normal);
+        let name: String = split_path(&p.file).1.chars().take(room).collect();
+        c.text(r.x + 20 * s, r.y + 44 * s, &name, rgb(60, 65, 75), Font::Small);
+        // The bar: a green fill in a sunken trough, as in Windows 7.
+        let bar = Rect::new(r.x + 20 * s, r.y + 70 * s, r.w - 40 * s, 18 * s);
+        c.fill(bar, rgb(230, 230, 230));
+        c.frame(bar, rgb(150, 155, 165));
+        let frac = if p.total == 0 { 1.0 } else { (p.done.min(p.total)) as f32 / p.total as f32 };
+        let fill = ((bar.w - 2 * s) as f32 * frac) as i32;
+        if fill > 0 {
+            c.gradient(Rect::new(bar.x + s, bar.y + s, fill, bar.h - 2 * s), rgb(130, 220, 120), rgb(40, 160, 50), 255);
+        }
+        let mb = |b: u64| (b + 512 * 1024) / (1024 * 1024);
+        let amount = if p.total >= 1024 * 1024 {
+            format!("{} MB of {} MB ({}%)", mb(p.done.min(p.total)), mb(p.total), (frac * 100.0) as u32)
+        } else {
+            format!("{} KB of {} KB ({}%)", p.done.min(p.total).div_ceil(1024), p.total.div_ceil(1024), (frac * 100.0) as u32)
+        };
+        c.text(r.x + 20 * s, r.y + 98 * s, &amount, rgb(60, 65, 75), Font::Small);
+        if p.cancel {
+            c.text(r.x + 20 * s, r.y + r.h - 38 * s, "Cancelling...", rgb(170, 30, 20), Font::Small);
+        }
+        let b = self.progress_cancel();
+        let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
+        let hot = b.contains(px, py);
+        let (top, bottom) = if hot { (rgb(250, 252, 255), rgb(190, 215, 245)) } else { (rgb(250, 251, 253), rgb(220, 228, 238)) };
+        c.rounded(b, 3 * s, false, top, bottom, 255);
+        c.rounded_outline(b, 3 * s, false, rgb(110, 130, 160), 255);
+        c.text(b.x + (b.w - Font::Normal.width(s, "Cancel")) / 2, b.y + (b.h - Font::Normal.h(s)) / 2, "Cancel", rgb(20, 40, 80), Font::Normal);
     }
 
     // ------------------------------------------------------ right-click menu
@@ -6724,9 +6976,15 @@ fn main() -> i64 {
         tree_open: alloc::vec![String::new()],
         tree_kids: Vec::new(),
         popup: None,
+        progress: None,
     };
-    let mut canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
-    present(&screen, &mut canvas, &desk, Rect::new(0, 0, w, h));
+    let canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
+    // SAFETY: set once, before anything reads it.
+    unsafe { *GFX.0.get() = Some(Gfx { screen, canvas }) };
+    {
+        let g = gfx();
+        present(&g.screen, &mut g.canvas, &desk, Rect::new(0, 0, w, h));
+    }
     let notes = desk.windows[desk.index(Kind::Notes)].rect;
     let icon = desk.icon_rect(0);
     let calc = desk.icon_rect(2);
@@ -6742,7 +7000,7 @@ fn main() -> i64 {
         // The pointer and what it lights up are small; they are redrawn on
         // their own instead of joined into one big rectangle with the rest.
         let mut spots = Damage::default();
-        let p = screen.pointer().unwrap_or(desk.pointer);
+        let p = gfx().screen.pointer().unwrap_or(desk.pointer);
         if p != desk.pointer {
             let old = desk.pointer;
             spots.add(desk.cursor_rect());
@@ -6835,7 +7093,7 @@ fn main() -> i64 {
                 dirty = dirty.union(&desk.window_area(desk.windows.len() - 1));
             }
         }
-        if let Ok(n) = screen.keys_with_modifiers(&mut keys) {
+        if let Ok(n) = gfx().screen.keys_with_modifiers(&mut keys) {
             dirty = dirty.union(&desk.typed(&keys[..n]));
         }
         // Twice a second: the clock, the System window and the Notes caret.
@@ -6866,10 +7124,11 @@ fn main() -> i64 {
         // Draw each piece, then hand the screen one rectangle covering them
         // all: one present per frame, however many pieces changed.
         let mut shown = Rect::EMPTY;
+        let g = gfx();
         for area in spots.rects {
-            shown = shown.union(&draw(&mut canvas, &desk, area));
+            shown = shown.union(&draw(&mut g.canvas, &desk, area));
         }
-        show(&screen, &canvas, shown);
+        show(&g.screen, &g.canvas, shown);
         if moved && desk.drag.is_none() && desk.resize.is_none() {
             let took = aero::clock_us() - t0;
             moves += 1;
@@ -6884,6 +7143,7 @@ fn main() -> i64 {
     println!("[desktop] pointer ended at {},{}", desk.pointer.x, desk.pointer.y);
     println!("[desktop] notes: {}", desk.notes.replace('\n', " / "));
     println!("[desktop] closed, screen given back to the console");
-    drop(screen);
+    // SAFETY: nothing holds a reference to it any more.
+    drop(unsafe { (*GFX.0.get()).take() });
     0
 }

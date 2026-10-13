@@ -66,6 +66,12 @@ if mtype(sata, "/Hello again.txt") != b"Saved from AeroForge on SATA\n":
 if names(sata, "/Archive") != ["Old docs"] or "docs" in names(sata, "/") or names(sata, "/Archive/Old docs") != []:
     fail("sata.img: /docs was not moved to /Archive/Old docs")
 
+# A file over 8 MiB copied there from the exFAT stick a megabyte at a time.
+with open(os.path.join(build, "usb2-files", "Games", "Big.bin"), "rb") as f:
+    big = f.read()
+if mtype(sata, "/Big.bin") != big:
+    fail("sata.img: /Big.bin (copied from the exFAT stick) is missing or not the same")
+
 usb = os.path.join(build, "usb.img")
 if mtype(usb, "/usbnote.txt") != b"Saved from AeroForge on USB\n":
     fail("usb.img: /usbnote.txt is missing or wrong")
@@ -105,6 +111,8 @@ if exfat("cat", "/Games/Saves/Level 3 checkpoint.sav") != b"checkpoint=forest-te
     fail("usb2.img: the save that was already there changed")
 if exfat("cat", "/AeroForge-OS-Design.md") != b"replaced by AeroForge\n":
     fail("usb2.img: the overwritten file is wrong")
+if exfat("cat", "/Big copy.bin") != big:
+    fail("usb2.img: /Big copy.bin (copied back from the SATA disk) is missing or not the same")
 root = (exfat("ls", "/") or b"").decode().splitlines()
 if "HOT.TXT" in root or "Tunes/" not in root or "Music/" in root:
     fail(f"usb2.img: root holds {root}: HOT.TXT and Music/ should be gone and Tunes/ there")

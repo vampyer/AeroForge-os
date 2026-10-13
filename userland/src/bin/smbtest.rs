@@ -66,8 +66,12 @@ fn main() -> i64 {
         Err(e) => return fail("reading hello.txt", e),
     }
     let data: Vec<u8> = (0..150_000u32).map(|i| (i * 7 % 251) as u8).collect();
-    if let Err(e) = c.write("big.bin", &data) {
+    // Written in two goes: the first part, then the rest added to its end.
+    if let Err(e) = c.write("big.bin", &data[..100_000]) {
         return fail("writing big.bin", e);
+    }
+    if let Err(e) = c.append("big.bin", &data[100_000..]) {
+        return fail("adding to big.bin", e);
     }
     match c.read("big.bin", 1 << 20) {
         Ok(d) if d == data => println!("[smbtest] wrote and read back {} bytes", d.len()),
@@ -76,6 +80,14 @@ fn main() -> i64 {
             return 1;
         }
         Err(e) => return fail("reading big.bin back", e),
+    }
+    match c.read_at("big.bin", 140_000, 65_536) {
+        Ok(d) if d == data[140_000..] => println!("[smbtest] read the last {} bytes from the middle", d.len()),
+        Ok(d) => {
+            println!("[smbtest] FAILED: reading big.bin from 140000 gave {} bytes, not the last 10000", d.len());
+            return 1;
+        }
+        Err(e) => return fail("reading part of big.bin", e),
     }
     if let Err(e) = c.create_dir("Saves") {
         return fail("making Saves", e);
@@ -97,6 +109,6 @@ fn main() -> i64 {
         Ok(n) => println!("[smbtest] share holds: {}", n.join(" | ")),
         Err(e) => return fail("listing the share again", e),
     }
-    println!("[smbtest] sign-in, list, read, write, folders, rename and delete on an SMB share: OK");
+    println!("[smbtest] sign-in, list, read, write, append, read part, folders, rename and delete on an SMB share: OK");
     0
 }

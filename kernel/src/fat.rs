@@ -41,6 +41,10 @@ struct State {
     /// Free clusters, when the FSInfo sector gave a believable count.
     free: Option<u32>,
     fat_cache: Option<(u64, Vec<u8>)>,
+    /// Where the last piece read or added was: a file's first cluster, a
+    /// cluster's place in its chain and the cluster, so a big file read or
+    /// written a piece at a time is not walked from its start every time.
+    cursor: Option<(u32, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,7 +99,7 @@ impl FatVolume {
         let label = String::from(core::str::from_utf8(&bs[71..82]).unwrap_or("").trim());
 
         // FSInfo keeps the free count and where to look for free clusters.
-        let mut state = State { next_free: 2, free: None, fat_cache: None };
+        let mut state = State { next_free: 2, free: None, fat_cache: None, cursor: None };
         let fsinfo_sector = u16_at(48) as u64;
         let mut fsinfo = None;
         if fsinfo_sector != 0 && fsinfo_sector != 0xFFFF && fsinfo_sector < reserved {
@@ -292,6 +296,133 @@ impl FatVolume {
         }
         self.put_slots(&chain, first, &slots)?;
         self.finish(st)
+    }
+
+    /// Up to `len` bytes of a file from byte `offset`.
+    pub fn read_at(&self, path: &str, offset: u64, len: usize) -> Res<Vec<u8>> {
+        let st = &mut *self.state.lock();
+        let f = self.lookup(st, path)?;
+        if f.is_dir {
+            return Err("is a directory");
+        }
+        let size = f.size as u64;
+        if offset >= size || len == 0 {
+            return Ok(Vec::new());
+        }
+        let len = (len as u64).min(size - offset) as usize;
+        let cb = self.cluster_bytes() as u64;
+        let first = (offset / cb) as u32;
+        let last = ((offset + len as u64 - 1) / cb) as u32;
+        // The clusters holding the piece, read a run of neighbours at a time.
+        let mut clusters = Vec::with_capacity((last - first + 1) as usize);
+        let mut c = self.cluster_at(st, f.cluster, first)?;
+        clusters.push(c);
+        for _ in first + 1..=last {
+            c = self.fat_get(st, c)?;
+            if !self.valid(c) {
+                return Err("cluster chain is broken");
+            }
+            clusters.push(c);
+        }
+        st.cursor = Some((f.cluster, last, c));
+        let mut out = Vec::with_capacity(clusters.len() * cb as usize);
+        let mut i = 0;
+        while i < clusters.len() {
+            let mut j = i + 1;
+            while j < clusters.len() && clusters[j] == clusters[j - 1] + 1 && j - i < 256 {
+                j += 1;
+            }
+            let at = out.len();
+            out.resize(at + (j - i) * cb as usize, 0);
+            self.dev.read(self.cluster_lba(clusters[i]), &mut out[at..])?;
+            i = j;
+        }
+        let skip = (offset % cb) as usize;
+        Ok(out[skip..skip + len].to_vec())
+    }
+
+    /// Adds `data` to the end of the file at `path`. The data goes into the
+    /// free part of its last cluster and new clusters first, then the chain
+    /// is linked, then the size in its directory entry grows: stopped part
+    /// way, the file is as it was (with at worst lost clusters).
+    pub fn append(&self, path: &str, data: &[u8]) -> Res<()> {
+        let st = &mut *self.state.lock();
+        let (parent, name) = self.parent_of(st, path)?;
+        let (chain, raw) = self.read_dir_raw(st, parent.cluster)?;
+        let f = parse_dir(&raw).into_iter().find(|e| e.name.eq_ignore_ascii_case(name)).ok_or("file not found")?;
+        if f.is_dir {
+            return Err("is a directory");
+        }
+        let size = f.size as u64;
+        let new_size = size + data.len() as u64;
+        if new_size > u32::MAX as u64 {
+            return Err("file too large for FAT32");
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let cb = self.cluster_bytes();
+        // Room left in the last cluster.
+        let (mut first, mut last) = (f.cluster, 0);
+        let mut used = 0;
+        if f.cluster >= 2 && size > 0 {
+            let n = (size - 1) / cb as u64;
+            last = self.cluster_at(st, f.cluster, n as u32)?;
+            let fill = (size % cb as u64) as usize;
+            if fill != 0 {
+                used = (cb - fill).min(data.len());
+                let mut buf = vec![0u8; cb];
+                self.dev.read(self.cluster_lba(last), &mut buf)?;
+                buf[fill..fill + used].copy_from_slice(&data[..used]);
+                self.dev.write(self.cluster_lba(last), &buf)?;
+            }
+        } else if f.cluster >= 2 {
+            // Empty but with a cluster: fill that one first.
+            last = f.cluster;
+            used = cb.min(data.len());
+            self.write_clusters(&[last], &data[..used])?;
+        }
+        let rest = &data[used..];
+        if !rest.is_empty() {
+            let new = self.find_free(st, rest.len().div_ceil(cb) as u32)?;
+            self.write_clusters(&new, rest)?;
+            self.link(st, &new)?;
+            if last >= 2 {
+                self.fat_set(st, vec![(last, new[0])])?;
+            } else {
+                first = new[0];
+            }
+            let n = (new_size - 1) / cb as u64;
+            st.cursor = Some((first, n as u32, *new.last().unwrap()));
+        }
+        let mut entry = slot_bytes(&raw, f.slot);
+        let (time, date) = timestamp();
+        set_cluster(&mut entry, first);
+        entry[11] |= ATTR_ARCHIVE;
+        entry[18..20].copy_from_slice(&date.to_le_bytes());
+        entry[22..24].copy_from_slice(&time.to_le_bytes());
+        entry[24..26].copy_from_slice(&date.to_le_bytes());
+        entry[28..32].copy_from_slice(&(new_size as u32).to_le_bytes());
+        self.put_slots(&chain, f.slot, &entry)?;
+        self.finish(st)
+    }
+
+    /// The `n`th cluster of the chain starting at `first`, walking on from
+    /// the last place read or written when that is on the way.
+    fn cluster_at(&self, st: &mut State, first: u32, n: u32) -> Res<u32> {
+        let (mut i, mut c) = match st.cursor {
+            Some((f, i, c)) if f == first && i <= n && self.valid(c) => (i, c),
+            _ => (0, first),
+        };
+        while i < n {
+            c = self.fat_get(st, c)?;
+            if !self.valid(c) {
+                return Err("cluster chain is broken");
+            }
+            i += 1;
+        }
+        st.cursor = Some((first, n, c));
+        Ok(c)
     }
 
     /// Deleted entries still in directory `path`, newest slots last.
@@ -565,6 +696,8 @@ impl FatVolume {
     }
 
     fn free_chain(&self, st: &mut State, start: u32) -> Res<()> {
+        // Those clusters may soon be another file's: forget where we were.
+        st.cursor = None;
         let chain = self.chain(st, start)?;
         let n = chain.len() as u32;
         self.fat_set(st, chain.into_iter().map(|c| (c, 0)).collect())?;
@@ -1046,5 +1179,11 @@ impl vfs::Volume for FatVolume {
     }
     fn rename(&self, from: &str, to: &str) -> Res<()> {
         FatVolume::rename(self, from, to)
+    }
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Res<Vec<u8>> {
+        FatVolume::read_at(self, path, offset, len)
+    }
+    fn append(&self, path: &str, data: &[u8]) -> Res<()> {
+        FatVolume::append(self, path, data)
     }
 }

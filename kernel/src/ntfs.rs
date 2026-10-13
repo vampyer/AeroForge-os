@@ -390,6 +390,28 @@ impl NtfsVolume {
         Ok(out)
     }
 
+    /// Up to `len` bytes of an attribute's value from `offset` on.
+    fn read_attr_at(&self, a: &Attr, offset: u64, len: usize) -> Res<Vec<u8>> {
+        if let Some(v) = &a.value {
+            let from = (offset as usize).min(v.len());
+            return Ok(v[from..from + len.min(v.len() - from)].to_vec());
+        }
+        if a.flags & FLAG_COMPRESSED != 0 {
+            return Err("compressed NTFS files are not supported yet");
+        }
+        if a.flags & FLAG_ENCRYPTED != 0 {
+            return Err("encrypted NTFS files cannot be read");
+        }
+        let end = a.size.min(offset.saturating_add(len as u64));
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        let valid_end = a.initialized.min(end);
+        let mut out = if valid_end > offset { self.read_runs(&a.runs, offset, (valid_end - offset) as usize)? } else { Vec::new() };
+        out.resize((end - offset) as usize, 0);
+        Ok(out)
+    }
+
     // ----------------------------------------------------------- folders
 
     /// The names in folder `n`, walking its index B-tree.
@@ -1701,34 +1723,111 @@ impl NtfsVolume {
         let (dir, name) = self.split(path)?;
         match self.find_in(dir, name)? {
             Some(n) => {
-                let rec = self.record(n)?;
-                if u16_at(&rec, 22) & 2 != 0 {
-                    return Err("is a directory");
-                }
-                self.can_change(n, &rec)?;
-                let si = find_attr(&rec, ATTR_STANDARD_INFORMATION, &[]).and_then(|p| resident_value(&rec, p)).unwrap_or(&[]);
-                if si.len() >= 0x24 && u32_at(si, 0x20) & FILE_READ_ONLY != 0 {
-                    return Err("that file is marked read-only");
-                }
-                if let Some(p) = find_attr(&rec, ATTR_DATA, &[]) {
-                    if rec[p + 8] != 0 && u16_at(&rec, p + 12) & (FLAG_COMPRESSED | FLAG_ENCRYPTED | FLAG_SPARSE) != 0 {
-                        return Err("compressed, encrypted and sparse NTFS files can't be changed here yet");
-                    }
-                }
+                self.can_write_data(n)?;
                 self.change(st, |v, st| {
                     let (allocated, size) = v.set_data(st, n, data)?;
-                    let now = v.now();
-                    for (p, _) in attrs_of(&v.record(n)?, ATTR_FILE_NAME) {
-                        let rec = v.record(n)?;
-                        let fname = resident_value(&rec, p).ok_or("bad NTFS record")?;
-                        let units: Vec<u16> = (0..fname[64] as usize).map(|i| u16_at(fname, 66 + 2 * i)).collect();
-                        v.index_touch(dir, &units, allocated, size, now)?;
-                    }
-                    Ok(())
+                    v.touch_names(dir, n, allocated, size)
                 })
             }
             None => self.create_locked(st, path, Some(data)),
         }
+    }
+
+    /// What stops file `n`'s data from being changed by us, if anything.
+    fn can_write_data(&self, n: u64) -> Res<()> {
+        let rec = self.record(n)?;
+        if u16_at(&rec, 22) & 2 != 0 {
+            return Err("is a directory");
+        }
+        self.can_change(n, &rec)?;
+        let si = find_attr(&rec, ATTR_STANDARD_INFORMATION, &[]).and_then(|p| resident_value(&rec, p)).unwrap_or(&[]);
+        if si.len() >= 0x24 && u32_at(si, 0x20) & FILE_READ_ONLY != 0 {
+            return Err("that file is marked read-only");
+        }
+        if let Some(p) = find_attr(&rec, ATTR_DATA, &[]) {
+            if rec[p + 8] != 0 && u16_at(&rec, p + 12) & (FLAG_COMPRESSED | FLAG_ENCRYPTED | FLAG_SPARSE) != 0 {
+                return Err("compressed, encrypted and sparse NTFS files can't be changed here yet");
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies file `n`'s new sizes and times into each of its names in `dir`'s index.
+    fn touch_names(&self, dir: u64, n: u64, allocated: u64, size: u64) -> Res<()> {
+        let now = self.now();
+        for (p, _) in attrs_of(&self.record(n)?, ATTR_FILE_NAME) {
+            let rec = self.record(n)?;
+            let fname = resident_value(&rec, p).ok_or("bad NTFS record")?;
+            let units: Vec<u16> = (0..fname[64] as usize).map(|i| u16_at(fname, 66 + 2 * i)).collect();
+            self.index_touch(dir, &units, allocated, size, now)?;
+        }
+        Ok(())
+    }
+
+    /// Adds `data` to the end of a file, taking clusters only for what is new.
+    fn append_locked(&self, st: &mut State, path: &str, data: &[u8]) -> Res<()> {
+        let (dir, name) = self.split(path)?;
+        let n = self.find_in(dir, name)?.ok_or("file not found")?;
+        self.can_write_data(n)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.change(st, |v, st| {
+            let (allocated, size) = v.append_data(st, n, data)?;
+            v.touch_names(dir, n, allocated, size)
+        })
+    }
+
+    /// Returns the data's allocated and real size afterwards.
+    fn append_data(&self, st: &mut State, n: u64, data: &[u8]) -> Res<(u64, u64)> {
+        let mut rec = self.record(n)?;
+        let p = find_attr(&rec, ATTR_DATA, &[]).ok_or("file has no data")?;
+        if rec[p + 8] == 0 {
+            // Still in the record: the whole lot goes through set_data.
+            let mut all = resident_value(&rec, p).ok_or("bad NTFS record")?.to_vec();
+            all.extend_from_slice(data);
+            return self.set_data(st, n, &all);
+        }
+        if u64_at(&rec, p + 16) != 0 {
+            return Err("that file is too fragmented to change here");
+        }
+        let size = u64_at(&rec, p + 0x30);
+        if u64_at(&rec, p + 0x38) < size {
+            return Err("that file is only partly written (initialized size)");
+        }
+        let old_runs = decode_runs(&rec[p + u16_at(&rec, p + 32) as usize..p + u32_at(&rec, p + 4) as usize], 0)?;
+        if old_runs.iter().any(|r| r.lcn.is_none()) {
+            return Err("sparse NTFS files can't be changed here yet");
+        }
+        let have: u64 = old_runs.iter().map(|r| r.len).sum();
+        let len = size + data.len() as u64;
+        let need = len.div_ceil(self.cluster);
+        let mut runs = old_runs.clone();
+        let mut new = Vec::new();
+        if need > have {
+            new = self.alloc_clusters(st, need - have)?;
+            let mut vcn = have;
+            for r in &new {
+                runs.push(Run { vcn, lcn: r.lcn, len: r.len });
+                vcn += r.len;
+            }
+        }
+        let runs = merge_runs(runs);
+        let allocated = need.max(have) * self.cluster;
+        // The new bytes, then zeros to the end of the last new cluster.
+        let mut padded = data.to_vec();
+        if need > have {
+            padded.resize((need * self.cluster - size) as usize, 0);
+        }
+        let written = self.write_runs(&runs, size, &padded).and_then(|_| self.dev.flush());
+        let placed = written.and_then(|_| replace_attr(&mut rec, p, nonresident_attr(ATTR_DATA, &[], &runs, allocated, len)));
+        if let Err(e) = placed {
+            self.free_clusters(&new)?;
+            return Err(if e == "no room left in the file's record" { "that file would be too fragmented" } else { e });
+        }
+        touch_si(&mut rec, self.now());
+        self.write_record(n, &rec)?;
+        Ok((allocated, len))
     }
 
     /// Creates a file holding `data`, or a folder when `data` is None.
@@ -2223,6 +2322,20 @@ impl vfs::Volume for NtfsVolume {
         let st = &mut *self.state.lock();
         self.check_writable()?;
         self.write_file_locked(st, path, data)
+    }
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Res<Vec<u8>> {
+        let n = self.lookup(path)?;
+        if self.is_dir(n)? {
+            return Err("is a directory");
+        }
+        let attrs = self.attributes(n)?;
+        let data = self.data_attr(&attrs, &[]).ok_or("file has no data")?;
+        self.read_attr_at(&data, offset, len)
+    }
+    fn append(&self, path: &str, data: &[u8]) -> Res<()> {
+        let st = &mut *self.state.lock();
+        self.check_writable()?;
+        self.append_locked(st, path, data)
     }
     fn create_dir(&self, path: &str) -> Res<()> {
         let st = &mut *self.state.lock();

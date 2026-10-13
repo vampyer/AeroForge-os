@@ -646,8 +646,13 @@ impl Client {
 
     /// Reads up to `limit` bytes of a file.
     pub fn read(&mut self, path: &str, limit: usize) -> Result<Vec<u8>, i64> {
+        self.read_at(path, 0, limit)
+    }
+
+    /// Reads up to `limit` bytes of a file from byte `offset`.
+    pub fn read_at(&mut self, path: &str, offset: u64, limit: usize) -> Result<Vec<u8>, i64> {
         let (f, size) = self.create(path, 0x0012_0089, 1, 0x40)?;
-        let want = (size as usize).min(limit);
+        let want = (size.saturating_sub(offset)).min(limit as u64) as usize;
         let mut out = Vec::with_capacity(want);
         let result = loop {
             if out.len() >= want {
@@ -659,7 +664,7 @@ impl Client {
             body.push(0x50);
             body.push(0);
             body.extend_from_slice(&(n as u32).to_le_bytes());
-            body.extend_from_slice(&(out.len() as u64).to_le_bytes());
+            body.extend_from_slice(&(offset + out.len() as u64).to_le_bytes());
             body.extend_from_slice(&f.0);
             body.extend_from_slice(&[0; 16]); // minimum, channel, remaining, channel info
             body.push(0);
@@ -687,8 +692,23 @@ impl Client {
     /// Creates the file, or replaces what it holds.
     pub fn write(&mut self, path: &str, data: &[u8]) -> Result<(), i64> {
         let (f, _) = self.create(path, 0x0012_0196, 5, 0x40)?;
+        let result = self.write_from(f, 0, data);
+        let closed = self.close(f);
+        result.and(closed)
+    }
+
+    /// Adds `data` to the end of an existing file.
+    pub fn append(&mut self, path: &str, data: &[u8]) -> Result<(), i64> {
+        let (f, size) = self.create(path, 0x0012_0196, 1, 0x40)?;
+        let result = self.write_from(f, size, data);
+        let closed = self.close(f);
+        result.and(closed)
+    }
+
+    /// Writes `data` into open file `f` from byte `start`.
+    fn write_from(&mut self, f: FileId, start: u64, data: &[u8]) -> Result<(), i64> {
         let mut at = 0;
-        let result = loop {
+        loop {
             if at >= data.len() {
                 break Ok(());
             }
@@ -697,7 +717,7 @@ impl Client {
             body.extend_from_slice(&49u16.to_le_bytes());
             body.extend_from_slice(&(64u16 + 48).to_le_bytes());
             body.extend_from_slice(&(piece.len() as u32).to_le_bytes());
-            body.extend_from_slice(&(at as u64).to_le_bytes());
+            body.extend_from_slice(&(start + at as u64).to_le_bytes());
             body.extend_from_slice(&f.0);
             body.extend_from_slice(&[0; 16]); // channel, remaining, channel info, flags
             body.extend_from_slice(piece);
@@ -712,9 +732,7 @@ impl Client {
                 Ok(r) => break Err(status_error(r.status)),
                 Err(e) => break Err(e),
             }
-        };
-        let closed = self.close(f);
-        result.and(closed)
+        }
     }
 
     /// Makes a folder.
