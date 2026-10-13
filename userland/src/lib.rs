@@ -467,7 +467,7 @@ pub mod display {
     /// 1 = right, 2 = middle) and how many times the left button has been
     /// pressed (20 bits, wraps), so a quick click between reads is seen.
     /// `doubles` counts the presses that were the second of a double-click
-    /// (4 bits, wraps), timed by the system as they happen.
+    /// (3 bits, wraps), timed by the system as they happen.
     /// `keys` are the modifier keys held now: MOD_SHIFT, MOD_CTRL, MOD_ALT
     /// and MOD_CAPS (Caps Lock on).
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -494,7 +494,7 @@ pub mod display {
                 buttons: ((v >> 32) & 0xF) as u8,
                 keys: ((v >> 36) & 0xF) as u8,
                 presses: (v >> 40) as u32 & 0xF_FFFF,
-                doubles: (v >> 60) as u8 & 0xF,
+                doubles: (v >> 60) as u8 & 0x7,
             })
         }
 
@@ -617,6 +617,8 @@ impl Drop for Handle {
         unsafe { syscall(sys::HANDLE_CLOSE, self.0, 0, 0, 0) };
     }
 }
+
+pub mod media;
 
 /// UDP and TCP sockets over the network card the kernel brought up.
 /// Errors: `E_NOTFOUND` (no network or no DHCP address yet), `E_CLOSED`

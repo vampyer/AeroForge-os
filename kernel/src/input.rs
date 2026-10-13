@@ -19,7 +19,7 @@ const KEY_QUEUE: usize = 64;
 static OWNER: AtomicU64 = AtomicU64::new(NOBODY);
 /// Left-button presses since boot (wraps at 20 bits for the syscall).
 static PRESSES: AtomicU32 = AtomicU32::new(0);
-/// Presses that were the second of a double-click (wraps at 4 bits).
+/// Presses that were the second of a double-click (wraps at 3 bits).
 static DOUBLES: AtomicU32 = AtomicU32::new(0);
 /// When (microseconds) and where (x | y << 16) the last press that could
 /// start a double-click was; 0 after a double-click, so a third press
@@ -132,6 +132,7 @@ pub fn pointer(pid: u64) -> Option<u64> {
     let b = usb::MOUSE_BUTTONS.load(Ordering::Relaxed) as u64 & 0xF;
     let m = MODIFIERS.load(Ordering::Relaxed) as u64 & 0xF;
     let p = PRESSES.load(Ordering::Relaxed) as u64 & 0xF_FFFF;
-    let d = DOUBLES.load(Ordering::Relaxed) as u64 & 0xF;
+    // 3 bits: with bit 63 set the value would read as an error code.
+    let d = DOUBLES.load(Ordering::Relaxed) as u64 & 0x7;
     Some(x | y << 16 | b << 32 | m << 36 | p << 40 | d << 60)
 }

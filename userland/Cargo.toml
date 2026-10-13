@@ -13,6 +13,11 @@ test = false
 [dependencies]
 noto-sans-mono-bitmap = { version = "0.3", default-features = false, features = ["regular", "bold", "size_16", "size_32", "unicode-basic-latin", "unicode-latin-1-supplement", "size_20", "size_24"] }
 
+zune-jpeg = { version = "=0.5.15", default-features = false }
+zune-png = { version = "=0.5.2", default-features = false }
+zune-core = { version = "0.5", default-features = false }
+nanomp3 = { version = "=0.2.0", default-features = false }
+
 [profile.dev]
 panic = "abort"
 

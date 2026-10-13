@@ -548,9 +548,11 @@ enum Kind {
     Notes,
     Computer,
     Calculator,
+    Photos,
+    Music,
 }
 
-const KINDS: [Kind; 5] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System, Kind::Welcome];
+const KINDS: [Kind; 7] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Photos, Kind::Music, Kind::System, Kind::Welcome];
 
 /// Desktop icons, top to bottom.
 const ICONS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System];
@@ -1119,6 +1121,9 @@ struct Desktop {
     tree_open: Vec<String>,
     tree_kids: Vec<(String, Vec<String>)>,
     popup: Option<Popup>,
+    /// The picture open in Photos, and the song in Music.
+    photo: Option<Photo>,
+    player: Option<Player>,
     /// A copy or move under way, with its progress window.
     progress: Option<Progress>,
     /// Two-pane mode: the side not in use (`files` is the one in use), and
@@ -1375,6 +1380,8 @@ impl Desktop {
             Kind::Notes => self.notes_view(c, &client, active),
             Kind::Computer => self.files_view(c, &client),
             Kind::Calculator => self.calc_view(c, &client),
+            Kind::Photos => self.photos_view(c, &client),
+            Kind::Music => self.music_view(c, &client),
         }
     }
 
@@ -1784,6 +1791,8 @@ impl Desktop {
             match self.windows[top].kind {
                 Kind::Computer => spots.extend(self.files_spots(&client)),
                 Kind::Notes => spots.push(self.notes_save(&client)),
+                Kind::Photos => spots.extend([self.photo_button(&client, false), self.photo_button(&client, true)]),
+                Kind::Music => spots.extend((0..4).map(|i| self.music_button(&client, i))),
                 Kind::Calculator => {
                     for row in 0..5 {
                         for col in 0..4 {
@@ -1933,6 +1942,15 @@ impl Desktop {
             if self.caption(&r, Caption::Close).contains(x, y) {
                 self.windows[i].open = false;
                 println!("[desktop] closed {}", self.windows[i].title);
+                match self.windows[i].kind {
+                    Kind::Photos => self.photo = None,
+                    Kind::Music => {
+                        if self.player.take().is_some_and(|p| p.playing) {
+                            println!("[desktop] music stopped");
+                        }
+                    }
+                    _ => {}
+                }
                 dirty = dirty.union(&self.window_area(i)).union(&self.taskbar());
             } else if self.caption(&r, Caption::Minimize).contains(x, y) {
                 self.windows[i].minimized = true;
@@ -1953,6 +1971,29 @@ impl Desktop {
             } else if self.windows[i].kind == Kind::Computer && self.client(&r).contains(x, y) {
                 dirty = dirty.union(&self.files_click(x, y, double));
                 dirty = dirty.union(&self.sync_preview());
+            } else if self.windows[i].kind == Kind::Photos && self.client(&r).contains(x, y) {
+                let client = self.client(&r);
+                for next in [false, true] {
+                    if self.photo_button(&client, next).contains(x, y) {
+                        dirty = dirty.union(&self.step_photo(next));
+                    }
+                }
+            } else if self.windows[i].kind == Kind::Music && self.client(&r).contains(x, y) {
+                let client = self.client(&r);
+                if let Some(b) = (0..4).find(|&b| self.music_button(&client, b).contains(x, y)) {
+                    dirty = dirty.union(&self.music_command(b));
+                } else if self.music_bar(&client).contains(x, y) {
+                    let bar = self.music_bar(&client);
+                    if let Some(song) = self.player.as_mut().and_then(|p| p.song.as_mut()) {
+                        let to = song.frames * (x - bar.x) as u64 / bar.w.max(1) as u64;
+                        song.seek(to);
+                        println!("[desktop] music: moved to {}", minutes(to / 48_000));
+                        let p = self.player.as_mut().unwrap();
+                        p.spare.clear();
+                        p.heard = to;
+                    }
+                    dirty = dirty.union(&client);
+                }
             } else if self.windows[i].kind == Kind::Calculator {
                 let client = self.client(&r);
                 for row in 0..5 {
@@ -2112,6 +2153,14 @@ impl Desktop {
                 self.quit = true;
                 continue;
             }
+            if self.top_kind() == Some(Kind::Photos) && (k == KEY_LEFT || k == KEY_RIGHT) {
+                dirty = dirty.union(&self.step_photo(k == KEY_RIGHT));
+                continue;
+            }
+            if self.top_kind() == Some(Kind::Music) && k == b' ' {
+                dirty = dirty.union(&self.music_command(1));
+                continue;
+            }
             if self.top_kind() == Some(Kind::Calculator) {
                 self.calc_key_pressed(k);
                 dirty = dirty.union(&self.window_area(self.windows.len() - 1));
@@ -2205,6 +2254,32 @@ fn fs_error_text(e: i64) -> &'static str {
 }
 
 // ------------------------------------------------------- network drives
+
+/// A picture shown in Photos, and the others in its folder.
+struct Photo {
+    list: Vec<String>,
+    at: usize,
+    /// The picture, made to fit the screen; its size before that.
+    img: Option<aero::media::Image>,
+    size: (usize, usize),
+    error: String,
+}
+
+/// The song playing in Music, and the others in its folder.
+struct Player {
+    list: Vec<String>,
+    at: usize,
+    song: Option<aero::media::Song>,
+    playing: bool,
+    /// Samples made that the audio queue had no room for yet.
+    spare: Vec<i16>,
+    /// 48 kHz frames heard so far (made, less those still queued).
+    heard: u64,
+    error: String,
+}
+
+/// The biggest picture or song opened (read whole into memory).
+const MAX_MEDIA: u64 = 96 * 1024 * 1024;
 
 /// How a copy or move is going, for its progress window.
 struct Progress {
@@ -2447,6 +2522,39 @@ fn copy_file(from: &str, to: &str, tick: Tick) -> Result<(), String> {
             return Err(String::from(CANCELLED));
         }
     }
+}
+
+/// Reads a whole file, a piece at a time (up to MAX_MEDIA).
+fn read_whole(path: &str) -> Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    loop {
+        let piece = fs_read_at(path, data.len() as u64, COPY_CHUNK).map_err(|e| format!("Can't read it: {}", fs_error_text(e)))?;
+        data.extend_from_slice(&piece);
+        if piece.len() < COPY_CHUNK {
+            return Ok(data);
+        }
+        if data.len() as u64 >= MAX_MEDIA {
+            return Err(String::from("It is too big to open here"));
+        }
+    }
+}
+
+/// The files of `kind` in the folder `path` is in, by name, and where
+/// `path` is among them.
+fn siblings(path: &str, kind: FileKind) -> (Vec<String>, usize) {
+    let (dir, name) = split_path(path);
+    let mut names: Vec<String> = fs_list(&dir).unwrap_or_default().into_iter().filter(|e| !e.is_dir && file_kind(&e.name) == kind).map(|e| e.name).collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    if !names.iter().any(|n| *n == name) {
+        names.push(name.clone());
+    }
+    let at = names.iter().position(|n| *n == name).unwrap_or(0);
+    (names.iter().map(|n| join(&dir, n)).collect(), at)
+}
+
+/// 75 seconds as "1:15".
+fn minutes(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// Deletes a file, or a folder and all it holds. Returns how many things it deleted.
@@ -4872,7 +4980,11 @@ impl Desktop {
         if e.is_dir {
             self.navigate(path)
         } else {
-            self.open_file(path)
+            match file_kind(&e.name) {
+                FileKind::Picture => self.files_area().union(&self.open_picture(path)),
+                FileKind::Sound => self.files_area().union(&self.open_song(path)),
+                _ => self.open_file(path),
+            }
         }
     }
 
@@ -5899,6 +6011,325 @@ impl Desktop {
             }
         });
         area
+    }
+
+    // ------------------------------------------------------------- Photos
+
+    fn photo_bar(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x, client.y + client.h - 48 * s, client.w, 48 * s)
+    }
+    fn photo_button(&self, client: &Rect, next: bool) -> Rect {
+        let s = self.ui;
+        let b = self.photo_bar(client);
+        let cx = b.x + b.w / 2;
+        Rect::new(if next { cx + 6 * s } else { cx - 56 * s }, b.y + 8 * s, 50 * s, 32 * s)
+    }
+    /// Where the picture goes: as big as fits, never bigger than it is.
+    fn photo_rect(&self, client: &Rect) -> Rect {
+        let Some(img) = self.photo.as_ref().and_then(|p| p.img.as_ref()) else { return Rect::EMPTY };
+        let s = self.ui;
+        let area = Rect::new(client.x + 8 * s, client.y + 8 * s, client.w - 16 * s, client.h - 64 * s);
+        let (iw, ih) = (img.w as i64, img.h as i64);
+        let (mut w, mut h) = (iw.min(area.w as i64), ih.min(area.h as i64));
+        if w * ih > h * iw {
+            w = h * iw / ih.max(1);
+        } else {
+            h = w * ih / iw.max(1);
+        }
+        let (w, h) = (w.max(1) as i32, h.max(1) as i32);
+        Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h)
+    }
+
+    /// Opens a picture in Photos, with the others in its folder a step away.
+    fn open_picture(&mut self, path: String) -> Rect {
+        let (list, at) = siblings(&path, FileKind::Picture);
+        self.photo = Some(Photo { list, at, img: None, size: (0, 0), error: String::new() });
+        self.load_photo();
+        self.log_window(Kind::Photos);
+        self.bring(Kind::Photos)
+    }
+
+    /// Where a window is and its close button, for the tests.
+    fn log_window(&self, kind: Kind) {
+        let w = &self.windows[self.index(kind)];
+        let x = self.caption(&w.rect, Caption::Close);
+        println!("[desktop] {} window at {},{} ({}x{}); close at {},{}", w.title, w.rect.x, w.rect.y, w.rect.w, w.rect.h, x.x + x.w / 2, x.y + x.h / 2);
+    }
+
+    fn load_photo(&mut self) {
+        let (sw, sh) = (self.w as usize, self.h as usize);
+        let Some(p) = self.photo.as_mut() else { return };
+        let path = p.list[p.at].clone();
+        p.img = None;
+        p.error = String::new();
+        match read_whole(&path).and_then(|data| aero::media::decode_image(&data).map_err(String::from)) {
+            Ok(img) => {
+                p.size = (img.w, img.h);
+                let format = img.format;
+                p.img = Some(aero::media::shrink_to_fit(img, sw, sh));
+                println!("[desktop] Photos: {}, {} {}x{} ({} of {})", path, format, p.size.0, p.size.1, p.at + 1, p.list.len());
+            }
+            Err(e) => {
+                println!("[desktop] Photos: {}: {}", path, e);
+                p.error = e;
+            }
+        }
+        let at = self.index(Kind::Photos);
+        let client = self.client(&self.windows[at].rect);
+        let (prev, next) = (self.photo_button(&client, false), self.photo_button(&client, true));
+        println!("[desktop] Photos: Previous at {},{}; Next at {},{}", prev.x + prev.w / 2, prev.y + prev.h / 2, next.x + next.w / 2, next.y + next.h / 2);
+    }
+
+    /// The next picture in the folder (or the one before), round to the start.
+    fn step_photo(&mut self, next: bool) -> Rect {
+        let Some(p) = self.photo.as_mut() else { return Rect::EMPTY };
+        let n = p.list.len();
+        p.at = if next { (p.at + 1) % n } else { (p.at + n - 1) % n };
+        self.load_photo();
+        let at = self.index(Kind::Photos);
+        self.client(&self.windows[at].rect)
+    }
+
+    fn photos_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        c.gradient(*client, rgb(246, 249, 253), rgb(226, 233, 243), 255);
+        let Some(p) = &self.photo else { return };
+        if let Some(img) = &p.img {
+            let r = self.photo_rect(client);
+            c.shade(Rect::new(r.x + 3 * s, r.y + 3 * s, r.w, r.h), 0x000000, 40);
+            let d = r.intersect(&c.clip);
+            for y in d.y..d.y + d.h {
+                let sy = ((y - r.y) as usize * img.h / r.h as usize).min(img.h - 1);
+                let src = &img.px[sy * img.w..(sy + 1) * img.w];
+                let row = (y * c.w) as usize;
+                for x in d.x..d.x + d.w {
+                    let sx = ((x - r.x) as usize * img.w / r.w as usize).min(img.w - 1);
+                    c.px[row + x as usize] = src[sx];
+                }
+            }
+        } else if !p.error.is_empty() {
+            let msg = format!("Can't show this picture: {}", p.error);
+            let room = ((client.w - 40 * s) / Font::Normal.w(s)).max(1) as usize;
+            let msg: String = msg.chars().take(room).collect();
+            let mx = client.x + (client.w - Font::Normal.width(s, &msg)) / 2;
+            c.text(mx, client.y + client.h / 2 - 30 * s, &msg, rgb(90, 60, 60), Font::Normal);
+        }
+        // The bar: name, size and place on the left; back and forward in the middle.
+        let b = self.photo_bar(client);
+        c.gradient(b, rgb(220, 232, 246), rgb(188, 207, 230), 255);
+        c.fill(Rect::new(b.x, b.y, b.w, 1), rgb(150, 170, 200));
+        let name = split_path(&p.list[p.at]).1;
+        let info = if p.img.is_some() { format!("{}  {} x {}  ({} of {})", name, p.size.0, p.size.1, p.at + 1, p.list.len()) } else { format!("{}  ({} of {})", name, p.at + 1, p.list.len()) };
+        let left_room = ((self.photo_button(client, false).x - b.x - 24 * s) / Font::Small.w(s)).max(0) as usize;
+        let info: String = info.chars().take(left_room).collect();
+        c.text(b.x + 12 * s, b.y + (b.h - Font::Small.h(s)) / 2, &info, rgb(30, 45, 70), Font::Small);
+        for next in [false, true] {
+            let r = self.photo_button(client, next);
+            self.round_button(c, r, if next { ">" } else { "<" });
+        }
+    }
+
+    /// A rounded button with a centred label, lit while the pointer is on it.
+    fn round_button(&self, c: &mut Canvas, b: Rect, label: &str) {
+        let s = self.ui;
+        let hot = b.contains(self.pointer.x as i32, self.pointer.y as i32);
+        let (top, bottom) = if hot { (rgb(250, 252, 255), rgb(190, 215, 245)) } else { (rgb(250, 251, 253), rgb(220, 228, 238)) };
+        c.rounded(b, 4 * s, false, top, bottom, 255);
+        c.rounded_outline(b, 4 * s, false, rgb(110, 130, 160), 255);
+        c.text(b.x + (b.w - Font::Normal.width(s, label)) / 2, b.y + (b.h - Font::Normal.h(s)) / 2, label, rgb(20, 40, 80), Font::Normal);
+    }
+
+    // -------------------------------------------------------------- Music
+
+    fn music_bar(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x + 20 * s, client.y + 92 * s, client.w - 40 * s, 12 * s)
+    }
+    /// Previous, Play/Pause, Stop and Next, left to right.
+    fn music_button(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let (w, gap) = (86 * s, 10 * s);
+        let x0 = client.x + (client.w - 4 * w - 3 * gap) / 2;
+        Rect::new(x0 + i as i32 * (w + gap), client.y + client.h - 52 * s, w, 34 * s)
+    }
+
+    /// Opens a song in Music and plays it, with the others in its folder after it.
+    fn open_song(&mut self, path: String) -> Rect {
+        let (list, at) = siblings(&path, FileKind::Sound);
+        self.player = Some(Player { list, at, song: None, playing: false, spare: Vec::new(), heard: 0, error: String::new() });
+        self.load_song(true);
+        self.log_window(Kind::Music);
+        self.bring(Kind::Music)
+    }
+
+    fn load_song(&mut self, play: bool) {
+        let Some(p) = self.player.as_mut() else { return };
+        let path = p.list[p.at].clone();
+        p.song = None;
+        p.spare.clear();
+        p.heard = 0;
+        p.error = String::new();
+        match read_whole(&path).and_then(|data| aero::media::Song::open(data).map_err(String::from)) {
+            Ok(song) => {
+                println!("[desktop] Music: {}, {} {} Hz, {} channel{}, {} ({} of {})", path, song.format, song.rate, song.channels,
+                    if song.channels == 1 { "" } else { "s" }, minutes(song.frames / 48_000), p.at + 1, p.list.len());
+                p.song = Some(song);
+                p.playing = play;
+            }
+            Err(e) => {
+                println!("[desktop] Music: {}: {}", path, e);
+                p.error = e;
+                p.playing = false;
+            }
+        }
+        let at = self.index(Kind::Music);
+        let client = self.client(&self.windows[at].rect);
+        let names = ["Previous", "Play", "Stop", "Next"];
+        let spots: Vec<String> = (0..4).map(|i| {
+            let b = self.music_button(&client, i);
+            format!("{} at {},{}", names[i], b.x + b.w / 2, b.y + b.h / 2)
+        }).collect();
+        println!("[desktop] Music: {}", spots.join("; "));
+    }
+
+    /// A button: 0 previous, 1 play or pause, 2 stop, 3 next.
+    fn music_command(&mut self, b: usize) -> Rect {
+        let at = self.index(Kind::Music);
+        let client = self.client(&self.windows[at].rect);
+        let Some(p) = self.player.as_mut() else { return Rect::EMPTY };
+        match b {
+            0 | 3 => {
+                let n = p.list.len();
+                p.at = if b == 3 { (p.at + 1) % n } else { (p.at + n - 1) % n };
+                let play = p.playing;
+                self.load_song(play);
+            }
+            1 => {
+                if p.song.is_some() {
+                    p.playing = !p.playing;
+                    println!("[desktop] music {} at {}", if p.playing { "playing" } else { "paused" }, minutes(p.heard / 48_000));
+                }
+            }
+            _ => {
+                p.playing = false;
+                p.spare.clear();
+                p.heard = 0;
+                if let Some(song) = p.song.as_mut() {
+                    song.seek(0);
+                }
+                println!("[desktop] music stopped");
+            }
+        }
+        client
+    }
+
+    /// Keeps the audio queue topped up while a song plays (about a third of
+    /// a second ahead), and goes on to the next song at the end of one.
+    /// Returns what to redraw: Music's inside, when the time shown changes.
+    fn pump_music(&mut self) -> Rect {
+        let at = self.index(Kind::Music);
+        let client = self.client(&self.windows[at].rect);
+        let Some(p) = self.player.as_mut() else { return Rect::EMPTY };
+        if !p.playing {
+            return Rect::EMPTY;
+        }
+        let queued = match aero::audio::queued() {
+            Ok(n) => n as u64,
+            Err(_) => {
+                p.playing = false;
+                p.error = String::from("There is no sound output");
+                println!("[desktop] Music: no sound output");
+                return client;
+            }
+        };
+        let before = p.heard / 48_000;
+        let mut room = (48_000 / 3u64).saturating_sub(queued);
+        while room > 0 {
+            if p.spare.is_empty() {
+                let Some(song) = p.song.as_mut() else { break };
+                let mut buf = alloc::vec![0i16; 2 * 2400];
+                let n = song.fill(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                buf.truncate(2 * n);
+                p.spare = buf;
+            }
+            match aero::audio::write(&p.spare) {
+                Ok(0) => break,
+                Ok(n) => {
+                    p.spare.drain(..2 * n);
+                    room = room.saturating_sub(n as u64);
+                }
+                Err(_) => break,
+            }
+        }
+        let made = p.song.as_ref().map_or(0, |s| s.made);
+        let queued = aero::audio::queued().unwrap_or(0) as u64;
+        p.heard = made.saturating_sub(queued + p.spare.len() as u64 / 2);
+        let done = p.song.as_ref().is_none_or(|s| s.ended()) && p.spare.is_empty() && queued == 0;
+        if done {
+            println!("[desktop] Music: played {} to the end", p.list[p.at]);
+            if p.at + 1 < p.list.len() {
+                p.at += 1;
+                self.load_song(true);
+            } else {
+                p.playing = false;
+                p.heard = 0;
+                if let Some(song) = p.song.as_mut() {
+                    song.seek(0);
+                }
+            }
+            return client;
+        }
+        if p.heard / 48_000 != before { client } else { Rect::EMPTY }
+    }
+
+    fn music_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        c.gradient(*client, rgb(250, 252, 255), rgb(225, 234, 246), 255);
+        // A note in a blue disc.
+        let (cx, cy) = (client.x + 44 * s, client.y + 44 * s);
+        c.orb(cx, cy, 26 * s, rgb(120, 190, 250), rgb(20, 80, 170));
+        c.fill(Rect::new(cx + 2 * s, cy - 14 * s, 3 * s, 22 * s), 0xFFFFFF);
+        c.fill(Rect::new(cx + 2 * s, cy - 14 * s, 10 * s, 4 * s), 0xFFFFFF);
+        c.orb(cx - 2 * s, cy + 9 * s, 5 * s, 0xFFFFFF, rgb(220, 230, 245));
+        let tx = client.x + 86 * s;
+        let room = ((client.x + client.w - 16 * s - tx) / Font::Normal.w(s)).max(1) as usize;
+        let Some(p) = &self.player else {
+            c.text(tx, client.y + 20 * s, "Open a song from Computer", rgb(30, 57, 145), Font::Normal);
+            return;
+        };
+        let name: String = split_path(&p.list[p.at]).1.chars().take(room).collect();
+        c.text(tx, client.y + 18 * s, &name, rgb(30, 57, 145), Font::Normal);
+        let line = match (&p.song, p.error.is_empty()) {
+            (_, false) => p.error.clone(),
+            (Some(song), true) => format!("{}, {}.{} kHz, {}", song.format, song.rate / 1000, song.rate % 1000 / 100,
+                if song.channels == 1 { "mono" } else { "stereo" }),
+            (None, true) => String::new(),
+        };
+        let small_room = ((client.x + client.w - 16 * s - tx) / Font::Small.w(s)).max(1) as usize;
+        let line: String = line.chars().take(small_room).collect();
+        c.text(tx, client.y + 50 * s, &line, if p.error.is_empty() { rgb(80, 85, 95) } else { rgb(170, 30, 20) }, Font::Small);
+        // How far through: a bar to click, and the time.
+        let bar = self.music_bar(client);
+        c.fill(bar, rgb(225, 228, 233));
+        c.frame(bar, rgb(150, 155, 165));
+        let total = p.song.as_ref().map_or(0, |s| s.frames);
+        let heard = p.heard.min(total);
+        if total > 0 {
+            let fill = ((bar.w - 2 * s) as u64 * heard / total) as i32;
+            c.gradient(Rect::new(bar.x + s, bar.y + s, fill, bar.h - 2 * s), rgb(110, 180, 250), rgb(30, 100, 200), 255);
+        }
+        let time = format!("{} / {}", minutes(heard / 48_000), minutes(total / 48_000));
+        c.text(bar.x, bar.y + bar.h + 8 * s, &time, rgb(60, 65, 75), Font::Small);
+        let place = format!("{} of {}", p.at + 1, p.list.len());
+        c.text(bar.x + bar.w - Font::Small.width(s, &place), bar.y + bar.h + 8 * s, &place, rgb(60, 65, 75), Font::Small);
+        let labels = ["|<", if p.playing { "Pause" } else { "Play" }, "Stop", ">|"];
+        for (i, label) in labels.iter().enumerate() {
+            self.round_button(c, self.music_button(client, i), label);
+        }
     }
 
     // ------------------------------------------------------ copy progress
@@ -6938,6 +7369,11 @@ fn main() -> i64 {
             Rect::new((w - cw - 20 * s).max(130 * s), 30 * s, cw, ch)
         }) },
         Window { open: false, ..window(Kind::Calculator, "Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s)) },
+        Window { open: false, ..window(Kind::Photos, "Photos", {
+            let (pw, ph) = ((w - 100 * s).min(900 * s), (h - 120 * s).min(660 * s));
+            Rect::new((w - pw) / 2, 20 * s, pw, ph)
+        }) },
+        Window { open: false, ..window(Kind::Music, "Music", Rect::new(w / 2 - 230 * s, h / 2 - 160 * s, 460 * s, 240 * s)) },
     ];
     let pointer = screen.pointer().unwrap_or_default();
     let started_us = aero::clock_us();
@@ -6976,6 +7412,8 @@ fn main() -> i64 {
         tree_open: alloc::vec![String::new()],
         tree_kids: Vec::new(),
         popup: None,
+        photo: None,
+        player: None,
         progress: None,
     };
     let canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
@@ -7011,7 +7449,7 @@ fn main() -> i64 {
             // Both presses of a quick double-click can land between two looks.
             // The double-clicks among them are the last ones.
             let presses = (p.presses.wrapping_sub(old.presses) & 0xF_FFFF).min(3);
-            let doubles = (p.doubles.wrapping_sub(old.doubles) & 0xF) as u32;
+            let doubles = (p.doubles.wrapping_sub(old.doubles) & 0x7) as u32;
             for k in 0..presses {
                 dirty = dirty.union(&desk.click(p.x as i32, p.y as i32, k + doubles.min(presses) >= presses));
             }
@@ -7096,6 +7534,7 @@ fn main() -> i64 {
         if let Ok(n) = gfx().screen.keys_with_modifiers(&mut keys) {
             dirty = dirty.union(&desk.typed(&keys[..n]));
         }
+        dirty = dirty.union(&desk.pump_music());
         // Twice a second: the clock, the System window and the Notes caret.
         let now = aero::clock_us();
         if now / 500_000 != tick {

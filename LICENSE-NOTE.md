@@ -1,6 +1,9 @@
 AeroForge's own code is offered under MIT OR Apache-2.0, as the design doc recommends.
 Third-party pieces: Limine (BSD-2-Clause, downloaded at build time, not vendored),
 font8x8 (MIT, public-domain glyph data), spin and linked_list_allocator (MIT/Apache-2.0).
+The picture and sound decoders: zune-jpeg, zune-png, zune-core and zune-inflate (MIT/Apache-2.0/Zlib),
+simd-adler32 (MIT), nanomp3 and nanomp3-core (MIT/Apache-2.0). The sample pictures and songs on the
+test disk are made by tools/make-media.py.
 
 MediaTek Bluetooth firmware (BT_RAM_CODE_MT7961/MT7922) comes from linux-firmware and is
 downloaded at build time, not kept in this repository. MediaTek allows its redistribution for
