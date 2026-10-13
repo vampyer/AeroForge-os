@@ -6579,7 +6579,8 @@ impl Desktop {
                 format!("{} at {},{}", name, r.x + r.w / 2, r.y + r.h / 2)
             }
         }).collect();
-        println!("[desktop] Control Panel {}: {}", cp_title(self.cp_page), spots.join(" | "));
+        // "end" marks a whole line for the boot test, which reads the log as it arrives.
+        println!("[desktop] Control Panel {}: {} | end", cp_title(self.cp_page), spots.join(" | "));
     }
 
     fn cp_go(&mut self, page: CpPage) {

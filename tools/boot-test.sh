@@ -133,6 +133,8 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
     -monitor unix:build/qemu-monitor.sock,server,nowait -qmp unix:build/qmp.sock,server,nowait &
 QEMU_PID=$!
+# set -e stops the test without a word; say where.
+trap 'echo "FAIL: boot-test.sh stopped at line $LINENO (test stage ${STAGE:-none})"' ERR
 trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null; $SUDO kill $SMBD_PID 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
@@ -201,15 +203,15 @@ pane_row() { grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o " $1 at [0-
 pane_arrow() { grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o " $1 at [0-9]*,[0-9]* ([>v] [0-9]*,[0-9]*)" | head -1 | grep -o "[0-9]*,[0-9]*)" | tr -d ')' | tr ',' ' '; }
 # Where the open right-click menu shows $1, from the latest "[desktop] menu: ..." line.
 # Where the Control Panel's page shows $1 ("Sound", "Mute", "Minute +"), from the
-# latest "[desktop] Control Panel <page>: name at x,y | ..." line; cp_bar gives
+# latest whole "[desktop] Control Panel <page>: name at x,y | ... | end" line; cp_bar gives
 # the point $2 thousandths along bar $1.
-cp_at() { grep -a "\[desktop\] Control Panel [A-Za-z ]*: " "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
+cp_at() { grep -a "\[desktop\] Control Panel [A-Za-z ]*: .* | end" "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 cp_bar() {
-    local xy; xy=$(grep -a "\[desktop\] Control Panel [A-Za-z ]*: " "$LOG" | tail -1 | grep -o "$1 bar at [0-9]*,[0-9]* to [0-9]*" | head -1)
+    local xy; xy=$(grep -a "\[desktop\] Control Panel [A-Za-z ]*: .* | end" "$LOG" | tail -1 | grep -o "$1 bar at [0-9]*,[0-9]* to [0-9]*" | head -1 || true)
     local x0 y x1; read -r x0 y x1 <<< "$(echo "$xy" | sed 's/.* bar at \([0-9]*\),\([0-9]*\) to \([0-9]*\)/\1 \2 \3/')"
     echo $((x0 + (x1 - x0) * $2 / 1000)) "$y"
 }
-cp_count() { grep -c "\[desktop\] Control Panel $1: " "$LOG" || true; }
+cp_count() { grep -c "\[desktop\] Control Panel $1: .* | end" "$LOG" || true; }
 click() { monitor "mouse_button 1" "mouse_button 0"; }
 menu_item() { grep -a "\[desktop\] menu: " "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 # Where the desktop's Computer window shows the entry named $2 of folder $1,
@@ -657,8 +659,9 @@ for _ in $(seq "$TIMEOUT"); do
         # Control Panel, from the right of the Start menu.
         sleep 0.5; point_at 27 780; click; STAGE=cpmenu
     elif [ $STAGE = cpmenu ] && grep -q "\[desktop\] Start menu open; Control Panel at " "$LOG"; then
+        sleep 0.5
         XY=$(grep -ao "Start menu open; Control Panel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
-        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cphome
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cphome
     elif [ $STAGE = cphome ] && [ "$(cp_count "Control Panel")" -ge 1 ]; then
         # Display: the Dusk background, and Large text (too small a screen here).
         sleep 0.5; point_at $(cp_at Display); click; STAGE=cpdisplay
@@ -720,8 +723,9 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = cpdisplay2 ] && [ "$(cp_count Display)" -ge 2 ]; then
         sleep 0.5; point_at $(cp_at "Aero blue"); click; STAGE=cpblue
     elif [ $STAGE = cpblue ] && grep -q "\[desktop\] background: Aero blue" "$LOG"; then
+        sleep 0.5
         XY=$(grep -ao "Control Panel window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
-        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cpclosed
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cpclosed
     elif [ $STAGE = cpclosed ] && grep -q "\[desktop\] closed Control Panel" "$LOG"; then
         # Open the Start menu for a screenshot of it and the Start button.
         sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
