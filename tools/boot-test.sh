@@ -141,7 +141,7 @@ trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-}
 fail() {
     echo "FAIL: $1"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|gamepad\|WARN' | tail -8 | tr -d '\r' | tr '\n' ';') | fakebt: $(grep -a 'FAIL\|voice\|reconnect\|LE\|SMP\|GATT' "$FAKEBT_LOG" | tail -6 | tr -d '\r' | tr '\n' ';')"
+        echo "::error::$1 | $(sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a 'bt pair\|paired\|mic\|pitch\|headset\|gamepad\|WARN' | tail -8 | tr -d '\r' | tr '\n' ';') | fakebt: $(grep -a 'FAIL\|voice\|reconnect\|LE\|SMP\|GATT' "$FAKEBT_LOG" | tail -6 | tr -d '\r' | tr '\n' ';') | desktop: $(grep -a '\[desktop\]\|fault\|killed\|exception' "$LOG" | tail -12 | tr -d '\r' | tr '\n' ';')"
     fi
     shift
     for f in "$@"; do cat "$f"; done
