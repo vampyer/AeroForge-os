@@ -29,7 +29,7 @@ fail() {
 
 make iso >/dev/null
 cp "$OVMF_VARS" build/display-vars.fd
-rm -f "$LOG" "$MON" build/virtio-boot.ppm build/virtio-draw.ppm build/virtio-console.ppm
+rm -f "$LOG" "$MON" build/virtio-desktop.ppm build/virtio-boot.ppm build/virtio-draw.ppm build/virtio-console.ppm
 
 qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 2 -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -44,7 +44,14 @@ STAGE=boot
 for _ in $(seq "$TIMEOUT"); do
     sleep 1
     grep -q "PANIC" "$LOG" 2>/dev/null && fail "kernel panic"
-    if [ $STAGE = boot ] && grep -q "\[client [0-9]*\] done, exiting" "$LOG" 2>/dev/null; then
+    # With no disk the built-in session runs, and the desktop starts after
+    # it; Esc gives the screen back to the console.
+    if [ $STAGE = boot ] && grep -q "\[desktop\] \(up at\|could not\)" "$LOG" 2>/dev/null; then
+        sleep 2
+        monitor "screendump build/virtio-desktop.ppm"
+        monitor "sendkey esc"
+        STAGE=console
+    elif [ $STAGE = console ] && grep -q "\[desktop\] closed, screen given back" "$LOG" && grep -q "\[client [0-9]*\] done, exiting" "$LOG"; then
         sleep 2
         monitor "screendump build/virtio-boot.ppm"
         python3 tools/qemu-type.py "$MON" $'display\n'
@@ -65,6 +72,8 @@ for _ in $(seq "$TIMEOUT"); do
 done
 [ $STAGE = done ] || fail "stopped at stage $STAGE within ${TIMEOUT}s"
 sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | grep -a "virtio-gpu\|drawtest\|through the\|whole screen\|showing the console"
+grep -q "\[aerosmss\] started the desktop" "$LOG" && grep -q "\[desktop\] up at [0-9]*x[0-9]*" "$LOG" \
+    || fail "the desktop did not start by itself after boot"
 grep -q "C++ virtio-gpu driver attached through DHI v[0-9]*: console on screen at [0-9]*x[0-9]*" "$LOG" || fail "the virtio-gpu driver did not start"
 grep -q "  [0-9]*x[0-9]* through the virtio-gpu" "$LOG" || fail "'display' did not report the virtio-gpu"
 if [ -n "${HUGE:-}" ]; then
@@ -76,4 +85,4 @@ grep -q "\[drawtest\] full-screen frame, partial update, bad frame refused, scre
 python3 tools/check-screen.py console build/virtio-boot.ppm || fail "the console was not on screen after boot"
 python3 tools/check-screen.py drawtest build/virtio-draw.ppm || fail "drawtest's picture was not on screen"
 python3 tools/check-screen.py console build/virtio-console.ppm || fail "the console did not come back after drawtest"
-echo "PASS: with no firmware framebuffer${HUGE:+ and a 4096x2160 screen asked for (fell back to 1280x800)}, the C++ virtio-gpu driver put the console on screen, a program drew the whole screen and a partial update, and the console came back"
+echo "PASS: with no firmware framebuffer${HUGE:+ and a 4096x2160 screen asked for (fell back to 1280x800)}, the desktop started by itself and Esc gave the screen back, the C++ virtio-gpu driver put the console on screen, a program drew the whole screen and a partial update, and the console came back"

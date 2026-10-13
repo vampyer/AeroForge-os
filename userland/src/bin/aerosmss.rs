@@ -1,6 +1,9 @@
 //! aerosmss: the AeroForge session manager, first user process.
 //! Reads the list of programs to start from /system/session.cfg on disk
-//! (falling back to a built-in list), starts them, and stays resident.
+//! (falling back to a built-in list), starts them, then starts the desktop
+//! (unless the list has a line "console": the boot test types at the
+//! console first), and stays resident. Esc or Start > Exit to console on
+//! the desktop leaves it at the console.
 
 #![no_std]
 #![no_main]
@@ -28,9 +31,14 @@ fn main() -> i64 {
     };
 
     // One program per line; '#' starts a comment.
+    let mut desktop = true;
     for line in session.lines() {
         let program = line.split('#').next().unwrap_or("").trim();
         if program.is_empty() {
+            continue;
+        }
+        if program == "console" {
+            desktop = false;
             continue;
         }
         match aero::spawn(program) {
@@ -39,6 +47,14 @@ fn main() -> i64 {
         }
     }
     println!("[aerosmss] all services up");
+    if desktop {
+        match aero::spawn("desktop") {
+            Ok(pid) => println!("[aerosmss] started the desktop (pid {})", pid),
+            Err(e) => println!("[aerosmss] failed to start the desktop: error {}", e),
+        }
+    } else {
+        println!("[aerosmss] staying at the console ({} says so)", CONFIG);
+    }
     loop {
         aero::sleep_ms(1000);
     }

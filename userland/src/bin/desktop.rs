@@ -2313,15 +2313,21 @@ fn fs_delete(path: &str, is_dir: bool) -> Result<(), i64> {
     }
 }
 
-/// Renames in place when both paths are on the same network share (local
-/// drives have no rename call yet). None when it can't be done that way.
+/// Renames in place when both paths are on the same drive or network
+/// share, without copying. None when it can't be done that way.
 fn fs_rename(from: &str, to: &str) -> Option<Result<(), i64>> {
-    let (i, a) = net_path(from)?;
-    let (j, b) = net_path(to)?;
-    (i == j).then(|| with_share(i, |c| c.rename(&a, &b)))
+    match (net_path(from), net_path(to)) {
+        (Some((i, a)), Some((j, b))) => (i == j).then(|| with_share(i, |c| c.rename(&a, &b))),
+        (None, None) => match aero::rename(from, to) {
+            Err(aero::E_XDEV) => None,
+            r => Some(r),
+        },
+        _ => None,
+    }
 }
 
-/// Moves a file or folder: a rename on one network share, else copy and delete.
+/// Moves a file or folder: a rename on one drive or network share, else
+/// copy and delete.
 fn move_tree(from: &str, to: &str, is_dir: bool, size: u64) -> Result<(), String> {
     if let Some(r) = fs_rename(from, to) {
         return r.map_err(|e| format!("Can't move {}: {}", from, fs_error_text(e)));
@@ -5105,13 +5111,13 @@ impl Desktop {
             self.files.status = String::new();
             return;
         }
-        if self.files.entries.iter().any(|o| o.name.eq_ignore_ascii_case(&new)) {
+        // Its own name in other letter case is fine: only the case changes.
+        if self.files.entries.iter().any(|o| o.name != e.name && o.name.eq_ignore_ascii_case(&new)) {
             self.files.status = format!("There is already something called \"{}\" here", new);
             return;
         }
         let dir = self.files.path.clone();
         let (from, to) = (join(&dir, &e.name), join(&dir, &new));
-        // Locally there is no rename call yet: copy under the new name, then delete the old one.
         let result = move_tree(&from, &to, e.is_dir, e.size);
         match result {
             Ok(_) => {
@@ -5141,8 +5147,8 @@ impl Desktop {
     fn recycle_root_of(&self, path: &str) -> Option<String> {
         let d = self.drive_of(path)?;
         let v = &self.files.drives[d];
-        // Not on Windows drives: Windows keeps its own Recycle Bin there.
-        if v.read_only || v.kind == "NTFS" { None } else { Some(v.path.clone()) }
+        // Not on network drives, and not on Windows drives until changes are allowed.
+        if v.read_only { None } else { Some(v.path.clone()) }
     }
 
     fn read_bin(root: &str) -> Vec<Recycled> {
@@ -5219,13 +5225,16 @@ impl Desktop {
             None => String::from("-"),
         };
         let item = Recycled { root: root.clone(), id: format!("R{:04}", next), original: String::from(path), is_dir: e.is_dir, size: e.size, when };
-        copy_tree(path, &item.stored(), e.is_dir, e.size).map_err(|m| format!("Not deleted: {}", m))?;
+        // Listed first, then moved in (a rename on its own drive): stopped in
+        // between, the list has a line for something not there, which is
+        // dropped from it, rather than the bin holding something unlisted.
         items.push(item.clone());
-        if let Err(m) = Self::write_bin(&root, &items) {
-            let _ = delete_tree(&item.stored(), e.is_dir);
+        Self::write_bin(&root, &items).map_err(|m| format!("Not deleted: {}", m))?;
+        if let Err(m) = move_tree(path, &item.stored(), e.is_dir, e.size) {
+            items.pop();
+            let _ = Self::write_bin(&root, &items);
             return Err(format!("Not deleted: {}", m));
         }
-        delete_tree(path, e.is_dir)?;
         println!("[desktop] moved {} to the Recycle Bin as {}", path, item.stored());
         self.files.last_recycled.push(item.clone());
         Ok(item)
@@ -5248,8 +5257,9 @@ impl Desktop {
         let taken: Vec<String> = aero::list_dir(&dir).unwrap_or_default().into_iter().map(|e| e.name).collect();
         let taken: Vec<&str> = taken.iter().map(|t| t.as_str()).collect();
         let to = join(&dir, &free_name(&name, &taken, item.is_dir, false));
-        copy_tree(&item.stored(), &to, item.is_dir, item.size).map_err(|m| format!("Not restored: {}", m))?;
-        self.purge(item, false)?;
+        move_tree(&item.stored(), &to, item.is_dir, item.size).map_err(|m| format!("Not restored: {}", m))?;
+        let items: Vec<Recycled> = Self::read_bin(&item.root).into_iter().filter(|b| b.id != item.id).collect();
+        Self::write_bin(&item.root, &items)?;
         println!("[desktop] restored {} from the Recycle Bin to {}", item.original, to);
         self.files.last_recycled.retain(|l| !(l.root == item.root && l.id == item.id));
         Ok(to)
@@ -5260,7 +5270,8 @@ impl Desktop {
     fn purge(&self, item: &Recycled, emptied: bool) -> Result<(), String> {
         // The list first: written after, a new list file could take the
         // directory slot of what was just deleted, and lose its name.
-        if emptied {
+        // Only FAT32 drives can undelete.
+        if emptied && self.drive_of(&item.root).is_some_and(|d| self.files.drives[d].kind == "FAT32") {
             let mut gone = Self::read_list(&item.root, BIN_GONE);
             gone.push(item.clone());
             let extra = gone.len().saturating_sub(BIN_GONE_MAX);

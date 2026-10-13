@@ -5,6 +5,8 @@
 //!   w|<path>|<size>|<seed>  write a file of a test pattern
 //!   m|<path>                make a folder
 //!   d|<path>                delete a file or an empty folder
+//!   n|<path>|<new path>     rename or move a file or folder
+//!   s|<path>|<short name>   give a file a DOS short name, as Windows does
 //!   l|<path>                count what a folder holds
 //!   r|<path>                read a file
 //!   c|<path>|<size>|<seed>  check a file holds that pattern
@@ -72,6 +74,14 @@ mod vfs {
         fn write_file(&self, path: &str, data: &[u8]) -> Result<(), &'static str>;
         fn create_dir(&self, path: &str) -> Result<(), &'static str>;
         fn remove(&self, path: &str) -> Result<(), &'static str>;
+        fn rename(&self, from: &str, to: &str) -> Result<(), &'static str>;
+    }
+    pub fn is_inside(path: &str, dir: &str) -> bool {
+        let (path, dir) = (path.trim_matches('/'), dir.trim_matches('/'));
+        path.len() > dir.len()
+            && path.as_bytes()[dir.len()] == b'/'
+            && path.is_char_boundary(dir.len())
+            && path[..dir.len()].eq_ignore_ascii_case(dir)
     }
 }
 #[path = "../../../kernel/src/ntfs.rs"]
@@ -100,6 +110,8 @@ fn main() {
                 v.write_file(parts[1], &data).map(|_| String::new())
             }
             "d" => v.remove(parts[1]).map(|_| String::new()),
+            "n" => v.rename(parts[1], parts[2]).map(|_| String::new()),
+            "s" => v.add_dos_name(parts[1], parts[2]).map(|_| String::new()),
             "m" => v.create_dir(parts[1]).map(|_| String::new()),
             "c" => {
                 let size: usize = parts[2].parse().unwrap();

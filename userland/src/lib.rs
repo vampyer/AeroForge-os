@@ -71,6 +71,7 @@ pub mod sys {
     pub const DELETED_LIST: u64 = 56;
     pub const UNDELETE: u64 = 57;
     pub const SET_WRITABLE: u64 = 58;
+    pub const RENAME: u64 = 59;
 }
 
 pub mod rights {
@@ -92,6 +93,8 @@ pub const E_AGAIN: i64 = -8;
 pub const E_TIMEDOUT: i64 = -9;
 /// A connection was refused or reset.
 pub const E_CLOSED: i64 = -10;
+/// Not on the same drive, or the drive can't rename: copy instead.
+pub const E_XDEV: i64 = -11;
 
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -316,6 +319,12 @@ pub fn undelete(path: &str, slot: u32) -> Result<alloc::string::String, i64> {
     let mut name = [0u8; 255];
     let n = check(unsafe { syscall(sys::UNDELETE, path.as_ptr() as u64, path.len() as u64, slot as u64, name.as_mut_ptr() as u64) })? as usize;
     Ok(alloc::string::String::from_utf8_lossy(&name[..n.min(255)]).into_owned())
+}
+
+/// Renames or moves a file or folder on the same drive, without copying
+/// it. E_XDEV when `to` is on another drive or the drive can't do it.
+pub fn rename(from: &str, to: &str) -> Result<(), i64> {
+    check(unsafe { syscall(sys::RENAME, from.as_ptr() as u64, from.len() as u64, to.as_ptr() as u64, to.len() as u64) }).map(|_| ())
 }
 
 /// Turns writing to the drive mounted at `path` on or off (drives written

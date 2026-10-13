@@ -90,6 +90,7 @@ impl Shell {
                 kprintln!("  write <path> <text>  save a line of text as a file (replacing it); quote a path with spaces");
                 kprintln!("  mkdir <path>  create a directory");
                 kprintln!("  rm <path>   delete a file or an empty directory");
+                kprintln!("  mv <path> <new path>  rename or move on the same drive (quote paths with spaces)");
                 kprintln!("  writable <drive> on|off  allow changes to an NTFS drive (Windows must have shut it down fully)");
                 kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
                 kprintln!("  mem         buddy allocator, slab heap and paging");
@@ -403,6 +404,13 @@ impl Shell {
                 },
                 _ => console::print_colored(YELLOW, format_args!("  usage: writable <drive> on|off\n")),
             },
+            "mv" => match two_paths(arg) {
+                Some((from, to)) => match vfs::rename(from, to) {
+                    Ok(()) => kprintln!("  moved {} to {}", from, to),
+                    Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", from, e)),
+                },
+                None => console::print_colored(YELLOW, format_args!("  usage: mv <path> <new path>\n")),
+            },
             "rm" => match vfs::remove(arg) {
                 Ok(()) => kprintln!("  deleted {}", arg),
                 Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
@@ -534,4 +542,18 @@ pub fn print_usb() {
                 dhi::c_field(&d.name));
         }
     }
+}
+
+/// Two paths, each either "quoted" (so it can hold spaces) or one word.
+fn two_paths(arg: &str) -> Option<(&str, &str)> {
+    fn one(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        match s.strip_prefix('"') {
+            Some(q) => q.split_once('"').map(|(p, rest)| (p, rest)),
+            None => Some(s.split_once(' ').unwrap_or((s, ""))),
+        }
+    }
+    let (a, rest) = one(arg)?;
+    let (b, rest) = one(rest)?;
+    (!a.is_empty() && !b.is_empty() && rest.trim().is_empty()).then_some((a, b))
 }

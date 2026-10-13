@@ -84,10 +84,56 @@ grep -q "^l /Photos: 70 entries" build/ntfs-write-test.log || fail "deleting pho
 grep -q "^v /: 100 names, all in order" build/ntfs-write-test.log || fail "a folder index is out of order after deleting"
 checked "deleting"
 
+# 3. Rename and move: files, a whole folder, back again, and changing just
+# a name's case; refuse a taken name and a folder moved into itself.
+python3 - <<'PY' | run
+import random
+random.seed(11)
+# Files made by Windows have a DOS short name too; renaming drops it.
+print("s|/Photos/again 7.jpg|AGAIN7~1.JPG")
+print("s|/Photos/again 8.jpg|AGAIN8~1.JPG")
+print("n|/Photos/again 8.jpg|/Photos/AGAIN8~1.JPG")
+print("l|/Photos")
+print("n|/new.txt|/renamed.txt")
+print("n|/renamed.txt|/Renamed.TXT")
+print("n|/README.TXT|/Renamed.TXT")
+print("m|/Box")
+print("n|/Photos/again 5.jpg|/Users/Player/again 5.jpg")
+print("n|/Photos|/Box/Pictures")
+print("n|/Box|/Box/Pictures/inside")
+print("l|/Box/Pictures")
+names = [f"/Box/Pictures/again {i}.jpg" for i in range(30) if i not in (5, 8)] + ["/Box/Pictures/AGAIN8~1.JPG"]
+random.shuffle(names)
+for i, p in enumerate(names):
+    print(f"n|{p}|/Box/Pictures/renamed photo number {i:02d} with a much longer name.jpg")
+print("n|/Box/Pictures|/Photos")
+print("c|/Renamed.TXT|50000|9")
+print("c|/Users/Player/again 5.jpg|15000|5")
+print("l|/Photos")
+print("l|/Box")
+print("v|/")
+PY
+grep -q "^n /README.TXT: ERROR already exists" build/ntfs-write-test.log || fail "a rename onto a taken name was not refused"
+grep -q "^n /Box: ERROR can't move a folder into itself" build/ntfs-write-test.log || fail "a folder was moved into itself"
+grep -q "^l /Photos: 70 entries" build/ntfs-write-test.log || fail "a short name was listed as a file of its own"
+grep -q "^l /Box/Pictures: 69 entries" build/ntfs-write-test.log || fail "a moved folder did not keep its files"
+grep -q "^c /Renamed.TXT: holds what was written" build/ntfs-write-test.log || fail "a renamed file did not read back"
+grep -q "^c /Users/Player/again 5.jpg: holds what was written" build/ntfs-write-test.log || fail "a moved file did not read back"
+grep -q "^l /Photos: 69 entries" build/ntfs-write-test.log || fail "a folder moved back lost files"
+grep -q "^l /Box: 0 entries" build/ntfs-write-test.log || fail "a folder moved out was still listed"
+grep -q "^v /: 101 names, all in order" build/ntfs-write-test.log || fail "a folder index is out of order after renaming"
+! grep -q "ERROR" <(sed -n '/^n \/new.txt/,$p' build/ntfs-write-test.log | grep -v "README.TXT: ERROR already\|/Box: ERROR can't move") || fail "a rename failed"
+checked "renaming"
+ntfsls "$IMG" | grep -qx "Renamed.TXT" || fail "Linux does not see the new name's case"
+[ "$(ntfsls -p /Photos "$IMG" | grep -c "^renamed photo number")" = 29 ] || fail "Linux does not see all 29 renamed files"
+ntfsls -p /Photos "$IMG" | grep -q "^renamed photo number 28 with" || fail "Linux does not see a renamed file"
+cmp -s <(ntfscat "$IMG" "/Users/Player/again 5.jpg") <(python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + 5) & 255 for i in range(15000)))") \
+    || fail "Linux does not read a moved file back the same"
+
 # 3. A change cut off half way leaves the volume dirty: no more writing
 # until Windows has checked it.
 echo "x|/" | run
 "$CHECK" "$IMG" < /dev/null > build/ntfs-crash.log
 grep -q "^writable: Err(\"Windows has to check it first" build/ntfs-crash.log || { cat build/ntfs-crash.log; fail "writing was allowed on a volume left dirty"; }
 
-echo "PASS: the NTFS writer saved over files, made 180 files and a folder (index split, MFT grown), deleted 440 of them, refused compressed files, bad names and a dirty volume; ntfsfix and ntfsresize found nothing wrong"
+echo "PASS: the NTFS writer saved over files, made 180 files and a folder (index split, MFT grown), deleted 440 of them, renamed and moved files and a folder, refused compressed files, bad names and a dirty volume; ntfsfix and ntfsresize found nothing wrong"

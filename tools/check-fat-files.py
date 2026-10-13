@@ -60,8 +60,11 @@ if mtype(disk, "/saves/Slot 2 - Forest Temple.sav") != save(2, 1500):
     fail("disk.img: slot 2 does not hold its save")
 
 sata = os.path.join(build, "sata.img")
-if mtype(sata, "/docs/Hello World.txt") != b"Saved from AeroForge on SATA\n":
-    fail("sata.img: /docs/Hello World.txt is missing or wrong")
+# Saved in /docs, renamed out to the root, then /docs moved into /Archive.
+if mtype(sata, "/Hello again.txt") != b"Saved from AeroForge on SATA\n":
+    fail("sata.img: /Hello again.txt (renamed from /docs/Hello World.txt) is missing or wrong")
+if names(sata, "/Archive") != ["Old docs"] or "docs" in names(sata, "/") or names(sata, "/Archive/Old docs") != []:
+    fail("sata.img: /docs was not moved to /Archive/Old docs")
 
 usb = os.path.join(build, "usb.img")
 if mtype(usb, "/usbnote.txt") != b"Saved from AeroForge on USB\n":
@@ -88,20 +91,23 @@ def exfat(cmd, path):
     return r.stdout if r.returncode == 0 else None
 
 
-want = ["Level 3 checkpoint.sav"] + [f"Level {n} checkpoint.sav" for n in range(4, 9)]
+want = ["Level 3 checkpoint.sav"] + [f"Level {n} checkpoint.sav" for n in range(4, 8)]
 listing = (exfat("ls", "/Games/Saves") or b"").decode().splitlines()
 if listing != want:
     fail(f"usb2.img: /Games/Saves holds {listing}, not {want}")
-for n in range(4, 9):
+for n in range(4, 8):
     if exfat("cat", f"/Games/Saves/Level {n} checkpoint.sav") != f"checkpoint=lava-{n}\n".encode():
         fail(f"usb2.img: level {n} save is wrong")
+# Level 8 was moved into Music, and Music renamed Tunes.
+if exfat("cat", "/Tunes/Level 8 moved.sav") != b"checkpoint=lava-8\n":
+    fail("usb2.img: the moved level 8 save is not in /Tunes")
 if exfat("cat", "/Games/Saves/Level 3 checkpoint.sav") != b"checkpoint=forest-temple-3\nhealth=87\n":
     fail("usb2.img: the save that was already there changed")
 if exfat("cat", "/AeroForge-OS-Design.md") != b"replaced by AeroForge\n":
     fail("usb2.img: the overwritten file is wrong")
 root = (exfat("ls", "/") or b"").decode().splitlines()
-if "HOT.TXT" in root or "Music/" not in root:
-    fail(f"usb2.img: root holds {root}: HOT.TXT should be gone and Music/ there")
+if "HOT.TXT" in root or "Tunes/" not in root or "Music/" in root:
+    fail(f"usb2.img: root holds {root}: HOT.TXT and Music/ should be gone and Tunes/ there")
 
 if failed:
     sys.exit(1)

@@ -182,6 +182,7 @@ pub const SYS_VOLUMES: u64 = 55;
 pub const SYS_DELETED_LIST: u64 = 56;
 pub const SYS_UNDELETE: u64 = 57;
 pub const SYS_SET_WRITABLE: u64 = 58;
+pub const SYS_RENAME: u64 = 59;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -212,6 +213,9 @@ const E_AGAIN: i64 = -8;
 const E_TIMEDOUT: i64 = -9;
 /// The connection was refused or reset (or never made).
 const E_CLOSED: i64 = -10;
+/// The two paths are on different drives, or the drive can't rename:
+/// the caller copies and deletes instead.
+const E_XDEV: i64 = -11;
 
 /// Most one SYS_SOCKET_SEND or SYS_SOCKET_RECV moves.
 const MAX_SOCKET_IO: u64 = 64 * 1024;
@@ -265,6 +269,7 @@ fn fs_error(e: &'static str) -> i64 {
         "its data has been written over" | "its data is gone" => E_FULL,
         "writing to this NTFS drive is not turned on" | "that file is marked read-only" | "that is one of Windows' own files" => E_RIGHTS,
         "the drive's file table is full" => E_FULL,
+        "not on the same drive" | "not supported on this kind of volume" => E_XDEV,
         _ => E_INVAL,
     }
 }
@@ -613,6 +618,15 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
             check_writable(a3, name.len() as u64)?;
             to_user(a3, name)?;
             Ok(name.len() as u64)
+        }
+        SYS_RENAME => {
+            // Renames or moves a0/a1 to a2/a3 on the same drive.
+            let from = user_str(a0, a1)?;
+            let to = user_str(a2, a3)?;
+            writable_by_programs(&from)?;
+            writable_by_programs(&to)?;
+            vfs::rename(&from, &to).map_err(fs_error)?;
+            Ok(0)
         }
         SYS_SET_WRITABLE => {
             // Turns writing to the drive mounted at a0/a1 on (a2 = 1) or off.

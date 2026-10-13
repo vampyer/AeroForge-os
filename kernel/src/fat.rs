@@ -199,7 +199,7 @@ impl FatVolume {
                     self.free_chain(st, old_cluster)?;
                 }
             }
-            None => self.add_entry(st, &parent, name, ATTR_ARCHIVE, first, data.len() as u32)?,
+            None => self.add_entry(st, &parent, name, short_entry(&[b' '; 11], 0, ATTR_ARCHIVE, first, data.len() as u32, time, date))?,
         }
         self.finish(st)
     }
@@ -220,7 +220,7 @@ impl FatVolume {
         block[32..64].copy_from_slice(&short_entry(b"..         ", 0, ATTR_DIR, parent_cluster, 0, time, date));
         self.write_clusters(&cluster, &block)?;
         self.link(st, &cluster)?;
-        self.add_entry(st, &parent, name, ATTR_DIR, cluster[0], 0)?;
+        self.add_entry(st, &parent, name, short_entry(&[b' '; 11], 0, ATTR_DIR, cluster[0], 0, time, date))?;
         self.finish(st)
     }
 
@@ -244,6 +244,53 @@ impl FatVolume {
         if e.cluster >= 2 {
             self.free_chain(st, e.cluster)?;
         }
+        self.finish(st)
+    }
+
+    /// Renames or moves the file or directory at `from` to `to`, on this
+    /// volume: only directory entries change, the data stays where it is.
+    /// The new name is written before the old one is deleted, so a crash in
+    /// between leaves two names for the same data (a disk check keeps one),
+    /// never none.
+    pub fn rename(&self, from: &str, to: &str) -> Res<()> {
+        if vfs::is_inside(to, from) {
+            return Err("can't move a folder into itself");
+        }
+        let st = &mut *self.state.lock();
+        let (src, name) = self.parent_of(st, from)?;
+        let raw = self.read_dir_raw(st, src.cluster)?.1;
+        let e = parse_dir(&raw).into_iter().find(|e| e.name.eq_ignore_ascii_case(name)).ok_or("file not found")?;
+        let (dst, new_name) = self.parent_of(st, to)?;
+        let same_dir = dst.cluster == src.cluster;
+        if same_dir && e.name == new_name {
+            return Ok(());
+        }
+        let taken = parse_dir(&self.read_dir_raw(st, dst.cluster)?.1).into_iter().find(|t| t.name.eq_ignore_ascii_case(new_name));
+        // Only the file itself may hold the name (changing just its case).
+        if taken.is_some_and(|t| !(same_dir && t.slot == e.slot)) {
+            return Err("already exists");
+        }
+        let body = slot_bytes(&raw, e.slot);
+        self.add_entry(st, &dst, new_name, body)?;
+        if e.is_dir && !same_dir && e.cluster >= 2 {
+            // Its ".." entry names the folder it is in (0 for the root).
+            let (chain, own) = self.read_dir_raw(st, e.cluster)?;
+            let mut dotdot = slot_bytes(&own, 1);
+            if &dotdot[0..11] == b"..         " {
+                set_cluster(&mut dotdot, if dst.cluster == self.root_cluster { 0 } else { dst.cluster });
+                self.put_slots(&chain, 1, &dotdot)?;
+            }
+        }
+        // Re-read: adding the new name may have grown the directory.
+        let (chain, raw) = self.read_dir_raw(st, src.cluster)?;
+        let first = e.slot - e.lfn;
+        let mut slots = Vec::with_capacity(32 * (e.lfn as usize + 1));
+        for s in first..=e.slot {
+            let mut b = slot_bytes(&raw, s);
+            b[0] = 0xE5;
+            slots.extend_from_slice(&b);
+        }
+        self.put_slots(&chain, first, &slots)?;
         self.finish(st)
     }
 
@@ -595,7 +642,9 @@ impl FatVolume {
 
     /// Adds a name to directory `parent`, with long-name entries when the
     /// name is not a plain 8.3 one, growing the directory if it is full.
-    fn add_entry(&self, st: &mut State, parent: &DirEntry, name: &str, attr: u8, cluster: u32, size: u32) -> Res<()> {
+    /// `body` is the 8.3 entry to store (attributes, times, cluster, size);
+    /// its name and case bytes are filled in here.
+    fn add_entry(&self, st: &mut State, parent: &DirEntry, name: &str, mut body: [u8; 32]) -> Res<()> {
         let (mut chain, raw) = self.read_dir_raw(st, parent.cluster)?;
         let existing: Vec<[u8; 11]> = parse_dir(&raw).iter().map(|e| e.short).collect();
         let (short, case, lfn) = match exact_short(name) {
@@ -605,12 +654,13 @@ impl FatVolume {
                 (short, 0, lfn_entries(name, checksum(&short)))
             }
         };
-        let (time, date) = timestamp();
+        body[0..11].copy_from_slice(&short);
+        body[12] = case;
         let mut slots = Vec::with_capacity(lfn.len() * 32 + 32);
         for l in &lfn {
             slots.extend_from_slice(l);
         }
-        slots.extend_from_slice(&short_entry(&short, case, attr, cluster, size, time, date));
+        slots.extend_from_slice(&body);
 
         // A run of free slots long enough; past the end marker every slot is free.
         let need = slots.len() / 32;
@@ -993,5 +1043,8 @@ impl vfs::Volume for FatVolume {
     }
     fn undelete(&self, path: &str, slot: u32) -> Res<String> {
         FatVolume::undelete(self, path, slot)
+    }
+    fn rename(&self, from: &str, to: &str) -> Res<()> {
+        FatVolume::rename(self, from, to)
     }
 }
