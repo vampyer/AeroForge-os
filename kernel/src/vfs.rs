@@ -68,6 +68,18 @@ pub trait Volume: Send + Sync {
     fn undelete(&self, _path: &str, _slot: u32) -> Result<String, &'static str> {
         Err("not supported on this kind of volume")
     }
+    /// Reads up to `len` bytes of a file from byte `offset` (fewer at its
+    /// end). The default reads the file from its start.
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, &'static str> {
+        let end = offset.checked_add(len as u64).ok_or("bad offset")?;
+        let all = self.read_file(path, usize::try_from(end).map_err(|_| "bad offset")?)?;
+        Ok(all.get(offset as usize..).map_or(Vec::new(), |d| d.to_vec()))
+    }
+    /// Adds `data` to the end of an existing file, so big files can be
+    /// written a piece at a time.
+    fn append(&self, _path: &str, _data: &[u8]) -> Result<(), &'static str> {
+        Err("not supported on this kind of volume")
+    }
     /// Renames or moves a file or directory within the volume, without
     /// copying its data.
     fn rename(&self, _from: &str, _to: &str) -> Result<(), &'static str> {
@@ -214,6 +226,21 @@ fn resolve_entry(path: &str) -> Result<(Arc<Mount>, &str), &'static str> {
         return Err("bad file name");
     }
     Ok((m, inner))
+}
+
+/// Up to `len` bytes of a file from byte `offset`.
+pub fn read_at(path: &str, offset: u64, len: usize) -> Result<Vec<u8>, &'static str> {
+    let (m, inner) = resolve(path)?;
+    m.vol.read_at(inner, offset, len)
+}
+
+/// Adds `data` to the end of an existing file.
+pub fn append(path: &str, data: &[u8]) -> Result<(), &'static str> {
+    let (m, inner) = resolve_entry(path)?;
+    if m.vol.read_only() {
+        return Err("read-only volume");
+    }
+    m.vol.append(inner, data)
 }
 
 /// Creates the file at `path`, or replaces what it holds.

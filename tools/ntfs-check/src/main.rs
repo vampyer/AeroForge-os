@@ -75,6 +75,8 @@ mod vfs {
         fn create_dir(&self, path: &str) -> Result<(), &'static str>;
         fn remove(&self, path: &str) -> Result<(), &'static str>;
         fn rename(&self, from: &str, to: &str) -> Result<(), &'static str>;
+        fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, &'static str>;
+        fn append(&self, path: &str, data: &[u8]) -> Result<(), &'static str>;
     }
     pub fn is_inside(path: &str, dir: &str) -> bool {
         let (path, dir) = (path.trim_matches('/'), dir.trim_matches('/'));
@@ -98,7 +100,8 @@ fn main() {
     let v = ntfs::NtfsVolume::mount(dev).unwrap();
     println!("unclean: {:?}", v.unclean());
     println!("writable: {:?}", v.set_writable(true));
-    // Commands from stdin: w path size seed | d path | m path | r path | l path
+    // Commands from stdin: w path size seed | a path start,end seed | p path offset,len seed
+    // | d path | m path | r path | l path
     let mut line = String::new();
     while { line.clear(); std::io::stdin().read_line(&mut line).unwrap() > 0 } {
         let parts: Vec<&str> = line.trim_end().splitn(4, '|').collect();
@@ -108,6 +111,21 @@ fn main() {
                 let seed: u8 = parts[3].parse().unwrap();
                 let data: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect();
                 v.write_file(parts[1], &data).map(|_| String::new())
+            }
+            "a" | "p" => {
+                let (a, b) = parts[2].split_once(',').unwrap();
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                let seed: u8 = parts[3].parse().unwrap();
+                let byte = |i: usize| (i as u8).wrapping_mul(31).wrapping_add(seed);
+                if parts[0] == "a" {
+                    let data: Vec<u8> = (a..b).map(byte).collect();
+                    v.append(parts[1], &data).map(|_| String::new())
+                } else {
+                    v.read_at(parts[1], a as u64, b).map(|d| {
+                        let ok = d.iter().enumerate().all(|(i, &x)| x == byte(a + i));
+                        format!("{} bytes{}", d.len(), if ok { ", as written" } else { ", DIFFERS" })
+                    })
+                }
             }
             "d" => v.remove(parts[1]).map(|_| String::new()),
             "n" => v.rename(parts[1], parts[2]).map(|_| String::new()),

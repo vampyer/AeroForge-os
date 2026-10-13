@@ -86,7 +86,14 @@ make iso >/dev/null
 mcopy -o -i build/disk.img@@1M build/session.cfg ::/system/session.cfg
 ./tools/make-sata-disk.sh >/dev/null 2>&1
 ./tools/make-usb-disk.sh >/dev/null 2>&1
-./tools/make-usb-disk.sh build/usb2.img HOTSTICK tools/usb2-files exfat >/dev/null 2>&1
+# A file too big for one read or write (over 8 MiB, not a whole number of
+# clusters), for the copy tests: on C: for the desktop, and on the stick
+# plugged in later for the shell.
+python3 -c 'import hashlib, sys; n = 12 * 1024 * 1024 + 12345
+sys.stdout.buffer.write(b"".join(hashlib.sha256(i.to_bytes(4, "little")).digest() for i in range(n // 32 + 1))[:n])' > build/Big.bin
+mcopy -o -i build/disk.img@@1M build/Big.bin ::/Big.bin
+rm -rf build/usb2-files && cp -r tools/usb2-files build/usb2-files && cp build/Big.bin build/usb2-files/Games/Big.bin
+./tools/make-usb-disk.sh build/usb2.img HOTSTICK build/usb2-files exfat >/dev/null 2>&1
 ./tools/make-ntfs-disk.sh >/dev/null
 cc -O2 -Wall -o build/fakebt tools/fakebt/fakebt.c -lusbredirparser -lm
 FAKEBT_LOG=build/fakebt.log
@@ -142,8 +149,11 @@ fail() {
 type_keys() { python3 tools/qemu-type.py build/qemu-monitor.sock "$1"; }
 # Shell commands for the exFAT stick, each with the output that ends it
 # (the success line, or the error line, which starts with the path).
-EXFAT_CMDS=('wc /usb1p1/AeroForge-OS-Design.md')
-EXFAT_WAIT=('fd53da30847dce45  /usb1p1/AeroForge-OS-Design.md\|  /usb1p1/AeroForge-OS-Design.md: ')
+EXFAT_CMDS=('wc /usb1p1/AeroForge-OS-Design.md' 'wc /usb1p1/Games/Big.bin' 'cp /usb1p1/Games/Big.bin /sata0p1/Big.bin'
+    'cp /sata0p1/Big.bin "/usb1p1/Big copy.bin"' 'wc /usb1p1/Big copy.bin' 'wc /sata0p1/Big.bin')
+EXFAT_WAIT=('fd53da30847dce45  /usb1p1/AeroForge-OS-Design.md\|  /usb1p1/AeroForge-OS-Design.md: '
+    '  /usb1p1/Games/Big.bin' 'copied [0-9]* bytes from /usb1p1/Games/Big.bin\|  /usb1p1/Games/Big.bin: '
+    'copied [0-9]* bytes from /sata0p1/Big.bin\|  /sata0p1/Big.bin: ' '  /usb1p1/Big copy.bin' '  /sata0p1/Big.bin')
 for n in 4 5 6 7 8; do
     EXFAT_CMDS+=("write \"/usb1p1/Games/Saves/Level $n checkpoint.sav\" checkpoint=lava-$n")
     EXFAT_WAIT+=("bytes to /usb1p1/Games/Saves/Level $n checkpoint.sav\|  /usb1p1/Games/Saves/Level $n checkpoint.sav: ")
@@ -158,7 +168,8 @@ NTFS_CMDS=('ls /sata1p1' 'ls /sata1p1/Photos' 'cat /sata1p1/users/player/saved g
     'wc /sata1p1/Program Files/AeroForge/manual.md' 'wc /sata1p1/fragmented.bin' 'wc /sata1p1/interleaved.bin'
     'wc /sata1p1/sparse.bin' 'cat /sata1p1/Packed/squeezed.txt' 'write /sata1p1/new.txt hello'
     'writable /sata1p1 on' 'write /sata1p1/new.txt hello from AeroForge'
-    'write "/sata1p1/users/player/saved games/level 9.sav" checkpoint=castle-10' 'mkdir /sata1p1/AeroForge Saves'
+    'write "/sata1p1/users/player/saved games/level 9.sav" checkpoint=castle-10' 'cp /sata0p1/Big.bin /sata1p1/Big.bin'
+    'wc /sata1p1/Big.bin' 'mkdir /sata1p1/AeroForge Saves'
     'rm /sata1p1/fragmented.bin' 'mv /sata1p1/README.TXT /sata1p1/ReadMe.txt'
     'mv "/sata1p1/users/player/saved games" "/sata1p1/AeroForge Saves/Saved Games"' 'mv /sata1p1/new.txt /usb0p1/new.txt'
     'cat /sata1p1/new.txt')
@@ -166,7 +177,8 @@ NTFS_WAIT=('  Café ☕.txt\|  /sata1p1: ' '  IMG_0300.JPG\|  /sata1p1/Photos: '
     '  /sata1p1/Program Files/AeroForge/manual.md' '  /sata1p1/fragmented.bin' '  /sata1p1/interleaved.bin'
     '  /sata1p1/sparse.bin' '  /sata1p1/Packed/squeezed.txt: ' '  /sata1p1/new.txt: '
     '  /sata1p1 is writable\|  /sata1p1: ' 'bytes to /sata1p1/new.txt\|  /sata1p1/new.txt: '
-    'bytes to /sata1p1/users/player/saved games/level 9.sav\|  /sata1p1/users/player/saved games/level 9.sav: ' 'created directory /sata1p1/AeroForge Saves\|  /sata1p1/AeroForge Saves: '
+    'bytes to /sata1p1/users/player/saved games/level 9.sav\|  /sata1p1/users/player/saved games/level 9.sav: '
+    'bytes from /sata0p1/Big.bin to /sata1p1\|  /sata0p1/Big.bin: ' '  /sata1p1/Big.bin' 'created directory /sata1p1/AeroForge Saves\|  /sata1p1/AeroForge Saves: '
     'deleted /sata1p1/fragmented.bin\|  /sata1p1/fragmented.bin: ' 'moved /sata1p1/README.TXT\|  /sata1p1/README.TXT: '
     'moved /sata1p1/users/player/saved games\|  /sata1p1/users/player/saved games: ' '  /sata1p1/new.txt: '
     'hello from AeroForge\|  /sata1p1/new.txt: ')
@@ -487,7 +499,25 @@ for _ in $(seq "$TIMEOUT"); do
         point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=panescopy
     elif [ $STAGE = panescopy ] && grep -q "\[desktop\] \(pasted /README.TXT as /docs/\|copy failed\|Can't\)" "$LOG"; then
         sleep 1; monitor "screendump build/gop-panes.ppm"
-        # The preview pane (Alt+P) on README.TXT, still selected: its text, then its bytes.
+        # A 12 MB file copied over, with the progress window up part way:
+        # on the left, still in use, Big.bin is the row above README.TXT.
+        monitor "sendkey end"; sleep 0.3; monitor "sendkey up"; sleep 0.5
+        XY=$(grep -ao "Copy > at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=bigcopy
+    elif [ $STAGE = bigcopy ] && grep -q "\[desktop\] \(pasted /Big.bin as /docs/Big.bin\|paste failed\|Can't\)" "$LOG"; then
+        # Again with Ctrl+C, Tab and Ctrl+V, the pointer waiting on Cancel,
+        # pressed as soon as the window is up.
+        XY=$(grep -ao "copying window up: .* Cancel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; type_keys $'\x03'; sleep 0.5; monitor "sendkey tab"; sleep 0.5
+        # The button goes down once the copy has started, before the window
+        # is up, and is held until Cancel takes it.
+        point_at "${XY%,*}" "${XY#*,}"; type_keys $'\x16'; sleep 0.3; monitor "mouse_button 1"; STAGE=bigcancel
+    elif [ $STAGE = bigcancel ] && grep -q "\[desktop\] \(Cancel pressed\|pasted /Big.bin as /docs/Big - Copy\|paste failed\)" "$LOG"; then
+        monitor "mouse_button 0"; STAGE=bigcancelled
+    elif [ $STAGE = bigcancelled ] && grep -q "\[desktop\] \(paste cancelled at\|pasted /Big.bin as /docs/Big - Copy\|paste failed\)" "$LOG"; then
+        # Back to the left (Tab), where README.TXT is the last row.
+        sleep 1; monitor "sendkey tab"; sleep 0.5; monitor "sendkey end"; sleep 0.5
+        # The preview pane (Alt+P) on README.TXT: its text, then its bytes.
         monitor "sendkey alt-p"; STAGE=preview
     elif [ $STAGE = preview ] && grep -q "\[desktop\] preview of /README.TXT: " "$LOG"; then
         XY=$(grep -ao "Hex at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
@@ -673,7 +703,7 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "network info, DNS lookups or the TCP server did not work" build/echo-server.log; }
         grep -q "host client: got .*: OK" build/echo-server.log || { fail "the host's client did not get nettest's server's answer" build/echo-server.log; }
         grep -q "^  0 program socket(s) open" "$LOG" || { fail "nettest's sockets were not closed after it exited"; }
-        grep -q "\[smbtest\] sign-in, list, read, write, folders, rename and delete on an SMB share: OK" "$LOG" \
+        grep -q "\[smbtest\] sign-in, list, read, write, append, read part, folders, rename and delete on an SMB share: OK" "$LOG" \
             || { fail "the SMB client could not use the Samba share" build/samba/smbd.log; }
         grep -q "\[desktop\] mapped \\\\\\\\10.0.2.2:4450\\\\aero as Z: signed in as aerotest" "$LOG" \
             || { fail "Map network drive did not sign in to the Samba share" build/samba/smbd.log; }
@@ -748,6 +778,14 @@ for _ in $(seq "$TIMEOUT"); do
             && grep -q "\[desktop\] two panes: left = Computer, right = Computer, left in use" "$LOG" \
             && grep -q "\[desktop\] two panes: left = C:/, right = C:/docs, left in use" "$LOG" \
             || { fail "Ctrl+T did not open a second tab, or it did not split into C:/ and C:/docs"; }
+        grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \
+            && grep -q "\[desktop\] pasted /Big.bin as /docs/Big.bin (1 file)" "$LOG" \
+            && mtype -i build/disk.img@@1M ::/docs/Big.bin | cmp -s - build/Big.bin \
+            || { fail "the desktop did not copy a 12 MB file whole, with its progress window"; }
+        grep -q "\[desktop\] Cancel pressed with [0-9]* of 12595257 bytes copied" "$LOG" \
+            && grep -q "\[desktop\] paste cancelled at /Big.bin" "$LOG" \
+            && ! mdir -i build/disk.img@@1M "::/docs/Big - Copy.bin" >/dev/null 2>&1 \
+            || { fail "Cancel did not stop a copy and take away the part copied"; }
         grep -q "\[desktop\] copying 1 item to the other side, /docs" "$LOG" \
             && grep -q "\[desktop\] pasted /README.TXT as /docs/README.TXT (1 file)" "$LOG" \
             && grep -q "\[desktop\] Computer: /docs = .*README.TXT.*; first row at" "$LOG" \
@@ -838,6 +876,15 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "created directory /usb1p1/Music" "$LOG" || { fail "creating a folder on the exFAT stick failed"; }
         grep -q "moved /usb1p1/Games/Saves/Level 8 checkpoint.sav to /usb1p1/Music/Level 8 moved.sav" "$LOG" \
             && grep -q "moved /usb1p1/Music to /usb1p1/Tunes" "$LOG" || { fail "moving a file and renaming a folder on the exFAT stick failed"; }
+        # Big copies: exFAT to FAT32, FAT32 to exFAT and FAT32 to NTFS, a megabyte at a time.
+        BIG=$(grep -o "12595257 bytes, [0-9]* lines, fnv1a [0-9a-f]*  /usb1p1/Games/Big.bin" "$LOG" | cut -d' ' -f1-6)
+        [ -n "$BIG" ] || { fail "a file over 8 MiB on the exFAT stick did not read back"; }
+        grep -q "copied 12595257 bytes from /usb1p1/Games/Big.bin to /sata0p1/Big.bin" "$LOG" \
+            && grep -q "copied 12595257 bytes from /sata0p1/Big.bin to /usb1p1/Big copy.bin" "$LOG" \
+            && grep -q "copied 12595257 bytes from /sata0p1/Big.bin to /sata1p1/Big.bin" "$LOG" || { fail "copying a file over 8 MiB between drives failed"; }
+        for f in "/usb1p1/Big copy.bin" /sata0p1/Big.bin /sata1p1/Big.bin; do
+            grep -qF "$BIG  $f" "$LOG" || { fail "the copy at $f did not read back the same as the original"; }
+        done
         grep -q "USB disk usb1 unplugged, /usb1p1 unmounted" "$LOG" || { fail "the unplugged USB stick was not unmounted"; }
         grep -q "  /usb1p1: " "$LOG" || { fail "the unplugged USB stick's files were still reachable"; }
         for d in nvme0 sata0 usb0; do
@@ -879,6 +926,7 @@ for _ in $(seq "$TIMEOUT"); do
         ntfsfix -n build/ntfs-after.img >/dev/null && ntfsresize -i -f build/ntfs-after.img >/dev/null 2>&1 \
             && [ "$(ntfsinfo -m build/ntfs-after.img | grep -o "Volume Flags: 0x[0-9a-f]*")" = "Volume Flags: 0x0000" ] \
             || { fail "ntfsprogs found the NTFS volume damaged or left dirty after AeroForge wrote to it"; }
+        ntfscat build/ntfs-after.img /Big.bin | cmp -s - build/Big.bin || { fail "ntfscat did not find the 12 MB copy on the NTFS drive the same as the original"; }
         [ "$(ntfscat build/ntfs-after.img /new.txt)" = "hello from AeroForge" ] \
             && [ "$(ntfscat build/ntfs-after.img "/AeroForge Saves/Saved Games/Level 9.sav")" = "checkpoint=castle-10" ] \
             && ! ntfsls -p /Users/Player build/ntfs-after.img | grep -q "Saved Games" \

@@ -91,6 +91,7 @@ impl Shell {
                 kprintln!("  mkdir <path>  create a directory");
                 kprintln!("  rm <path>   delete a file or an empty directory");
                 kprintln!("  mv <path> <new path>  rename or move on the same drive (quote paths with spaces)");
+                kprintln!("  cp <path> <new path>  copy a file of any size, a megabyte at a time");
                 kprintln!("  writable <drive> on|off  allow changes to an NTFS drive (Windows must have shut it down fully)");
                 kprintln!("  wc <path>   size, lines and FNV-1a checksum of a file");
                 kprintln!("  mem         buddy allocator, slab heap and paging");
@@ -411,6 +412,13 @@ impl Shell {
                 },
                 None => console::print_colored(YELLOW, format_args!("  usage: mv <path> <new path>\n")),
             },
+            "cp" => match two_paths(arg) {
+                Some((from, to)) => match copy_file(from, to) {
+                    Ok(n) => kprintln!("  copied {} bytes from {} to {}", n, from, to),
+                    Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", from, e)),
+                },
+                None => console::print_colored(YELLOW, format_args!("  usage: cp <path> <new path>\n")),
+            },
             "rm" => match vfs::remove(arg) {
                 Ok(()) => kprintln!("  deleted {}", arg),
                 Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
@@ -452,12 +460,8 @@ impl Shell {
                 }
                 Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
             },
-            "wc" => match vfs::read(arg, usize::MAX) {
-                Ok(data) => {
-                    let lines = data.iter().filter(|&&b| b == b'\n').count();
-                    let hash = data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-                    kprintln!("  {} bytes, {} lines, fnv1a {:016x}  {}", data.len(), lines, hash, arg);
-                }
+            "wc" => match count_file(arg) {
+                Ok((bytes, lines, hash)) => kprintln!("  {} bytes, {} lines, fnv1a {:016x}  {}", bytes, lines, hash, arg),
                 Err(e) => console::print_colored(YELLOW, format_args!("  {}: {}\n", arg, e)),
             },
             "irq" => {
@@ -545,6 +549,41 @@ pub fn print_usb() {
 }
 
 /// Two paths, each either "quoted" (so it can hold spaces) or one word.
+/// How much `cp` and `wc` read at a time.
+const CHUNK: usize = 1024 * 1024;
+
+/// Copies a file a piece at a time: the first piece replaces or creates
+/// `to`, the rest are added to its end. Returns the bytes copied.
+fn copy_file(from: &str, to: &str) -> Result<u64, &'static str> {
+    let mut at = 0u64;
+    loop {
+        let piece = vfs::read_at(from, at, CHUNK)?;
+        if at == 0 {
+            vfs::write(to, &piece)?;
+        } else if !piece.is_empty() {
+            vfs::append(to, &piece)?;
+        }
+        at += piece.len() as u64;
+        if piece.len() < CHUNK {
+            return Ok(at);
+        }
+    }
+}
+
+/// Size, lines and FNV-1a checksum of a file, read a piece at a time.
+fn count_file(path: &str) -> Result<(u64, usize, u64), &'static str> {
+    let (mut at, mut lines, mut hash) = (0u64, 0, 0xcbf2_9ce4_8422_2325u64);
+    loop {
+        let piece = vfs::read_at(path, at, CHUNK)?;
+        lines += piece.iter().filter(|&&b| b == b'\n').count();
+        hash = piece.iter().fold(hash, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        at += piece.len() as u64;
+        if piece.len() < CHUNK {
+            return Ok((at, lines, hash));
+        }
+    }
+}
+
 fn two_paths(arg: &str) -> Option<(&str, &str)> {
     fn one(s: &str) -> Option<(&str, &str)> {
         let s = s.trim_start();

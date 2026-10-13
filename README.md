@@ -470,7 +470,7 @@ sort with a click. New folder, Cut, Copy, Paste, Rename and Delete are on its co
 (Ctrl+N, Ctrl+X, Ctrl+C, Ctrl+V, F2, Delete; arrows, Home, End, Page Up and Down, Enter, Backspace and F5
 work too). Deleting moves things to the drive's Recycle Bin (a "Recycle Bin" folder at its root, with an
 `info.txt` saying where each one came from), where they can be restored or deleted for good; Ctrl+Z puts
-back the last thing deleted. NTFS drives stay read-only (until 0.57). Copies are limited to 8 MB a file for now (moves on one drive are not, since 0.58). Keys
+back the last thing deleted. NTFS drives stay read-only (until 0.57). Copies were limited to 8 MB a file until 0.59. Keys
 with no character (arrows, Delete, F2, F5) now reach programs that own the screen, and an empty file can
 be saved. The boot test makes, renames and fills a folder, deletes to the Recycle Bin, undoes it and
 deletes for good, then checks the disk image with mtools.
@@ -555,6 +555,21 @@ Also since 0.58 AeroForge goes straight to the desktop: aerosmss starts it once 
 desktop` brings it back. A line `console` in session.cfg keeps the machine at the console instead (the
 boot test adds one, as it types at the console first); the display test checks that the desktop comes up
 on its own.
+
+Since 0.59 copies have no size limit. Files are read and written a megabyte at a time: two new system
+calls read part of a file (60, `file_read_at`) and add to the end of one (61, `file_append`), on FAT32,
+exFAT and NTFS, and the SMB client reads from an offset and appends the same way. FAT32 and exFAT keep
+their place in a file's cluster chain between pieces, so a big copy doesn't walk the chain from the start
+each time; an exFAT file kept in one piece is turned into a chained one if it can't grow in place. On NTFS
+a file grows by taking only the clusters it needs, with its runs and sizes updated in its record. Copying,
+pasting and dragging between drives in the file manager shows a progress window (megabytes copied, a
+green bar, the file being copied) once a copy takes a moment, and Cancel stops it, deleting the part of
+the file it was on; a move that is cancelled leaves the original where it was. The shell has `cp`, and
+`wc` now reads files a piece at a time. The boot test copies a 12 MB file from the exFAT stick to a FAT32
+disk, back to the stick and on to the NTFS drive from the shell, and in the file manager copies one with
+the progress window up, then cancels a second copy, checking every copy with mtools, `tools/exfat.py` and
+ntfscat; `tools/ntfs-write-test.sh` adds to files a piece at a time (including two that grow in turns, so
+their clusters interleave) and reads pieces back.
 
 | Area | Status |
 |---|---|

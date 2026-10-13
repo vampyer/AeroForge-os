@@ -57,6 +57,9 @@ struct State {
     free: u32,
     next_free: u32,
     fat_cache: Option<(u64, Vec<u8>)>,
+    /// A chained file's first cluster, a cluster's place in it and the
+    /// cluster: where the last piece read or added was.
+    cursor: Option<(u32, u32, u32)>,
 }
 
 /// Where a file's or directory's data lives.
@@ -136,6 +139,7 @@ impl ExfatVolume {
                 free: 0,
                 next_free: 2,
                 fat_cache: None,
+                cursor: None,
             }),
         };
         if !vol.valid(vol.root_cluster) {
@@ -360,6 +364,146 @@ impl ExfatVolume {
         }
         self.put_set(st, &old)?;
         self.finish(st)
+    }
+
+    /// Up to `len` bytes of a file from byte `offset`.
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Res<Vec<u8>> {
+        let st = &mut *self.state.lock();
+        let e = self.lookup(st, path)?;
+        if e.is_dir() {
+            return Err("is a directory");
+        }
+        let s = e.stream;
+        if offset >= s.len || len == 0 {
+            return Ok(Vec::new());
+        }
+        let len = (len as u64).min(s.len - offset) as usize;
+        let cb = self.cluster_bytes() as u64;
+        let (first, last) = ((offset / cb) as u32, ((offset + len as u64 - 1) / cb) as u32);
+        let mut clusters = Vec::with_capacity((last - first + 1) as usize);
+        let mut c = self.cluster_at(st, &s, first)?;
+        clusters.push(c);
+        for i in first + 1..=last {
+            c = if s.contiguous { s.first + i } else { self.fat_get(st, c)? };
+            if !self.valid(c) {
+                return Err("cluster chain is broken");
+            }
+            clusters.push(c);
+        }
+        if !s.contiguous {
+            st.cursor = Some((s.first, last, c));
+        }
+        let skip = (offset % cb) as usize;
+        let mut out = self.read_clusters(&clusters, skip + len)?;
+        out.drain(..skip);
+        // Past the valid data length reads as zeros.
+        if offset + len as u64 > s.valid {
+            let keep = s.valid.saturating_sub(offset) as usize;
+            out[keep..].fill(0);
+        }
+        Ok(out)
+    }
+
+    /// Adds `data` to the end of a file: its data first (the free part of
+    /// its last cluster, then new clusters, chained or still in one piece),
+    /// the bitmap, then the bigger size in its entry set.
+    fn append(&self, path: &str, data: &[u8]) -> Res<()> {
+        let st = &mut *self.state.lock();
+        let (parent, name) = self.parent_of(st, path)?;
+        let mut e = self.read_dir(st, &parent.stream)?.1
+            .into_iter()
+            .find(|e| self.same_name(&e.name, name))
+            .ok_or("file not found")?;
+        if e.is_dir() {
+            return Err("is a directory");
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let s = e.stream;
+        if s.valid < s.len {
+            return Err("can't add to a file with unwritten space at its end");
+        }
+        let cb = self.cluster_bytes();
+        let new_len = s.len + data.len() as u64;
+        let stream = if s.first == 0 || s.len == 0 {
+            if s.first != 0 {
+                self.release(st, &s)?;
+            }
+            let new = self.allocate(st, data.len().div_ceil(cb) as u32)?;
+            self.claim(st, &new, data)?
+        } else {
+            let n = ((s.len - 1) / cb as u64) as u32;
+            let last = self.cluster_at(st, &s, n)?;
+            let fill = (s.len % cb as u64) as usize;
+            let mut used = 0;
+            if fill != 0 {
+                used = (cb - fill).min(data.len());
+                let mut buf = vec![0u8; cb];
+                self.dev.read(self.cluster_lba(last), &mut buf)?;
+                buf[fill..fill + used].copy_from_slice(&data[..used]);
+                self.dev.write(self.cluster_lba(last), &buf)?;
+            }
+            let rest = &data[used..];
+            let mut contiguous = s.contiguous;
+            if !rest.is_empty() {
+                let new = self.allocate(st, rest.len().div_ceil(cb) as u32)?;
+                self.write_clusters(&new, rest)?;
+                let follows = new[0] == last + 1 && new.windows(2).all(|w| w[1] == w[0] + 1);
+                if !(s.contiguous && follows) {
+                    // Chained from now on: link what was in one piece, then the new ones.
+                    let mut links: Vec<(u32, u32)> = Vec::new();
+                    if s.contiguous {
+                        links.extend((s.first..last).map(|c| (c, c + 1)));
+                    }
+                    links.push((last, new[0]));
+                    links.extend(new.iter().enumerate().map(|(i, &c)| (c, new.get(i + 1).copied().unwrap_or(EOC))));
+                    self.fat_set(st, links)?;
+                    contiguous = false;
+                }
+                for &c in &new {
+                    self.mark(st, c, true);
+                }
+                let l = *new.last().unwrap();
+                st.next_free = if l + 1 >= self.clusters + 2 { 2 } else { l + 1 };
+                self.write_bitmap(st)?;
+                if !contiguous {
+                    st.cursor = Some((s.first, ((new_len - 1) / cb as u64) as u32, l));
+                }
+            }
+            Stream { first: s.first, len: new_len, valid: new_len, contiguous }
+        };
+        e.stream = stream;
+        e.attrs |= ATTR_ARCHIVE;
+        let now = timestamp();
+        e.raw[4..6].copy_from_slice(&e.attrs.to_le_bytes());
+        e.raw[12..16].copy_from_slice(&now.to_le_bytes()); // modified
+        e.raw[16..20].copy_from_slice(&now.to_le_bytes()); // accessed
+        e.raw[21] = 0;
+        self.put_set(st, &e)?;
+        self.finish(st)
+    }
+
+    /// The `n`th cluster of a file, walking a chain on from the last place
+    /// read or written when that is on the way.
+    fn cluster_at(&self, st: &mut State, s: &Stream, n: u32) -> Res<u32> {
+        if s.contiguous {
+            let c = s.first.checked_add(n).ok_or("file outside the volume")?;
+            return if self.valid(c) { Ok(c) } else { Err("file outside the volume") };
+        }
+        let (mut i, mut c) = match st.cursor {
+            Some((f, i, c)) if f == s.first && i <= n && self.valid(c) => (i, c),
+            _ => (0, s.first),
+        };
+        while i < n {
+            c = self.fat_get(st, c)?;
+            if !self.valid(c) {
+                return Err("cluster chain is broken");
+            }
+            i += 1;
+        }
+        st.cursor = Some((s.first, n, c));
+        Ok(c)
     }
 
     // ----------------------------------------------------------- lookups
@@ -652,6 +796,7 @@ impl ExfatVolume {
     }
 
     fn release(&self, st: &mut State, s: &Stream) -> Res<()> {
+        st.cursor = None;
         for c in self.clusters_of(st, s)? {
             self.mark(st, c, false);
         }
@@ -838,6 +983,12 @@ impl vfs::Volume for ExfatVolume {
     }
     fn rename(&self, from: &str, to: &str) -> Res<()> {
         ExfatVolume::rename(self, from, to)
+    }
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Res<Vec<u8>> {
+        ExfatVolume::read_at(self, path, offset, len)
+    }
+    fn append(&self, path: &str, data: &[u8]) -> Res<()> {
+        ExfatVolume::append(self, path, data)
     }
     fn remove(&self, path: &str) -> Res<()> {
         self.delete(path)

@@ -130,10 +130,50 @@ ntfsls -p /Photos "$IMG" | grep -q "^renamed photo number 28 with" || fail "Linu
 cmp -s <(ntfscat "$IMG" "/Users/Player/again 5.jpg") <(python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + 5) & 255 for i in range(15000)))") \
     || fail "Linux does not read a moved file back the same"
 
-# 3. A change cut off half way leaves the volume dirty: no more writing
+# 4. Add to the end of files a piece at a time: a file that starts in its
+# record, one that gets clusters, and two that grow in turns, so their
+# clusters interleave. Then read pieces back from the middle and the end.
+{
+    echo "w|/grow.bin|100|6"
+    echo "a|/grow.bin|100,3000|6"
+    echo "a|/grow.bin|3000,1500000|6"
+    echo "a|/grow.bin|1500000,1500001|6"
+    echo "w|/turns a.bin|0|7"
+    echo "w|/turns b.bin|5000|8"
+    for i in $(seq 0 19); do
+        echo "a|/turns a.bin|$((i * 9000)),$((i * 9000 + 9000))|7"
+        echo "a|/turns b.bin|$((5000 + i * 7000)),$((5000 + i * 7000 + 7000))|8"
+    done
+    echo "a|/Packed/squeezed.txt|10,20|1"
+    echo "c|/grow.bin|1500001|6"
+    echo "c|/turns a.bin|180000|7"
+    echo "c|/turns b.bin|145000|8"
+    echo "p|/grow.bin|1499990,100|6"
+    echo "p|/grow.bin|4000,8192|6"
+    echo "p|/turns b.bin|0,10|8"
+    echo "p|/grow.bin|2000000,10|6"
+    echo "v|/"
+} | run
+grep -q "^c /grow.bin: holds what was written" build/ntfs-write-test.log \
+    && grep -q "^c /turns a.bin: holds what was written" build/ntfs-write-test.log \
+    && grep -q "^c /turns b.bin: holds what was written" build/ntfs-write-test.log || fail "a file added to did not read back"
+grep -q "^p /grow.bin: 11 bytes, as written" build/ntfs-write-test.log && grep -q "^p /grow.bin: 8192 bytes, as written" build/ntfs-write-test.log \
+    && grep -q "^p /turns b.bin: 10 bytes, as written" build/ntfs-write-test.log && grep -q "^p /grow.bin: 0 bytes, as written" build/ntfs-write-test.log \
+    || fail "reading part of a file gave the wrong bytes"
+grep -q "^a /Packed/squeezed.txt: ERROR compressed" build/ntfs-write-test.log || fail "adding to a compressed file was not refused"
+grep -q "^v /: 104 names, all in order" build/ntfs-write-test.log || fail "a folder index is out of order after adding to files"
+! grep -q "ERROR" <(sed -n '/^p \/grow.bin\|^c \/grow.bin\|^a /p' build/ntfs-write-test.log | grep -v squeezed) || fail "adding to a file failed"
+checked "adding to files"
+for f in "grow.bin|1500001|6" "turns a.bin|180000|7" "turns b.bin|145000|8"; do
+    IFS='|' read -r name size seed <<< "$f"
+    cmp -s <(ntfscat "$IMG" "/$name") <(python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + $seed) & 255 for i in range($size)))") \
+        || fail "Linux does not read /$name back the same"
+done
+
+# 5. A change cut off half way leaves the volume dirty: no more writing
 # until Windows has checked it.
 echo "x|/" | run
 "$CHECK" "$IMG" < /dev/null > build/ntfs-crash.log
 grep -q "^writable: Err(\"Windows has to check it first" build/ntfs-crash.log || { cat build/ntfs-crash.log; fail "writing was allowed on a volume left dirty"; }
 
-echo "PASS: the NTFS writer saved over files, made 180 files and a folder (index split, MFT grown), deleted 440 of them, renamed and moved files and a folder, refused compressed files, bad names and a dirty volume; ntfsfix and ntfsresize found nothing wrong"
+echo "PASS: the NTFS writer saved over files, made 180 files and a folder (index split, MFT grown), deleted 440 of them, renamed and moved files and a folder, added to files a piece at a time and read pieces back, refused compressed files, bad names and a dirty volume; ntfsfix and ntfsresize found nothing wrong"

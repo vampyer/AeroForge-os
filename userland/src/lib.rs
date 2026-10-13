@@ -72,6 +72,8 @@ pub mod sys {
     pub const UNDELETE: u64 = 57;
     pub const SET_WRITABLE: u64 = 58;
     pub const RENAME: u64 = 59;
+    pub const FILE_READ_AT: u64 = 60;
+    pub const FILE_APPEND: u64 = 61;
 }
 
 pub mod rights {
@@ -189,6 +191,21 @@ pub fn read_file(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
 pub fn write_file(path: &str, data: &[u8]) -> Result<usize, i64> {
     check(unsafe {
         syscall(sys::FILE_WRITE, path.as_ptr() as u64, path.len() as u64, data.as_ptr() as u64, data.len() as u64)
+    })
+    .map(|n| n as usize)
+}
+
+/// Reads part of a file, from byte `offset` on, into `buf` (at most 8 MiB);
+/// returns the bytes read, 0 at the end.
+pub fn read_file_at(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let args = [buf.as_mut_ptr() as u64, buf.len() as u64, offset];
+    check(unsafe { syscall(sys::FILE_READ_AT, path.as_ptr() as u64, path.len() as u64, args.as_ptr() as u64, 0) }).map(|n| n as usize)
+}
+
+/// Adds `data` (at most 8 MiB) to the end of an existing file.
+pub fn append_file(path: &str, data: &[u8]) -> Result<usize, i64> {
+    check(unsafe {
+        syscall(sys::FILE_APPEND, path.as_ptr() as u64, path.len() as u64, data.as_ptr() as u64, data.len() as u64)
     })
     .map(|n| n as usize)
 }
