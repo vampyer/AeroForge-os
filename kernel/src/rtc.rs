@@ -81,6 +81,52 @@ fn cmos(reg: u8) -> u8 {
     }
 }
 
+fn write_cmos(reg: u8, value: u8) {
+    unsafe {
+        arch::outb(0x70, 0x80 | reg);
+        arch::outb(0x71, value);
+    }
+}
+
+/// Sets the clock to `t` (local time). False if `t` is not a real date and
+/// time, or its year is outside 2000-2099.
+pub fn set(t: DateTime) -> bool {
+    let days = match t.month {
+        2 if t.year % 4 == 0 && (t.year % 100 != 0 || t.year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => 0,
+    };
+    if !(2000..=2099).contains(&t.year) || t.day == 0 || t.day > days || t.hour > 23 || t.minute > 59 || t.second > 59 {
+        return false;
+    }
+    arch::without_interrupts(|| {
+        let _cmos = CMOS.lock();
+        let status_b = cmos(0x0B);
+        let bcd = status_b & 0x04 == 0;
+        let enc = |v: u8| if bcd { (v / 10) << 4 | v % 10 } else { v };
+        // In 12-hour mode the hour is 1-12, with bit 7 for PM.
+        let hour = if status_b & 0x02 == 0 {
+            let h12 = match t.hour % 12 { 0 => 12, h => h };
+            enc(h12) | if t.hour >= 12 { 0x80 } else { 0 }
+        } else {
+            enc(t.hour)
+        };
+        // Hold the clock still (SET) while its fields change.
+        write_cmos(0x0B, status_b | 0x80);
+        write_cmos(0x00, enc(t.second));
+        write_cmos(0x02, enc(t.minute));
+        write_cmos(0x04, hour);
+        write_cmos(0x07, enc(t.day));
+        write_cmos(0x08, enc(t.month));
+        write_cmos(0x09, enc((t.year % 100) as u8));
+        write_cmos(0x32, enc((t.year / 100) as u8));
+        write_cmos(0x0B, status_b & !0x80);
+    });
+    true
+}
+
 fn read_raw() -> [u8; 7] {
     // Wait out an update in progress so the fields belong to the same second.
     for _ in 0..100_000 {

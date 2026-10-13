@@ -200,6 +200,17 @@ double_click() { fast_monitor "mouse_button 1" "mouse_button 0" "mouse_button 1"
 pane_row() { grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o " $1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 pane_arrow() { grep -a "\[desktop\] pane: " "$LOG" | tail -1 | grep -o " $1 at [0-9]*,[0-9]* ([>v] [0-9]*,[0-9]*)" | head -1 | grep -o "[0-9]*,[0-9]*)" | tr -d ')' | tr ',' ' '; }
 # Where the open right-click menu shows $1, from the latest "[desktop] menu: ..." line.
+# Where the Control Panel's page shows $1 ("Sound", "Mute", "Minute +"), from the
+# latest "[desktop] Control Panel <page>: name at x,y | ..." line; cp_bar gives
+# the point $2 thousandths along bar $1.
+cp_at() { grep -a "\[desktop\] Control Panel [A-Za-z ]*: " "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
+cp_bar() {
+    local xy; xy=$(grep -a "\[desktop\] Control Panel [A-Za-z ]*: " "$LOG" | tail -1 | grep -o "$1 bar at [0-9]*,[0-9]* to [0-9]*" | head -1)
+    local x0 y x1; read -r x0 y x1 <<< "$(echo "$xy" | sed 's/.* bar at \([0-9]*\),\([0-9]*\) to \([0-9]*\)/\1 \2 \3/')"
+    echo $((x0 + (x1 - x0) * $2 / 1000)) "$y"
+}
+cp_count() { grep -c "\[desktop\] Control Panel $1: " "$LOG" || true; }
+click() { monitor "mouse_button 1" "mouse_button 0"; }
 menu_item() { grep -a "\[desktop\] menu: " "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 # Where the desktop's Computer window shows the entry named $2 of folder $1,
 # from its latest "[desktop] Computer: <folder> = a | b; first row at x,y, rows h apart" line.
@@ -643,6 +654,75 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Calculator = key at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
         point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=deskcalcdone
     elif [ $STAGE = deskcalcdone ] && grep -q "\[desktop\] calculator: " "$LOG"; then
+        # Control Panel, from the right of the Start menu.
+        sleep 0.5; point_at 27 780; click; STAGE=cpmenu
+    elif [ $STAGE = cpmenu ] && grep -q "\[desktop\] Start menu open; Control Panel at " "$LOG"; then
+        XY=$(grep -ao "Start menu open; Control Panel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cphome
+    elif [ $STAGE = cphome ] && [ "$(cp_count "Control Panel")" -ge 1 ]; then
+        # Display: the Dusk background, and Large text (too small a screen here).
+        sleep 0.5; point_at $(cp_at Display); click; STAGE=cpdisplay
+    elif [ $STAGE = cpdisplay ] && [ "$(cp_count Display)" -ge 1 ]; then
+        sleep 0.5; point_at $(cp_at Dusk); click; STAGE=cpdusk
+    elif [ $STAGE = cpdusk ] && grep -q "\[desktop\] background: Dusk" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-cpanel.ppm"
+        point_at $(cp_at "Large size"); click; STAGE=cplarge
+    elif [ $STAGE = cplarge ] && grep -q "\[desktop\] text size: " "$LOG"; then
+        sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback1
+    elif [ $STAGE = cpback1 ] && [ "$(cp_count "Control Panel")" -ge 2 ]; then
+        # Sound: volume to half, a test sound (heard at a quarter of its
+        # level), mute on and off, then the volume back up.
+        sleep 0.5; point_at $(cp_at Sound); click; STAGE=cpsound
+    elif [ $STAGE = cpsound ] && [ "$(cp_count Sound)" -ge 1 ]; then
+        sleep 0.5; point_at $(cp_bar Volume 500); click; STAGE=cpvol
+    elif [ $STAGE = cpvol ] && grep -q "\[desktop\] volume 50%" "$LOG"; then
+        sleep 0.5; point_at $(cp_at TestSound); click; STAGE=cptest
+    elif [ $STAGE = cptest ] && grep -q "\[desktop\] test sound at volume" "$LOG"; then
+        sleep 1.5; point_at $(cp_at Mute); click; STAGE=cpmute
+    elif [ $STAGE = cpmute ] && grep -q "\[desktop\] volume 50%, muted" "$LOG"; then
+        sleep 0.5; click; STAGE=cpunmute
+    elif [ $STAGE = cpunmute ] && [ "$(grep -c "\[desktop\] volume 50%, saved" "$LOG")" -ge 2 ]; then
+        sleep 0.5; point_at $(cp_bar Volume 1000); click; STAGE=cpvol100
+    elif [ $STAGE = cpvol100 ] && grep -q "\[desktop\] volume 100%" "$LOG"; then
+        sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback2
+    elif [ $STAGE = cpback2 ] && [ "$(cp_count "Control Panel")" -ge 3 ]; then
+        # Mouse: double-click the test folder; double-click speed to fast and
+        # back; swap the buttons, then swap them back with the right button.
+        sleep 0.5; point_at $(cp_at Mouse); click; STAGE=cpmouse
+    elif [ $STAGE = cpmouse ] && [ "$(cp_count Mouse)" -ge 1 ]; then
+        sleep 0.5; point_at $(cp_at TestFolder); double_click; STAGE=cpfolder
+    elif [ $STAGE = cpfolder ] && grep -q "\[desktop\] test folder opened" "$LOG"; then
+        sleep 0.5; point_at $(cp_bar DoubleClick 1000); click; STAGE=cpfast
+    elif [ $STAGE = cpfast ] && grep -q "\[desktop\] double-click 200 ms" "$LOG"; then
+        sleep 0.5; point_at $(cp_bar DoubleClick 571); click; STAGE=cpnormal
+    elif [ $STAGE = cpnormal ] && grep -q "\[desktop\] double-click 500 ms, saved" "$LOG"; then
+        sleep 0.5; point_at $(cp_at Swap); click; STAGE=cpswap
+    elif [ $STAGE = cpswap ] && grep -q "\[desktop\] double-click 500 ms, buttons swapped" "$LOG"; then
+        sleep 0.5; monitor "mouse_button 2" "mouse_button 0"; STAGE=cpunswap
+    elif [ $STAGE = cpunswap ] && [ "$(grep -c "\[desktop\] double-click 500 ms, saved" "$LOG")" -ge 2 ]; then
+        sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback3
+    elif [ $STAGE = cpback3 ] && [ "$(cp_count "Control Panel")" -ge 4 ]; then
+        # Date and Time: a minute on and back, set the clock; the 24-hour clock and back.
+        sleep 0.5; point_at $(cp_at "Date and Time"); click; STAGE=cpclock
+    elif [ $STAGE = cpclock ] && [ "$(cp_count "Date and Time")" -ge 1 ]; then
+        sleep 0.5; point_at $(cp_at "Minute +"); click
+        sleep 0.5; point_at $(cp_at "Minute -"); click
+        sleep 0.5; point_at $(cp_at SetClock); click; STAGE=cpset
+    elif [ $STAGE = cpset ] && grep -q "\[desktop\] clock \(set to\|not set\)" "$LOG"; then
+        sleep 0.5; point_at $(cp_at 24-hour); click; STAGE=cp24
+    elif [ $STAGE = cp24 ] && grep -q "\[desktop\] clock: 24-hour" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-cpclock.ppm"
+        point_at $(cp_at 12-hour); click; STAGE=cp12
+    elif [ $STAGE = cp12 ] && grep -q "\[desktop\] clock: 12-hour" "$LOG"; then
+        sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback4
+    elif [ $STAGE = cpback4 ] && [ "$(cp_count "Control Panel")" -ge 5 ]; then
+        sleep 0.5; point_at $(cp_at Display); click; STAGE=cpdisplay2
+    elif [ $STAGE = cpdisplay2 ] && [ "$(cp_count Display)" -ge 2 ]; then
+        sleep 0.5; point_at $(cp_at "Aero blue"); click; STAGE=cpblue
+    elif [ $STAGE = cpblue ] && grep -q "\[desktop\] background: Aero blue" "$LOG"; then
+        XY=$(grep -ao "Control Panel window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cpclosed
+    elif [ $STAGE = cpclosed ] && grep -q "\[desktop\] closed Control Panel" "$LOG"; then
         # Open the Start menu for a screenshot of it and the Start button.
         sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
         sleep 1; monitor "screendump build/gop-start.ppm"
@@ -821,7 +901,28 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "Music did not play the WAV song and go on to the MP3 one"; }
         echo "$TONE" | grep -qE "^tone (3\.[5-9]|4\.[0-6])[0-9] s, .*peak (9[0-9]{3}|1[0-2][0-9]{3})$" \
             || { fail "the WAV song (4.5 s of chimes) was not heard on the sound card ($TONE)"; }
-        echo "$TONE" | tail -1 | grep -qE "^tone ([1-9]|[1-9][0-9])\.[0-9]+ s" || { fail "the MP3 song was not heard on the sound card ($TONE)"; }
+        echo "$TONE" | grep -qE "^tone ([5-9]|[1-9][0-9])\.[0-9]+ s" || { fail "the MP3 song was not heard on the sound card ($TONE)"; }
+        # Control Panel.
+        grep -q "\[desktop\] background: Dusk, saved" "$LOG" && grep -q "\[desktop\] background: Aero blue, saved" "$LOG" \
+            || { fail "Control Panel did not change the background and save it"; }
+        python3 tools/check-screen.py cpanel build/gop-cpanel.ppm || { fail "the Dusk background was not on the screen"; }
+        grep -q "\[desktop\] text size: Large needs a screen of at least 1600 x 1000" "$LOG" \
+            || { fail "Large text was not refused on a 1280x800 screen"; }
+        grep -q "\[desktop\] volume 50%, saved" "$LOG" && grep -q "\[desktop\] volume 50%, muted, saved" "$LOG" \
+            && grep -q "\[desktop\] volume 100%, saved" "$LOG" || { fail "Control Panel did not set the volume, mute and unmute"; }
+        echo "$TONE" | grep -qE "^tone 0\.[3-5][0-9] s, 8[6-9][0-9] Hz, peak (2[5-9][0-9]{2}|3[0-4][0-9]{2})$" \
+            || { fail "the test sound was not heard at a quarter of its level at volume 50% ($TONE)"; }
+        grep -q "\[desktop\] test folder opened" "$LOG" && grep -q "\[desktop\] double-click 200 ms, saved" "$LOG" \
+            && grep -q "mouse: double-click time 500 ms, buttons swapped" "$LOG" && [ "$(grep -c "\[desktop\] double-click 500 ms, saved" "$LOG")" -ge 2 ] \
+            || { fail "Control Panel did not change the double-click speed, or swap the buttons and back with the other button"; }
+        grep -q "\[desktop\] clock set to " "$LOG" && grep -q "clock: set to 20[0-9-]* [0-9:]* by pid" "$LOG" \
+            || { fail "Control Panel did not set the clock ($(grep -a 'clock not set' "$LOG"))"; }
+        grep -q "\[desktop\] clock: 24-hour, saved" "$LOG" && grep -q "\[desktop\] clock: 12-hour, saved" "$LOG" \
+            || { fail "Control Panel did not switch the taskbar clock to 24 hours and back"; }
+        INI=$(mtype -i build/disk.img@@1M ::/AeroForge.ini)
+        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour"; do
+            echo "$INI" | grep -q "^$want" || { fail "/AeroForge.ini does not have \"$want\" ($INI)"; }
+        done
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \
             && grep -q "\[desktop\] pasted /Big.bin as /docs/Big.bin (1 file)" "$LOG" \
             && mtype -i build/disk.img@@1M ::/docs/Big.bin | cmp -s - build/Big.bin \
@@ -984,7 +1085,7 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "a folder index on the NTFS volume is out of order"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
         grep -q "\[aerosmss\] staying at the console (/system/session.cfg says so)" "$LOG" || { fail "aerosmss did not keep the console for the test as session.cfg asks"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

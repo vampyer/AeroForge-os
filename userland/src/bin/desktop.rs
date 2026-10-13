@@ -550,9 +550,70 @@ enum Kind {
     Calculator,
     Photos,
     Music,
+    ControlPanel,
 }
 
-const KINDS: [Kind; 7] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Photos, Kind::Music, Kind::System, Kind::Welcome];
+const KINDS: [Kind; 8] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Photos, Kind::Music, Kind::ControlPanel, Kind::System, Kind::Welcome];
+
+/// The programs on the left of the Start menu (Control Panel is on the right, as in Windows 7).
+const MENU: [Kind; 7] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Photos, Kind::Music, Kind::System, Kind::Welcome];
+
+/// A page of the Control Panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CpPage {
+    Home,
+    Display,
+    Sound,
+    Mouse,
+    Clock,
+}
+
+/// Something to click in the Control Panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ctl {
+    Back,
+    Page(CpPage),
+    Background(usize),
+    TextSize(i32),
+    Volume,
+    Mute,
+    TestSound,
+    Speed,
+    DoubleClick,
+    Swap,
+    TestFolder,
+    /// A part of the date and time (year, month, day, hour, minute) one less or one more.
+    Field(usize, bool),
+    SetClock,
+    Hours24(bool),
+}
+
+/// The desktop backgrounds: a name, the sky's top and bottom colours and the glow's.
+const BACKGROUNDS: [(&str, u32, u32, u32); 4] = [
+    ("Aero blue", 0x145CAA, 0x041E52, 0x96DCFF),
+    ("Aurora", 0x0A5A5A, 0x021A26, 0x78FFC8),
+    ("Dusk", 0x6E3270, 0x1E0A32, 0xFFBE82),
+    ("Graphite", 0x464B55, 0x14161A, 0xC8D2E1),
+];
+
+/// Settings kept in /AeroForge.ini besides the mouse speed and network drives.
+#[derive(Clone, Copy)]
+struct Prefs {
+    background: usize,
+    /// Text and window size: 0 to fit the screen, else the scale (1 or 2).
+    text_size: i32,
+    volume: u32,
+    muted: bool,
+    double_ms: u64,
+    swapped: bool,
+    hours24: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Prefs {
+        Prefs { background: 0, text_size: 0, volume: 100, muted: false, double_ms: 500, swapped: false, hours24: false }
+    }
+}
 
 /// Desktop icons, top to bottom.
 const ICONS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System];
@@ -1126,6 +1187,13 @@ struct Desktop {
     player: Option<Player>,
     /// A copy or move under way, with its progress window.
     progress: Option<Progress>,
+    /// The Control Panel: its page, the settings, the date and time being
+    /// set, the test folder on the Mouse page, and a test sound still to play.
+    cp_page: CpPage,
+    prefs: Prefs,
+    cp_time: Option<aero::DateTime>,
+    cp_folder_open: bool,
+    test_sound: Vec<i16>,
     /// Two-pane mode: the side not in use (`files` is the one in use), and
     /// whether the one in use is the right-hand side.
     other: Option<Box<Files>>,
@@ -1207,6 +1275,13 @@ impl Desktop {
         let s = self.ui;
         let rx = l.x + l.w + 14 * s;
         Rect::new(rx + if faster { 152 * s } else { 0 }, m.y + 160 * s, 30 * s, 30 * s)
+    }
+    /// "Control Panel" on the right of the Start menu, under the mouse speed.
+    fn cp_menu_item(&self) -> Rect {
+        let l = self.menu_left();
+        let m = self.menu_rect();
+        let s = self.ui;
+        Rect::new(l.x + l.w + 8 * s, m.y + 214 * s, m.x + m.w - (l.x + l.w) - 16 * s, 36 * s)
     }
     fn exit_button(&self) -> Rect {
         let m = self.menu_rect();
@@ -1298,21 +1373,11 @@ impl Desktop {
         // Deep blue with a bright glow low on the right and soft light
         // bands sweeping across it.
         let clip = c.clip;
-        let (gx, gy) = (self.w * 2 / 3, self.h * 3 / 4);
-        let reach = (self.w * self.w + self.h * self.h) / 5;
+        let paper = Wallpaper::new(self.prefs.background, &Rect::new(0, 0, self.w, self.h));
         for y in clip.y..clip.y + clip.h {
-            let base = lerp(rgb(20, 92, 170), rgb(4, 30, 82), y, self.h);
             let row = (y * c.w) as usize;
             for x in clip.x..clip.x + clip.w {
-                let (dx, dy) = (x - gx, y - gy);
-                let d = dx * dx + dy * dy;
-                let glow = if d < reach { (reach - d) / (reach / 110).max(1) } else { 0 };
-                let band = |offset: i32, width: i32, strength: i32| {
-                    let d = (x / 3 + y - offset).abs();
-                    if d < width { (width - d) * strength / width } else { 0 }
-                };
-                let light = (glow + band(self.h * 2 / 3, self.h / 6, 60) + band(self.h, self.h / 12, 50)).min(200);
-                c.px[row + x as usize] = blend(base, rgb(150, 220, 255), light as u32);
+                c.px[row + x as usize] = paper.px(x, y);
             }
         }
     }
@@ -1382,6 +1447,7 @@ impl Desktop {
             Kind::Calculator => self.calc_view(c, &client),
             Kind::Photos => self.photos_view(c, &client),
             Kind::Music => self.music_view(c, &client),
+            Kind::ControlPanel => self.cp_view(c, &client),
         }
     }
 
@@ -1608,7 +1674,7 @@ impl Desktop {
         let l = self.menu_left();
         c.rounded(l, 4 * s, false, 0xFFFFFF, rgb(235, 242, 250), 255);
         c.rounded_outline(l, 4 * s, false, rgb(90, 120, 160), 255);
-        for (i, kind) in KINDS.iter().enumerate() {
+        for (i, kind) in MENU.iter().enumerate() {
             let item = self.menu_item(i);
             if item.contains(self.pointer.x as i32, self.pointer.y as i32) {
                 c.rounded(item, 3 * s, false, rgb(225, 240, 255), rgb(190, 220, 250), 255);
@@ -1653,6 +1719,13 @@ impl Desktop {
             let on = (i as u64) < self.mouse_speed;
             c.fill(bar, if on { rgb(120, 210, 255) } else { rgb(70, 90, 120) });
         }
+        // Control Panel, lit up under the pointer like the programs.
+        let cp = self.cp_menu_item();
+        if cp.contains(self.pointer.x as i32, self.pointer.y as i32) {
+            c.rounded(cp, 3 * s, false, rgb(90, 150, 210), rgb(40, 90, 150), 230);
+            c.rounded_outline(cp, 3 * s, false, rgb(170, 210, 245), 255);
+        }
+        c.text(cp.x + 10 * s, cp.y + (cp.h - Font::Normal.h(s)) / 2, "Control Panel", 0xFFFFFF, Font::Normal);
         let e = self.exit_button();
         let hover = e.contains(self.pointer.x as i32, self.pointer.y as i32);
         c.rounded(e, 3 * s, false, if hover { rgb(250, 180, 150) } else { rgb(230, 150, 120) }, rgb(170, 50, 25), 240);
@@ -1793,6 +1866,7 @@ impl Desktop {
                 Kind::Notes => spots.push(self.notes_save(&client)),
                 Kind::Photos => spots.extend([self.photo_button(&client, false), self.photo_button(&client, true)]),
                 Kind::Music => spots.extend((0..4).map(|i| self.music_button(&client, i))),
+                Kind::ControlPanel => spots.extend(self.cp_controls(&client).into_iter().map(|(_, r)| r)),
                 Kind::Calculator => {
                     for row in 0..5 {
                         for col in 0..4 {
@@ -1871,10 +1945,13 @@ impl Desktop {
         if self.menu {
             self.menu = false;
             dirty = dirty.union(&self.menu_rect());
-            for (i, &kind) in KINDS.iter().enumerate() {
+            for (i, &kind) in MENU.iter().enumerate() {
                 if self.menu_item(i).contains(x, y) {
                     return dirty.union(&self.open(kind));
                 }
+            }
+            if self.cp_menu_item().contains(x, y) {
+                return dirty.union(&self.open(Kind::ControlPanel));
             }
             if self.exit_button().contains(x, y) {
                 self.quit = true;
@@ -1896,6 +1973,10 @@ impl Desktop {
         let (ox, oy, or) = self.start_button();
         if (x - ox) * (x - ox) + (y - oy) * (y - oy) <= or * or {
             self.menu = !menu_was_open;
+            if self.menu {
+                let cp = self.cp_menu_item();
+                println!("[desktop] Start menu open; Control Panel at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2);
+            }
             return dirty.union(&self.menu_rect()).union(&self.taskbar());
         }
         if self.show_desktop().contains(x, y) {
@@ -1944,6 +2025,7 @@ impl Desktop {
                 println!("[desktop] closed {}", self.windows[i].title);
                 match self.windows[i].kind {
                     Kind::Photos => self.photo = None,
+                    Kind::ControlPanel => self.cp_page = CpPage::Home,
                     Kind::Music => {
                         if self.player.take().is_some_and(|p| p.playing) {
                             println!("[desktop] music stopped");
@@ -1978,6 +2060,9 @@ impl Desktop {
                         dirty = dirty.union(&self.step_photo(next));
                     }
                 }
+            } else if self.windows[i].kind == Kind::ControlPanel && self.client(&r).contains(x, y) {
+                let client = self.client(&r);
+                dirty = dirty.union(&self.cp_click(&client, x, y, double));
             } else if self.windows[i].kind == Kind::Music && self.client(&r).contains(x, y) {
                 let client = self.client(&r);
                 if let Some(b) = (0..4).find(|&b| self.music_button(&client, b).contains(x, y)) {
@@ -2055,6 +2140,14 @@ impl Desktop {
         }
         let r = self.windows[at].rect;
         println!("[desktop] opened {} at {},{} ({}x{})", self.windows[at].title, r.x, r.y, r.w, r.h);
+        if kind == Kind::ControlPanel {
+            self.cp_page = CpPage::Home;
+            self.log_window(kind);
+            self.bring(kind);
+            self.cp_log();
+            let at = self.index(kind);
+            return self.window_area(at).union(&self.taskbar());
+        }
         if kind == Kind::Calculator {
             let k = self.calc_key(&self.client(&r), 3, 3);
             println!("[desktop] Calculator = key at {},{}", k.x + k.w / 2, k.y + k.h / 2);
@@ -4104,7 +4197,13 @@ impl Desktop {
     /// Writes /AeroForge.ini: the mouse speed and the network drives
     /// (where and who; never the password).
     fn save_settings(&self) -> bool {
+        let p = &self.prefs;
         let mut text = format!("mouse speed = {}\n", self.mouse_speed);
+        text.push_str(&format!("double-click = {}\nswap buttons = {}\n", p.double_ms, if p.swapped { "yes" } else { "no" }));
+        text.push_str(&format!("volume = {}\nmuted = {}\n", p.volume, if p.muted { "yes" } else { "no" }));
+        text.push_str(&format!("background = {}\n", BACKGROUNDS[p.background].0));
+        text.push_str(&format!("text size = {}\n", match p.text_size { 1 => "normal", 2 => "large", _ => "auto" }));
+        text.push_str(&format!("clock = {}\n", if p.hours24 { "24-hour" } else { "12-hour" }));
         for sh in shares().iter() {
             text.push_str(&format!("network drive = {}|{}|{}\n", sh.unc(), sh.user, sh.letter));
         }
@@ -6332,6 +6431,394 @@ impl Desktop {
         }
     }
 
+    // ------------------------------------------------------ Control Panel
+
+    /// Everything to click on the page shown, with where it is.
+    fn cp_controls(&self, client: &Rect) -> Vec<(Ctl, Rect)> {
+        let s = self.ui;
+        let (x0, y0) = (client.x + 24 * s, client.y + 64 * s);
+        let mut out = Vec::new();
+        if self.cp_page == CpPage::Home {
+            // Four categories, two by two.
+            let (tw, th) = ((client.w - 72 * s) / 2, 96 * s);
+            let pages = [CpPage::Display, CpPage::Sound, CpPage::Mouse, CpPage::Clock];
+            for (i, page) in pages.iter().enumerate() {
+                let (col, row) = ((i % 2) as i32, (i / 2) as i32);
+                out.push((Ctl::Page(*page), Rect::new(x0 + col * (tw + 24 * s), y0 + 8 * s + row * (th + 20 * s), tw, th)));
+            }
+            return out;
+        }
+        out.push((Ctl::Back, Rect::new(client.x + 12 * s, client.y + 10 * s, 36 * s, 36 * s)));
+        let bar = |y: i32| Rect::new(x0 + 220 * s, y, 280 * s, 10 * s);
+        match self.cp_page {
+            CpPage::Display => {
+                let (sw, sh) = (128 * s, 80 * s);
+                for i in 0..BACKGROUNDS.len() {
+                    out.push((Ctl::Background(i), Rect::new(x0 + i as i32 * (sw + 18 * s), y0 + 34 * s, sw, sh)));
+                }
+                for (k, size) in [1, 2].iter().enumerate() {
+                    out.push((Ctl::TextSize(*size), Rect::new(x0 + k as i32 * 220 * s, y0 + 210 * s, 200 * s, 28 * s)));
+                }
+            }
+            CpPage::Sound => {
+                out.push((Ctl::Volume, bar(y0 + 40 * s)));
+                out.push((Ctl::Mute, Rect::new(x0, y0 + 84 * s, 240 * s, 28 * s)));
+                out.push((Ctl::TestSound, Rect::new(x0, y0 + 136 * s, 200 * s, 34 * s)));
+            }
+            CpPage::Mouse => {
+                out.push((Ctl::Speed, bar(y0 + 14 * s)));
+                out.push((Ctl::DoubleClick, bar(y0 + 64 * s)));
+                out.push((Ctl::TestFolder, Rect::new(x0 + 520 * s, y0 + 34 * s, 80 * s, 70 * s)));
+                out.push((Ctl::Swap, Rect::new(x0, y0 + 122 * s, 420 * s, 28 * s)));
+            }
+            CpPage::Clock => {
+                for i in 0..5 {
+                    let fx = x0 + i as i32 * 124 * s;
+                    out.push((Ctl::Field(i, false), Rect::new(fx, y0 + 116 * s, 30 * s, 30 * s)));
+                    out.push((Ctl::Field(i, true), Rect::new(fx + 84 * s, y0 + 116 * s, 30 * s, 30 * s)));
+                }
+                out.push((Ctl::SetClock, Rect::new(x0, y0 + 166 * s, 180 * s, 34 * s)));
+                for (k, h24) in [false, true].iter().enumerate() {
+                    out.push((Ctl::Hours24(*h24), Rect::new(x0 + k as i32 * 200 * s, y0 + 254 * s, 180 * s, 28 * s)));
+                }
+            }
+            CpPage::Home => {}
+        }
+        out
+    }
+
+    /// Logs where the page's controls are, for tests and for reading the log.
+    fn cp_log(&self) {
+        let at = self.index(Kind::ControlPanel);
+        let client = self.client(&self.windows[at].rect);
+        let spots: Vec<String> = self.cp_controls(&client).iter().map(|(ctl, r)| {
+            let name = match ctl {
+                Ctl::Back => String::from("Back"),
+                Ctl::Page(p) => String::from(cp_title(*p)),
+                Ctl::Background(i) => String::from(BACKGROUNDS[*i].0),
+                Ctl::TextSize(n) => String::from(if *n == 1 { "Normal size" } else { "Large size" }),
+                Ctl::Field(i, up) => format!("{} {}", ["Year", "Month", "Day", "Hour", "Minute"][*i], if *up { "+" } else { "-" }),
+                Ctl::Hours24(h) => String::from(if *h { "24-hour" } else { "12-hour" }),
+                other => format!("{:?}", other),
+            };
+            if matches!(ctl, Ctl::Volume | Ctl::Speed | Ctl::DoubleClick) {
+                format!("{} bar at {},{} to {},{}", name, r.x, r.y + r.h / 2, r.x + r.w - 1, r.y + r.h / 2)
+            } else {
+                format!("{} at {},{}", name, r.x + r.w / 2, r.y + r.h / 2)
+            }
+        }).collect();
+        println!("[desktop] Control Panel {}: {}", cp_title(self.cp_page), spots.join(" | "));
+    }
+
+    fn cp_go(&mut self, page: CpPage) {
+        self.cp_page = page;
+        if page == CpPage::Clock {
+            self.cp_time = aero::now();
+        }
+        self.cp_log();
+    }
+
+    fn cp_click(&mut self, client: &Rect, x: i32, y: i32, double: bool) -> Rect {
+        let Some((ctl, r)) = self.cp_controls(client).into_iter().find(|(_, r)| r.contains(x, y)) else { return Rect::EMPTY };
+        // Where on a bar, 0 to 1000.
+        let along = ((x - r.x) * 1000 / (r.w - 1).max(1)).clamp(0, 1000) as u64;
+        match ctl {
+            Ctl::Back => self.cp_go(CpPage::Home),
+            Ctl::Page(p) => self.cp_go(p),
+            Ctl::Background(i) => {
+                self.prefs.background = i;
+                let saved = self.save_settings();
+                println!("[desktop] background: {}{}", BACKGROUNDS[i].0, if saved { ", saved" } else { "" });
+                return Rect::new(0, 0, self.w, self.h);
+            }
+            Ctl::TextSize(n) => {
+                if n == 2 && ui_for(self.w, self.h, 2) != 2 {
+                    println!("[desktop] text size: Large needs a screen of at least 1600 x 1000");
+                    return *client;
+                }
+                self.prefs.text_size = n;
+                let saved = self.save_settings();
+                println!("[desktop] text size: {}{}", if n == 1 { "normal" } else { "large" }, if saved { ", saved" } else { "" });
+                self.set_ui(n);
+                return Rect::new(0, 0, self.w, self.h);
+            }
+            Ctl::Volume | Ctl::Mute => {
+                if ctl == Ctl::Volume {
+                    self.prefs.volume = ((along + 5) / 10) as u32;
+                } else {
+                    self.prefs.muted = !self.prefs.muted;
+                }
+                let applied = aero::audio::volume(Some((self.prefs.volume, self.prefs.muted))).is_ok();
+                let saved = self.save_settings();
+                println!("[desktop] volume {}%{}{}{}", self.prefs.volume, if self.prefs.muted { ", muted" } else { "" },
+                    if applied { "" } else { " (no sound card)" }, if saved { ", saved" } else { "" });
+            }
+            Ctl::TestSound => {
+                // A short bell: 880 Hz, fading out over half a second.
+                let n = 24_000usize;
+                let mut wave = Vec::with_capacity(2 * n);
+                for i in 0..n {
+                    let phase = (i * 880 % 48_000) as f32 / 48_000.0;
+                    let tri = if phase < 0.5 { 4.0 * phase - 1.0 } else { 3.0 - 4.0 * phase };
+                    let fade = if i < n * 4 / 5 { 1.0 } else { (n - i) as f32 / (n / 5) as f32 };
+                    let v = (tri * 12_000.0 * fade) as i16;
+                    wave.push(v);
+                    wave.push(v);
+                }
+                self.test_sound = wave;
+                println!("[desktop] test sound at volume {}%{}", self.prefs.volume, if self.prefs.muted { " (muted)" } else { "" });
+                self.pump_test_sound();
+            }
+            Ctl::Speed => {
+                let speed = (1 + (along * 9 + 500) / 1000).clamp(1, 10);
+                self.set_mouse_speed(speed);
+            }
+            Ctl::DoubleClick | Ctl::Swap => {
+                if ctl == Ctl::DoubleClick {
+                    // Left is slow (900 ms), right is fast (200 ms).
+                    self.prefs.double_ms = 900 - (along * 7 + 500) / 1000 * 100;
+                } else {
+                    self.prefs.swapped = !self.prefs.swapped;
+                }
+                let _ = aero::mouse_buttons(Some((self.prefs.double_ms, self.prefs.swapped)));
+                let saved = self.save_settings();
+                println!("[desktop] double-click {} ms{}{}", self.prefs.double_ms,
+                    if self.prefs.swapped { ", buttons swapped" } else { "" }, if saved { ", saved" } else { "" });
+            }
+            Ctl::TestFolder => {
+                if double {
+                    self.cp_folder_open = !self.cp_folder_open;
+                    println!("[desktop] test folder {}", if self.cp_folder_open { "opened" } else { "closed" });
+                }
+            }
+            Ctl::Field(i, up) => {
+                let Some(t) = self.cp_time.as_mut() else { return Rect::EMPTY };
+                let step = |v: i32, lo: i32, hi: i32| if up { if v >= hi { lo } else { v + 1 } } else if v <= lo { hi } else { v - 1 };
+                match i {
+                    0 => t.year = step(t.year as i32, 2000, 2099) as u16,
+                    1 => t.month = step(t.month as i32, 1, 12) as u8,
+                    2 => t.day = step(t.day as i32, 1, 31) as u8,
+                    3 => t.hour = step(t.hour as i32, 0, 23) as u8,
+                    _ => t.minute = step(t.minute as i32, 0, 59) as u8,
+                }
+                t.day = t.day.min(days_in(t.year, t.month));
+            }
+            Ctl::SetClock => {
+                if let Some(mut t) = self.cp_time {
+                    t.second = 0;
+                    match aero::set_time(&t) {
+                        Ok(()) => println!("[desktop] clock set to {}/{}/{} {}", t.month, t.day, t.year, time_text(t.hour, t.minute, true)),
+                        Err(e) => println!("[desktop] clock not set ({})", e),
+                    }
+                    self.clock = clock(self.started_us, self.prefs.hours24);
+                    return client.union(&self.taskbar());
+                }
+            }
+            Ctl::Hours24(h24) => {
+                self.prefs.hours24 = h24;
+                self.clock = clock(self.started_us, h24);
+                let saved = self.save_settings();
+                println!("[desktop] clock: {}{}", if h24 { "24-hour" } else { "12-hour" }, if saved { ", saved" } else { "" });
+                return client.union(&self.taskbar());
+            }
+        }
+        *client
+    }
+
+    /// Plays what is left of the test sound, as room comes up on the sound card.
+    fn pump_test_sound(&mut self) {
+        if self.test_sound.is_empty() {
+            return;
+        }
+        match aero::audio::write(&self.test_sound) {
+            Ok(n) => {
+                self.test_sound.drain(..2 * n);
+            }
+            Err(_) => {
+                println!("[desktop] test sound: no sound output");
+                self.test_sound.clear();
+            }
+        }
+    }
+
+    /// Draws and lays out everything again at scale `ui` (text size).
+    fn set_ui(&mut self, ui: i32) {
+        let ui = ui_for(self.w, self.h, ui);
+        if ui == self.ui {
+            return;
+        }
+        self.ui = ui;
+        gfx().canvas.ui = ui;
+        for i in 0..self.windows.len() {
+            let (_, rect, _) = window_place(self.windows[i].kind, self.w, self.h, ui);
+            self.windows[i].rect = rect;
+            self.windows[i].restore = None;
+        }
+        self.snap = None;
+        self.cp_log();
+    }
+
+    fn cp_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        let (x0, y0) = (client.x + 24 * s, client.y + 64 * s);
+        let blue = rgb(30, 57, 145);
+        let grey = rgb(80, 85, 95);
+        c.gradient(*client, rgb(250, 252, 255), rgb(228, 236, 247), 255);
+        let controls = self.cp_controls(client);
+        let at = |ctl: Ctl| controls.iter().find(|(c2, _)| *c2 == ctl).map(|(_, r)| *r).unwrap_or(Rect::EMPTY);
+        let hot = |r: &Rect| r.contains(self.pointer.x as i32, self.pointer.y as i32);
+        // The heading, with a back arrow on the pages.
+        let title_x = if self.cp_page == CpPage::Home { client.x + 24 * s } else { client.x + 60 * s };
+        let heading = if self.cp_page == CpPage::Home { "Adjust your computer's settings" } else { cp_title(self.cp_page) };
+        c.text(title_x, client.y + 16 * s, heading, blue, Font::Normal);
+        c.fill(Rect::new(client.x + 16 * s, client.y + 52 * s, client.w - 32 * s, s), rgb(200, 212, 230));
+        if self.cp_page != CpPage::Home {
+            let b = at(Ctl::Back);
+            c.orb(b.x + b.w / 2, b.y + b.h / 2, 15 * s, if hot(&b) { rgb(140, 200, 255) } else { rgb(100, 160, 230) }, rgb(30, 80, 160));
+            let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
+            c.line(cx + 7 * s, cy, cx - 6 * s, cy, 3 * s, 0xFFFFFF);
+            c.line(cx - 6 * s, cy, cx, cy - 6 * s, 3 * s, 0xFFFFFF);
+            c.line(cx - 6 * s, cy, cx, cy + 6 * s, 3 * s, 0xFFFFFF);
+        }
+        let check = |c: &mut Canvas, r: Rect, on: bool, label: &str, round: bool| {
+            let b = Rect::new(r.x, r.y + (r.h - 18 * s) / 2, 18 * s, 18 * s);
+            if round {
+                c.orb(b.x + 9 * s, b.y + 9 * s, 9 * s, 0xFFFFFF, rgb(120, 130, 150));
+                c.orb(b.x + 9 * s, b.y + 9 * s, 7 * s, 0xFFFFFF, rgb(225, 230, 238));
+                if on {
+                    c.orb(b.x + 9 * s, b.y + 9 * s, 4 * s, rgb(90, 170, 250), rgb(20, 80, 170));
+                }
+            } else {
+                c.fill(b, 0xFFFFFF);
+                c.frame(b, rgb(120, 130, 150));
+                if on {
+                    c.line(b.x + 4 * s, b.y + 9 * s, b.x + 8 * s, b.y + 13 * s, 2 * s, rgb(20, 80, 170));
+                    c.line(b.x + 8 * s, b.y + 13 * s, b.x + 14 * s, b.y + 4 * s, 2 * s, rgb(20, 80, 170));
+                }
+            }
+            c.text(b.x + 28 * s, r.y + (r.h - Font::Normal.h(s)) / 2, label, 0x202020, Font::Normal);
+        };
+        let slider = |c: &mut Canvas, r: Rect, filled: i32, left: &str, right: &str| {
+            c.fill(r, rgb(225, 228, 233));
+            c.frame(r, rgb(150, 155, 165));
+            c.gradient(Rect::new(r.x + s, r.y + s, (filled - 2 * s).max(0), r.h - 2 * s), rgb(110, 180, 250), rgb(30, 100, 200), 255);
+            let knob = Rect::new(r.x + filled - 6 * s, r.y - 6 * s, 12 * s, r.h + 12 * s);
+            c.rounded(knob, 3 * s, false, rgb(250, 252, 255), rgb(190, 210, 235), 255);
+            c.rounded_outline(knob, 3 * s, false, rgb(70, 100, 150), 255);
+            c.text(r.x, r.y + r.h + 10 * s, left, grey, Font::Small);
+            c.text(r.x + r.w - Font::Small.width(s, right), r.y + r.h + 10 * s, right, grey, Font::Small);
+        };
+        match self.cp_page {
+            CpPage::Home => {
+                for (ctl, r) in &controls {
+                    let Ctl::Page(page) = *ctl else { continue };
+                    if hot(r) {
+                        c.rounded(*r, 4 * s, false, rgb(235, 245, 255), rgb(205, 228, 250), 255);
+                        c.rounded_outline(*r, 4 * s, false, rgb(120, 170, 230), 255);
+                    }
+                    cp_icon(c, page, r.x + 14 * s, r.y + 16 * s, s);
+                    c.text(r.x + 92 * s, r.y + 18 * s, cp_title(page), rgb(20, 90, 40), Font::Normal);
+                    let lines: &[&str] = match page {
+                        CpPage::Display => &["Background, text size"],
+                        CpPage::Sound => &["Volume, test sound"],
+                        CpPage::Mouse => &["Speed, double-click,", "buttons"],
+                        _ => &["Set the clock,", "12 or 24 hours"],
+                    };
+                    for (k, line) in lines.iter().enumerate() {
+                        c.text(r.x + 92 * s, r.y + 50 * s + k as i32 * 22 * s, line, grey, Font::Small);
+                    }
+                }
+            }
+            CpPage::Display => {
+                c.text(x0, y0, "Desktop background", 0x202020, Font::Normal);
+                for i in 0..BACKGROUNDS.len() {
+                    let r = at(Ctl::Background(i));
+                    let paper = Wallpaper::new(i, &r);
+                    let area = r.intersect(&c.clip);
+                    for y in area.y..area.y + area.h {
+                        for x in area.x..area.x + area.w {
+                            let i2 = (y * c.w + x) as usize;
+                            c.px[i2] = paper.px(x, y);
+                        }
+                    }
+                    let chosen = self.prefs.background == i;
+                    c.frame(r, if chosen { rgb(30, 110, 220) } else { rgb(150, 160, 175) });
+                    if chosen {
+                        c.frame(Rect::new(r.x - 2 * s, r.y - 2 * s, r.w + 4 * s, r.h + 4 * s), rgb(30, 110, 220));
+                        c.frame(Rect::new(r.x - 3 * s, r.y - 3 * s, r.w + 6 * s, r.h + 6 * s), rgb(30, 110, 220));
+                    }
+                    let name = BACKGROUNDS[i].0;
+                    c.text(r.x + (r.w - Font::Small.width(s, name)) / 2, r.y + r.h + 8 * s, name, if chosen { blue } else { grey }, Font::Small);
+                }
+                c.text(x0, y0 + 176 * s, "Text and window size", 0x202020, Font::Normal);
+                let large_ok = ui_for(self.w, self.h, 2) == 2;
+                check(c, at(Ctl::TextSize(1)), self.ui == 1, "Normal", true);
+                check(c, at(Ctl::TextSize(2)), self.ui == 2, if large_ok { "Large" } else { "Large (bigger screen)" }, true);
+                c.text(x0, y0 + 262 * s, &format!("Screen: {} x {}", self.w, self.h), grey, Font::Small);
+            }
+            CpPage::Sound => {
+                let (v, muted) = (self.prefs.volume, self.prefs.muted);
+                let card = aero::audio::volume(None).is_ok() && aero::audio::queued().is_ok();
+                c.text(x0, y0, if card { "Speakers (the sound card's main output)" } else { "No sound card was found" }, if card { 0x202020 } else { rgb(170, 30, 20) }, Font::Normal);
+                c.text(x0, y0 + 32 * s, "Volume", 0x202020, Font::Normal);
+                let r = at(Ctl::Volume);
+                slider(c, r, (r.w - 1) * v as i32 / 100, "", "");
+                c.text(r.x + r.w + 18 * s, y0 + 32 * s, &format!("{}%", v), blue, Font::Normal);
+                check(c, at(Ctl::Mute), muted, "Mute", false);
+                let t = at(Ctl::TestSound);
+                self.round_button(c, t, "Play a test sound");
+            }
+            CpPage::Mouse => {
+                c.text(x0, y0 + 6 * s, "Pointer speed", 0x202020, Font::Normal);
+                let r = at(Ctl::Speed);
+                slider(c, r, (r.w - 1) * (self.mouse_speed as i32 - 1) / 9, "Slow", "Fast");
+                c.text(x0, y0 + 56 * s, "Double-click speed", 0x202020, Font::Normal);
+                let r = at(Ctl::DoubleClick);
+                slider(c, r, (r.w - 1) * (900 - self.prefs.double_ms as i32) / 700, "Slow", "Fast");
+                let f = at(Ctl::TestFolder);
+                if self.cp_folder_open {
+                    c.folder(f.x + 16 * s, f.y + 8 * s, 3 * s);
+                    c.page(f.x + 30 * s, f.y + 2 * s, 2 * s);
+                } else {
+                    c.folder(f.x + 16 * s, f.y + 8 * s, 3 * s);
+                }
+                c.text(f.x - 30 * s, f.y + f.h + 4 * s, "Double-click", grey, Font::Small);
+                c.text(f.x - 30 * s, f.y + f.h + 24 * s, "to test", grey, Font::Small);
+                check(c, at(Ctl::Swap), self.prefs.swapped, "Switch primary and secondary buttons", false);
+            }
+            CpPage::Clock => {
+                let now = aero::now();
+                let (time, date) = match now {
+                    Some(t) => (time_text(t.hour, t.minute, self.prefs.hours24), format!("{}:{:02}  {}/{}/{}", t.minute, t.second, t.month, t.day, t.year)),
+                    None => (String::from("--:--"), String::from("The PC's clock can't be read")),
+                };
+                let _ = date;
+                c.text(x0, y0, &time, blue, Font::Large);
+                if let Some(t) = now {
+                    c.text(x0 + Font::Large.width(s, &time) + 16 * s, y0 + 8 * s, &format!("{}  {}/{}/{}", weekday(t.year, t.month, t.day), t.month, t.day, t.year), grey, Font::Normal);
+                }
+                c.text(x0, y0 + 58 * s, "Change the date and time:", 0x202020, Font::Normal);
+                if let Some(t) = self.cp_time {
+                    let values = [t.year as u32, t.month as u32, t.day as u32, t.hour as u32, t.minute as u32];
+                    for i in 0..5 {
+                        let label = ["Year", "Month", "Day", "Hour", "Minute"][i];
+                        let minus = at(Ctl::Field(i, false));
+                        c.text(minus.x, minus.y - 26 * s, label, grey, Font::Small);
+                        self.round_button(c, minus, "-");
+                        self.round_button(c, at(Ctl::Field(i, true)), "+");
+                        let v = if i == 0 { format!("{}", values[i]) } else { format!("{:02}", values[i]) };
+                        let mid = minus.x + 57 * s;
+                        c.text(mid - Font::Normal.width(s, &v) / 2, minus.y + (minus.h - Font::Normal.h(s)) / 2, &v, 0x202020, Font::Normal);
+                    }
+                }
+                self.round_button(c, at(Ctl::SetClock), "Set the clock");
+                c.text(x0, y0 + 226 * s, "Clock in the taskbar", 0x202020, Font::Normal);
+                check(c, at(Ctl::Hours24(false)), !self.prefs.hours24, "12-hour", true);
+                check(c, at(Ctl::Hours24(true)), self.prefs.hours24, "24-hour", true);
+            }
+        }
+    }
+
     // ------------------------------------------------------ copy progress
     //
     // Copying and moving run here, a piece at a time; between pieces the
@@ -7333,18 +7820,241 @@ fn uptime(us: u64) -> String {
 
 /// The taskbar clock: "3:07 PM" over "10/7/2026", or the time since the
 /// desktop started if the PC's clock can't be read.
-fn clock(started_us: u64) -> (String, String) {
+fn clock(started_us: u64, hours24: bool) -> (String, String) {
     match aero::now() {
-        Some(t) => {
-            let hour = match t.hour % 12 {
-                0 => 12,
-                h => h,
-            };
-            let half = if t.hour < 12 { "AM" } else { "PM" };
-            (format!("{}:{:02} {}", hour, t.minute, half), format!("{}/{}/{}", t.month, t.day, t.year))
-        }
+        Some(t) => (time_text(t.hour, t.minute, hours24), format!("{}/{}/{}", t.month, t.day, t.year)),
         None => (uptime(aero::clock_us() - started_us), String::from("uptime")),
     }
+}
+
+/// Windows in the order they are stacked at start, back to front.
+const KINDS_BY_LAYER: [Kind; 8] =
+    [Kind::Welcome, Kind::System, Kind::Notes, Kind::Computer, Kind::Calculator, Kind::Photos, Kind::Music, Kind::ControlPanel];
+
+/// A window's title, where it opens on a `w` x `h` screen at scale `s`, and
+/// whether it is open at start.
+fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool) {
+    match kind {
+        Kind::Welcome => ("Welcome", Rect::new(w / 12, h / 7, 460 * s, 290 * s), true),
+        Kind::System => ("System", Rect::new(w / 12 + 480 * s, h / 7 + 30 * s, 300 * s, 190 * s), true),
+        Kind::Notes => ("Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 500 * s, 290 * s), true),
+        // A file manager wants room: most of the screen, right of the icons.
+        Kind::Computer => {
+            let (cw, ch) = ((w - 150 * s).min(1040 * s).max(800 * s), (h - 180 * s).min(620 * s).max(480 * s));
+            ("Computer", Rect::new((w - cw - 20 * s).max(130 * s), 30 * s, cw, ch), false)
+        }
+        Kind::Calculator => ("Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s), false),
+        Kind::Photos => {
+            let (pw, ph) = ((w - 100 * s).min(900 * s), (h - 120 * s).min(660 * s));
+            ("Photos", Rect::new((w - pw) / 2, 20 * s, pw, ph), false)
+        }
+        Kind::Music => ("Music", Rect::new(w / 2 - 230 * s, h / 2 - 160 * s, 460 * s, 240 * s), false),
+        Kind::ControlPanel => {
+            let (cw, ch) = (680 * s, (h - 120 * s).min(440 * s));
+            ("Control Panel", Rect::new((w - cw) / 2, 40 * s, cw, ch), false)
+        }
+    }
+}
+
+/// The scale things are drawn at: 2 on big screens unless set otherwise
+/// (Large needs a screen of at least 1600 x 1000).
+fn ui_for(w: i32, h: i32, text_size: i32) -> i32 {
+    match text_size {
+        1 => 1,
+        2 if w >= 1600 && h >= 1000 => 2,
+        _ if w >= 2560 => 2,
+        _ => 1,
+    }
+}
+
+/// The wallpaper drawn into `r` (the screen, or a small preview of it): a
+/// sky in background `which`'s colours with a glow low on the right and
+/// soft light bands sweeping across it. Set up once, then asked pixel by pixel.
+struct Wallpaper {
+    r: Rect,
+    top: u32,
+    bottom: u32,
+    light: u32,
+    glow: (i32, i32, i32, i32),
+    /// The bands, worked out as on a 1280 x 800 screen: x and y scaled by
+    /// these (out of 65536), then (offset, width, strength) for each.
+    scale: (i32, i32),
+    bands: [(i32, i32, i32); 2],
+}
+
+impl Wallpaper {
+    fn new(which: usize, r: &Rect) -> Wallpaper {
+        let (_, top, bottom, light) = BACKGROUNDS[which.min(BACKGROUNDS.len() - 1)];
+        let (w, h) = (r.w.max(1), r.h.max(1));
+        let reach = (w * w + h * h) / 5;
+        Wallpaper {
+            r: *r,
+            top,
+            bottom,
+            light,
+            glow: (w * 2 / 3, h * 3 / 4, reach, (reach / 110).max(1)),
+            scale: (1280 * 65536 / 3 / w, 800 * 65536 / h),
+            bands: [(800 * 2 / 3, 800 / 6, 60), (800, 800 / 12, 50)],
+        }
+    }
+
+    fn px(&self, x: i32, y: i32) -> u32 {
+        let (x, y) = (x - self.r.x, y - self.r.y);
+        let base = lerp(self.top, self.bottom, y, self.r.h.max(1));
+        let (gx, gy, reach, step) = self.glow;
+        let (dx, dy) = (x - gx, y - gy);
+        let d = dx * dx + dy * dy;
+        let mut light = if d < reach { (reach - d) / step } else { 0 };
+        let at = ((x as i64 * self.scale.0 as i64 + y as i64 * self.scale.1 as i64) >> 16) as i32;
+        for (offset, width, strength) in self.bands {
+            let d = (at - offset).abs();
+            if d < width {
+                light += (width - d) * strength / width;
+            }
+        }
+        blend(base, self.light, light.min(200) as u32)
+    }
+}
+
+/// "3:07 PM", or "15:07" on a 24-hour clock.
+fn time_text(hour: u8, minute: u8, hours24: bool) -> String {
+    if hours24 {
+        return format!("{:02}:{:02}", hour, minute);
+    }
+    let h12 = match hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    format!("{}:{:02} {}", h12, minute, if hour < 12 { "AM" } else { "PM" })
+}
+
+fn cp_title(page: CpPage) -> &'static str {
+    match page {
+        CpPage::Home => "Control Panel",
+        CpPage::Display => "Display",
+        CpPage::Sound => "Sound",
+        CpPage::Mouse => "Mouse",
+        CpPage::Clock => "Date and Time",
+    }
+}
+
+/// A Control Panel category's picture, 64 x 64 at scale 1, from (x, y).
+fn cp_icon(c: &mut Canvas, page: CpPage, x: i32, y: i32, s: i32) {
+    match page {
+        CpPage::Display => {
+            // A screen showing the sky, on a stand.
+            c.rounded(Rect::new(x + 2 * s, y + 4 * s, 60 * s, 42 * s), 3 * s, false, rgb(70, 80, 95), rgb(20, 25, 35), 255);
+            c.gradient(Rect::new(x + 6 * s, y + 8 * s, 52 * s, 34 * s), rgb(60, 150, 230), rgb(10, 50, 120), 255);
+            c.orb(x + 42 * s, y + 30 * s, 7 * s, rgb(200, 240, 255), rgb(90, 170, 240));
+            c.fill(Rect::new(x + 28 * s, y + 46 * s, 8 * s, 8 * s), rgb(60, 65, 75));
+            c.rounded(Rect::new(x + 16 * s, y + 54 * s, 32 * s, 6 * s), 2 * s, false, rgb(110, 115, 125), rgb(50, 55, 65), 255);
+        }
+        CpPage::Sound => {
+            // A speaker and sound waves.
+            c.fill(Rect::new(x + 6 * s, y + 22 * s, 12 * s, 20 * s), rgb(70, 80, 95));
+            for k in 0..14 {
+                c.fill(Rect::new(x + 18 * s + k * s, y + (22 - k) * s, s, (20 + 2 * k) * s), rgb(90 + 4 * k as u32, 100 + 4 * k as u32, 115 + 4 * k as u32));
+            }
+            for (k, r) in [10, 18, 26].iter().enumerate() {
+                let r = *r * s;
+                let (cx, cy) = (x + 32 * s, y + 32 * s);
+                let col = rgb(40, 120 + 30 * k as u32, 210);
+                let steps = 12;
+                for i in 0..steps {
+                    let a0 = -0.8 + 1.6 * i as f32 / steps as f32;
+                    let a1 = -0.8 + 1.6 * (i + 1) as f32 / steps as f32;
+                    let p = |a: f32| (cx + (r as f32 * cos_approx(a)) as i32, cy + (r as f32 * sin_approx(a)) as i32);
+                    let (p0, p1) = (p(a0), p(a1));
+                    c.line(p0.0, p0.1, p1.0, p1.1, 3 * s, col);
+                }
+            }
+        }
+        CpPage::Mouse => {
+            // A mouse, its left button lit.
+            c.rounded(Rect::new(x + 16 * s, y + 4 * s, 32 * s, 54 * s), 14 * s, false, rgb(245, 247, 250), rgb(170, 180, 195), 255);
+            c.rounded_outline(Rect::new(x + 16 * s, y + 4 * s, 32 * s, 54 * s), 14 * s, false, rgb(70, 80, 95), 255);
+            c.rounded(Rect::new(x + 18 * s, y + 6 * s, 13 * s, 20 * s), 6 * s, true, rgb(140, 210, 255), rgb(40, 130, 230), 255);
+            c.fill(Rect::new(x + 32 * s, y + 6 * s, s, 22 * s), rgb(70, 80, 95));
+            c.fill(Rect::new(x + 18 * s, y + 27 * s, 28 * s, s), rgb(150, 160, 175));
+        }
+        _ => {
+            // A clock face.
+            let (cx, cy) = (x + 32 * s, y + 32 * s);
+            c.orb(cx, cy, 28 * s, rgb(90, 160, 240), rgb(20, 70, 150));
+            c.orb(cx, cy, 23 * s, 0xFFFFFF, rgb(225, 232, 242));
+            for k in 0..12 {
+                let a = k as f32 * core::f32::consts::PI / 6.0;
+                let (dx, dy) = (sin_approx(a), -cos_approx(a));
+                c.line(cx + (dx * 18.0 * s as f32) as i32, cy + (dy * 18.0 * s as f32) as i32,
+                       cx + (dx * 21.0 * s as f32) as i32, cy + (dy * 21.0 * s as f32) as i32, s, rgb(60, 70, 90));
+            }
+            c.line(cx, cy, cx + 10 * s, cy - 6 * s, 3 * s, rgb(30, 40, 60));
+            c.line(cx, cy, cx - 2 * s, cy - 16 * s, 2 * s, rgb(30, 40, 60));
+            c.orb(cx, cy, 3 * s, rgb(200, 60, 40), rgb(140, 30, 20));
+        }
+    }
+}
+
+/// Sine and cosine to a few thousandths, without the standard library.
+fn sin_approx(a: f32) -> f32 {
+    let pi = core::f32::consts::PI;
+    let mut a = a % (2.0 * pi);
+    if a > pi {
+        a -= 2.0 * pi;
+    } else if a < -pi {
+        a += 2.0 * pi;
+    }
+    // Bhaskara-style parabola, then a correction.
+    let y = 4.0 / pi * a - 4.0 / (pi * pi) * a * if a < 0.0 { -a } else { a };
+    0.225 * (y * if y < 0.0 { -y } else { y } - y) + y
+}
+fn cos_approx(a: f32) -> f32 {
+    sin_approx(a + core::f32::consts::FRAC_PI_2)
+}
+
+fn days_in(year: u16, month: u8) -> u8 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// The day of the week, by Sakamoto's method.
+fn weekday(year: u16, month: u8, day: u8) -> &'static str {
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = year as i32 - if month < 3 { 1 } else { 0 };
+    let d = (y + y / 4 - y / 100 + y / 400 + T[(month.clamp(1, 12) - 1) as usize] + day as i32) % 7;
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][d as usize]
+}
+
+/// The Control Panel's settings from /AeroForge.ini, put into effect
+/// (volume, double-click time and buttons are the system's).
+fn saved_prefs() -> Prefs {
+    let mut p = Prefs::default();
+    let mut buf = [0u8; 4096];
+    if let Ok(n) = aero::read_file(SETTINGS, &mut buf) {
+        let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let value = value.trim();
+            let yes = value == "yes";
+            match key.trim() {
+                "double-click" => p.double_ms = value.parse().unwrap_or(500u64).clamp(200, 900),
+                "swap buttons" => p.swapped = yes,
+                "volume" => p.volume = value.parse().unwrap_or(100u32).min(100),
+                "muted" => p.muted = yes,
+                "background" => p.background = BACKGROUNDS.iter().position(|b| b.0.eq_ignore_ascii_case(value)).unwrap_or(0),
+                "text size" => p.text_size = match value { "normal" => 1, "large" => 2, _ => 0 },
+                "clock" => p.hours24 = value == "24-hour",
+                _ => {}
+            }
+        }
+    }
+    let _ = aero::mouse_buttons(Some((p.double_ms, p.swapped)));
+    let _ = aero::audio::volume(Some((p.volume, p.muted)));
+    p
 }
 
 fn main() -> i64 {
@@ -7356,25 +8066,12 @@ fn main() -> i64 {
         }
     };
     let (w, h) = (screen.width as i32, screen.height as i32);
-    let ui = if w >= 2560 { 2 } else { 1 };
-    let s = ui;
-    let window = |kind, title, rect| Window { kind, title, rect, open: true, minimized: false, restore: None };
-    let windows = alloc::vec![
-        window(Kind::Welcome, "Welcome", Rect::new(w / 12, h / 7, 460 * s, 290 * s)),
-        window(Kind::System, "System", Rect::new(w / 12 + 480 * s, h / 7 + 30 * s, 300 * s, 190 * s)),
-        window(Kind::Notes, "Notes", Rect::new(w / 12 + 160 * s, h / 7 + 200 * s, 500 * s, 290 * s)),
-        // A file manager wants room: most of the screen, right of the icons.
-        Window { open: false, ..window(Kind::Computer, "Computer", {
-            let (cw, ch) = ((w - 150 * s).min(1040 * s).max(800 * s), (h - 180 * s).min(620 * s).max(480 * s));
-            Rect::new((w - cw - 20 * s).max(130 * s), 30 * s, cw, ch)
-        }) },
-        Window { open: false, ..window(Kind::Calculator, "Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s)) },
-        Window { open: false, ..window(Kind::Photos, "Photos", {
-            let (pw, ph) = ((w - 100 * s).min(900 * s), (h - 120 * s).min(660 * s));
-            Rect::new((w - pw) / 2, 20 * s, pw, ph)
-        }) },
-        Window { open: false, ..window(Kind::Music, "Music", Rect::new(w / 2 - 230 * s, h / 2 - 160 * s, 460 * s, 240 * s)) },
-    ];
+    let prefs = saved_prefs();
+    let ui = ui_for(w, h, prefs.text_size);
+    let windows = KINDS_BY_LAYER.iter().map(|&kind| {
+        let (title, rect, open) = window_place(kind, w, h, ui);
+        Window { kind, title, rect, open, minimized: false, restore: None }
+    }).collect();
     let pointer = screen.pointer().unwrap_or_default();
     let started_us = aero::clock_us();
     let mut desk = Desktop {
@@ -7393,7 +8090,7 @@ fn main() -> i64 {
         menu: false,
         peeked: Vec::new(),
         started_us,
-        clock: clock(started_us),
+        clock: clock(started_us, prefs.hours24),
         quit: false,
         files: Files::new(),
         other: None,
@@ -7415,6 +8112,11 @@ fn main() -> i64 {
         photo: None,
         player: None,
         progress: None,
+        cp_page: CpPage::Home,
+        prefs,
+        cp_time: None,
+        cp_folder_open: false,
+        test_sound: Vec::new(),
     };
     let canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
     // SAFETY: set once, before anything reads it.
@@ -7424,6 +8126,7 @@ fn main() -> i64 {
         present(&g.screen, &mut g.canvas, &desk, Rect::new(0, 0, w, h));
     }
     let notes = desk.windows[desk.index(Kind::Notes)].rect;
+    let s = ui;
     let icon = desk.icon_rect(0);
     let calc = desk.icon_rect(2);
     println!("[desktop] up at {}x{}; Notes title bar at {},{}; Computer icon at {},{}; Calculator icon at {},{}", w, h,
@@ -7535,11 +8238,12 @@ fn main() -> i64 {
             dirty = dirty.union(&desk.typed(&keys[..n]));
         }
         dirty = dirty.union(&desk.pump_music());
+        desk.pump_test_sound();
         // Twice a second: the clock, the System window and the Notes caret.
         let now = aero::clock_us();
         if now / 500_000 != tick {
             tick = now / 500_000;
-            let time = clock(desk.started_us);
+            let time = clock(desk.started_us, desk.prefs.hours24);
             if time != desk.clock {
                 desk.clock = time;
                 dirty = dirty.union(&desk.tray());
@@ -7550,6 +8254,10 @@ fn main() -> i64 {
             // Only their insides, and the caret only blinks in the window in
             // front: redrawing whole windows here, glass and all, kept the
             // desktop busy for a large part of every second.
+            if desk.cp_page == CpPage::Clock && desk.windows[desk.index(Kind::ControlPanel)].shown() {
+                let at = desk.index(Kind::ControlPanel);
+                dirty = dirty.union(&desk.client(&desk.windows[at].rect));
+            }
             for kind in [Kind::System, Kind::Notes] {
                 let at = desk.index(kind);
                 if desk.windows[at].shown() && (kind == Kind::System || desk.top_kind() == Some(kind)) {

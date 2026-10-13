@@ -7,7 +7,7 @@
 //! count of the presses that made a double-click, timed here as they happen
 //! rather than when a busy program gets round to reading them.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::sync::IrqMutex;
 use crate::usb;
@@ -28,7 +28,7 @@ static LAST_PRESS_US: AtomicU64 = AtomicU64::new(0);
 static LAST_PRESS_AT: AtomicU32 = AtomicU32::new(0);
 /// Two presses closer together than this, in time and in pixels either
 /// way, are a double-click.
-const DOUBLE_CLICK_US: u64 = 500_000;
+static DOUBLE_CLICK_US: AtomicU64 = AtomicU64::new(500_000);
 const DOUBLE_CLICK_PX: i32 = 8;
 /// The modifier keys held now (DHI_MOD_*: Shift 1, Ctrl 2, Alt 4, Caps Lock 8),
 /// from the last key event of any keyboard.
@@ -80,6 +80,29 @@ pub fn push_key(c: u8) -> bool {
     true
 }
 
+/// The left and right buttons trade places (for the left hand).
+static SWAPPED: AtomicBool = AtomicBool::new(false);
+
+/// The double-click time in milliseconds and whether the buttons are swapped.
+pub fn mouse_buttons() -> (u64, bool) {
+    (DOUBLE_CLICK_US.load(Ordering::Relaxed) / 1000, SWAPPED.load(Ordering::Relaxed))
+}
+
+pub fn set_mouse_buttons(double_click_ms: u64, swapped: bool) {
+    DOUBLE_CLICK_US.store(double_click_ms.clamp(200, 900) * 1000, Ordering::Relaxed);
+    SWAPPED.store(swapped, Ordering::Relaxed);
+}
+
+/// A mouse's buttons as the system sees them: left and right swapped when
+/// set so, so the primary button is always bit 0.
+pub fn mapped(buttons: u32) -> u32 {
+    if SWAPPED.load(Ordering::Relaxed) {
+        (buttons & !3) | (buttons & 1) << 1 | (buttons & 2) >> 1
+    } else {
+        buttons
+    }
+}
+
 /// The mouse buttons changed from `old` to `new`.
 pub fn buttons(old: u32, new: u32) {
     if new & 1 != 0 && old & 1 == 0 {
@@ -89,7 +112,7 @@ pub fn buttons(old: u32, new: u32) {
         let at = LAST_PRESS_AT.load(Ordering::Relaxed);
         let (px, py) = ((at & 0xFFFF) as i32, (at >> 16) as i32);
         let double = when != 0
-            && now.saturating_sub(when) < DOUBLE_CLICK_US
+            && now.saturating_sub(when) < DOUBLE_CLICK_US.load(Ordering::Relaxed)
             && (x - px).abs() <= DOUBLE_CLICK_PX
             && (y - py).abs() <= DOUBLE_CLICK_PX;
         if double {

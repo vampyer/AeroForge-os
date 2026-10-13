@@ -227,8 +227,9 @@ pub fn poll_thread(_: u64) {
                         let y = (MOUSE_Y.load(Ordering::Relaxed) + sy).clamp(0, h as i32 - 1);
                         MOUSE_X.store(x, Ordering::Relaxed);
                         MOUSE_Y.store(y, Ordering::Relaxed);
-                        let old = MOUSE_BUTTONS.swap(ev.buttons as u32, Ordering::Relaxed);
-                        crate::input::buttons(old, ev.buttons as u32);
+                        let now = crate::input::mapped(ev.buttons as u32);
+                        let old = MOUSE_BUTTONS.swap(now, Ordering::Relaxed);
+                        crate::input::buttons(old, now);
                     }
                     dhi::INPUT_TABLET => {
                         // The pointer goes exactly where the tablet (or the
@@ -238,8 +239,9 @@ pub fn poll_thread(_: u64) {
                         let y = (ev.dy.max(0) as i64 * h as i64 / 32768) as i32;
                         MOUSE_X.store(x.clamp(0, w as i32 - 1), Ordering::Relaxed);
                         MOUSE_Y.store(y.clamp(0, h as i32 - 1), Ordering::Relaxed);
-                        let old = MOUSE_BUTTONS.swap(ev.buttons as u32, Ordering::Relaxed);
-                        crate::input::buttons(old, ev.buttons as u32);
+                        let now = crate::input::mapped(ev.buttons as u32);
+                        let old = MOUSE_BUTTONS.swap(now, Ordering::Relaxed);
+                        crate::input::buttons(old, now);
                     }
                     _ => {}
                 }

@@ -185,6 +185,9 @@ pub const SYS_SET_WRITABLE: u64 = 58;
 pub const SYS_RENAME: u64 = 59;
 pub const SYS_FILE_READ_AT: u64 = 60;
 pub const SYS_FILE_APPEND: u64 = 61;
+pub const SYS_AUDIO_VOLUME: u64 = 62;
+pub const SYS_MOUSE_BUTTONS: u64 = 63;
+pub const SYS_TIME_SET: u64 = 64;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -874,6 +877,52 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 _ => return Err(E_INVAL),
             }
             Ok(crate::usb::MOUSE_SPEED.load(Relaxed) as u64)
+        }
+        SYS_MOUSE_BUTTONS => {
+            // Double-click time and swapped buttons: a0 = 0 reads them; a0 = 1
+            // sets the time to a1 ms (200-900) and swaps the buttons if a2 = 1.
+            // Returns the time in ms | swapped << 16.
+            if a0 == 1 {
+                if !(200..=900).contains(&a1) || a2 > 1 {
+                    return Err(E_INVAL);
+                }
+                input::set_mouse_buttons(a1, a2 == 1);
+                crate::kprintln!("mouse: double-click time {} ms{}", a1, if a2 == 1 { ", buttons swapped" } else { "" });
+            } else if a0 != 0 {
+                return Err(E_INVAL);
+            }
+            let (ms, swapped) = input::mouse_buttons();
+            Ok(ms | (swapped as u64) << 16)
+        }
+        SYS_AUDIO_VOLUME => {
+            // Master volume: a0 = 0 reads it; a0 = 1 sets it to a1 (0-100),
+            // muted if a2 = 1. Returns the volume | muted << 8.
+            if a0 == 1 {
+                if a1 > 100 || a2 > 1 {
+                    return Err(E_INVAL);
+                }
+                sound::set_volume(a1 as u32, a2 == 1);
+            } else if a0 != 0 {
+                return Err(E_INVAL);
+            }
+            let (v, muted) = sound::volume();
+            Ok(v as u64 | (muted as u64) << 8)
+        }
+        SYS_TIME_SET => {
+            // Sets the wall clock; a0 is packed as SYS_TIME returns it.
+            let t = crate::rtc::DateTime {
+                year: (a0 >> 40) as u16,
+                month: (a0 >> 32) as u8,
+                day: (a0 >> 24) as u8,
+                hour: (a0 >> 16) as u8,
+                minute: (a0 >> 8) as u8,
+                second: a0 as u8,
+            };
+            if !crate::rtc::set(t) {
+                return Err(E_INVAL);
+            }
+            crate::kprintln!("clock: set to {}-{:02}-{:02} {:02}:{:02}:{:02} by pid {}", t.year, t.month, t.day, t.hour, t.minute, t.second, proc_.pid);
+            Ok(0)
         }
         SYS_TIME => {
             // Wall clock (local time, from the CMOS clock):
