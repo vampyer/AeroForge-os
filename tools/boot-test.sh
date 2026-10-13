@@ -648,6 +648,17 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=formatsclose
     elif [ $STAGE = formatsclose ] && [ "$(grep -c "\[desktop\] closed Music" "$LOG")" -ge 2 ]; then
+        # Music on its own, from the Start menu: it lines up the songs in the Music folders.
+        sleep 0.5; point_at 27 780; click; STAGE=musicmenu
+    elif [ $STAGE = musicmenu ] && grep -q "\[desktop\] Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG"; then
+        sleep 0.5
+        XY=$(grep -ao "Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=musicicon
+    elif [ $STAGE = musicicon ] && [ "$(grep -c "\[desktop\] Music window at " "$LOG")" -ge 3 ]; then
+        sleep 0.5
+        XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musiciconclose
+    elif [ $STAGE = musiciconclose ] && [ "$(grep -c "\[desktop\] closed Music" "$LOG")" -ge 3 ]; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
@@ -668,7 +679,7 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = deskcalcdone ] && grep -q "\[desktop\] calculator: " "$LOG"; then
         # Control Panel, from the right of the Start menu.
         sleep 0.5; point_at 27 780; click; STAGE=cpmenu
-    elif [ $STAGE = cpmenu ] && grep -q "\[desktop\] Start menu open; Control Panel at " "$LOG"; then
+    elif [ $STAGE = cpmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
         sleep 0.5
         XY=$(grep -ao "Start menu open; Control Panel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cphome
@@ -923,6 +934,9 @@ for _ in $(seq "$TIMEOUT"); do
             grep -q "\[desktop\] Music: /Music/Formats/$want, 0:00 ($n of 8)" "$LOG" && grep -q "\[desktop\] Music: played /Music/Formats/${want%%,*} to the end" "$LOG" \
                 || { fail "Music did not play /Music/Formats/${want%%,*} ($(grep -a "Music: /Music/Formats/${want%%,*}" "$LOG" | tail -1))"; }
         done
+        grep -q "\[desktop\] Music: found 10 songs in Music folders" "$LOG" \
+            && grep -q "\[desktop\] Music: /Music/Chimes.wav, WAV 44100 Hz, 1 channel, 0:04 (1 of 10)" "$LOG" \
+            || { fail "Music opened from the Start menu did not line up the 10 songs in /Music ($(grep -a "Music: found" "$LOG" | tail -1))"; }
         for hz in 330 392 440 494 587 659 740 880; do
             echo "$TONE" | python3 -c "import re,sys; sys.exit(not any(0.5 <= float(m[0]) <= 0.7 and abs(float(m[1]) - $hz) <= $hz * 0.02 for m in re.findall(r'^tone ([0-9.]+) s, ([0-9]+) Hz', sys.stdin.read(), re.M)))" \
                 || { fail "the $hz Hz note from Music/Formats was not heard on the sound card ($TONE)"; }

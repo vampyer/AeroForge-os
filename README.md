@@ -610,7 +610,10 @@ pages around it are read in `media.rs`. WAV files can now also hold 32-bit float
 files with Opus sound say they can't be played yet. C:/Music/Formats on the test disk holds a short note in
 each kind of file (24-bit FLAC, mono FLAC, OGG, mono OGG, 8-bit, 24-bit and floating point WAV, and a
 64 kbit/s mono MP3), each at its own pitch; the boot test plays the folder through and finds every note,
-at its pitch, in the sound card's output.
+at its pitch, in the sound card's output. Opened from the Start menu with no song picked, Music lines up the
+songs in the Music folder at the top of each drive (and the folders in it), ready to play, or says it found
+none. Control Panel's test sound now plays from its own thread, as Music does, so a slow redraw can't leave
+a gap in it.
 
 | Area | Status |
 |---|---|

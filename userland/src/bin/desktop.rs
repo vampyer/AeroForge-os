@@ -1194,7 +1194,8 @@ struct Desktop {
     prefs: Prefs,
     cp_time: Option<aero::DateTime>,
     cp_folder_open: bool,
-    test_sound: Vec<i16>,
+    /// The thread playing Control Panel's test sound.
+    test_sound: Option<aero::thread::JoinHandle<()>>,
     /// Two-pane mode: the side not in use (`files` is the one in use), and
     /// whether the one in use is the right-hand side.
     other: Option<Box<Files>>,
@@ -1976,7 +1977,9 @@ impl Desktop {
             self.menu = !menu_was_open;
             if self.menu {
                 let cp = self.cp_menu_item();
-                println!("[desktop] Start menu open; Control Panel at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2);
+                let music = self.menu_item(MENU.iter().position(|&k| k == Kind::Music).unwrap_or(0));
+                println!("[desktop] Start menu open; Control Panel at {},{}; Music at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2,
+                    music.x + music.w / 2, music.y + music.h / 2);
             }
             return dirty.union(&self.menu_rect()).union(&self.taskbar());
         }
@@ -2151,6 +2154,16 @@ impl Desktop {
             self.cp_log();
             let at = self.index(kind);
             return self.window_area(at).union(&self.taskbar());
+        }
+        if kind == Kind::Music && self.player.is_none() {
+            // Opened on its own: line up the songs in the Music folders, ready to play.
+            let songs = find_songs();
+            println!("[desktop] Music: found {} song{} in Music folders", songs.len(), if songs.len() == 1 { "" } else { "s" });
+            if !songs.is_empty() {
+                self.player = Some(Player::new(songs, 0));
+                self.load_song(false);
+            }
+            self.log_window(kind);
         }
         if kind == Kind::Calculator {
             let k = self.calc_key(&self.client(&r), 3, 3);
@@ -2419,6 +2432,25 @@ fn feed_music(deck: Arc<aero::sync::Mutex<Deck>>) {
             }
         }
         aero::sleep_ms(10);
+    }
+}
+
+/// Plays a stereo wave to the end, as room comes up on the sound card.
+fn play_wave(mut wave: Vec<i16>) {
+    let _ = aero::thread::set_priority(aero::thread::Priority::High);
+    while !wave.is_empty() {
+        match aero::audio::write(&wave) {
+            Ok(n) => {
+                wave.drain(..2 * n);
+                if n == 0 {
+                    aero::sleep_ms(10);
+                }
+            }
+            Err(_) => {
+                println!("[desktop] test sound: no sound output");
+                return;
+            }
+        }
     }
 }
 
@@ -2726,6 +2758,32 @@ fn siblings(path: &str, kind: FileKind) -> (Vec<String>, usize) {
     }
     let at = names.iter().position(|n| *n == name).unwrap_or(0);
     (names.iter().map(|n| join(&dir, n)).collect(), at)
+}
+
+/// The songs in the Music folder at the top of each drive and the folders in it,
+/// folder by folder in name order.
+fn find_songs() -> Vec<String> {
+    fn walk(dir: &str, depth: u32, out: &mut Vec<String>) {
+        let Ok(mut entries) = fs_list(dir) else { return };
+        entries.sort_by_key(|e| e.name.to_lowercase());
+        for e in entries.iter().filter(|e| !e.is_dir && file_kind(&e.name) == FileKind::Sound) {
+            if out.len() < 500 {
+                out.push(join(dir, &e.name));
+            }
+        }
+        if depth < 3 {
+            for e in entries.iter().filter(|e| e.is_dir) {
+                walk(&join(dir, &e.name), depth + 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for v in aero::volumes().unwrap_or_default() {
+        if !v.path.starts_with("//") {
+            walk(&join(&v.path, "Music"), 0, &mut out);
+        }
+    }
+    out
 }
 
 /// 75 seconds as "1:15".
@@ -6467,7 +6525,10 @@ impl Desktop {
         let tx = client.x + 86 * s;
         let room = ((client.x + client.w - 16 * s - tx) / Font::Normal.w(s)).max(1) as usize;
         let Some(p) = &self.player else {
-            c.text(tx, client.y + 20 * s, "Open a song from Computer", rgb(30, 57, 145), Font::Normal);
+            c.text(tx, client.y + 20 * s, "No songs found", rgb(30, 57, 145), Font::Normal);
+            let tip = "Put songs in a Music folder, or open one from Computer.";
+            let room = ((client.x + client.w - 16 * s - tx) / Font::Small.w(s)).max(1) as usize;
+            c.text(tx, client.y + 50 * s, &tip.chars().take(room).collect::<String>(), rgb(80, 85, 95), Font::Small);
             return;
         };
         let name: String = split_path(&p.list[p.at]).1.chars().take(room).collect();
@@ -6638,9 +6699,12 @@ impl Desktop {
                     wave.push(v);
                     wave.push(v);
                 }
-                self.test_sound = wave;
                 println!("[desktop] test sound at volume {}%{}", self.prefs.volume, if self.prefs.muted { " (muted)" } else { "" });
-                self.pump_test_sound();
+                // Its own thread keeps the sound card fed, so a slow redraw can't leave a gap in it.
+                if let Some(old) = self.test_sound.take() {
+                    old.join();
+                }
+                self.test_sound = aero::thread::spawn(move || play_wave(wave)).ok();
             }
             Ctl::Speed => {
                 let speed = (1 + (along * 9 + 500) / 1000).clamp(1, 10);
@@ -6696,22 +6760,6 @@ impl Desktop {
             }
         }
         *client
-    }
-
-    /// Plays what is left of the test sound, as room comes up on the sound card.
-    fn pump_test_sound(&mut self) {
-        if self.test_sound.is_empty() {
-            return;
-        }
-        match aero::audio::write(&self.test_sound) {
-            Ok(n) => {
-                self.test_sound.drain(..2 * n);
-            }
-            Err(_) => {
-                println!("[desktop] test sound: no sound output");
-                self.test_sound.clear();
-            }
-        }
     }
 
     /// Draws and lays out everything again at scale `ui` (text size).
@@ -8190,7 +8238,7 @@ fn main() -> i64 {
         prefs,
         cp_time: None,
         cp_folder_open: false,
-        test_sound: Vec::new(),
+        test_sound: None,
     };
     let canvas = Canvas { px: alloc::vec![0u32; (w * h) as usize], w, h, clip: Rect::EMPTY, ui };
     // SAFETY: set once, before anything reads it.
@@ -8312,7 +8360,6 @@ fn main() -> i64 {
             dirty = dirty.union(&desk.typed(&keys[..n]));
         }
         dirty = dirty.union(&desk.pump_music());
-        desk.pump_test_sound();
         // Twice a second: the clock, the System window and the Notes caret.
         let now = aero::clock_us();
         if now / 500_000 != tick {
