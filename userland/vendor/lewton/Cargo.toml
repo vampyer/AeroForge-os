@@ -1,0 +1,9 @@
+[package]
+name = "lewton"
+version = "0.10.2"
+edition = "2015"
+license = "MIT OR Apache-2.0"
+description = "lewton 0.10.2 (https://github.com/RustAudio/lewton), the Vorbis decoder, made no_std for AeroForge OS"
+
+[dependencies]
+tinyvec = { version = "1.0", default-features = false, features = ["alloc"] }

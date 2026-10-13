@@ -2791,7 +2791,7 @@ fn type_text(e: &aero::DirEntry) -> String {
         "md" => "Markdown File",
         "ini" | "cfg" | "conf" => "Settings File",
         "png" | "jpg" | "jpeg" | "bmp" | "gif" => "Picture",
-        "wav" | "mp3" => "Sound",
+        "wav" | "mp3" | "ogg" | "flac" => "Sound",
         "exe" | "elf" => "Program",
         "zip" | "7z" | "gz" | "tar" => "Compressed Folder",
         "sav" => "Saved Game",

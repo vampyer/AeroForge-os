@@ -649,6 +649,7 @@ impl Drop for Handle {
     }
 }
 
+pub mod flac;
 pub mod media;
 
 /// UDP and TCP sockets over the network card the kernel brought up.

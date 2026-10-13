@@ -602,6 +602,16 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.62 Music plays FLAC and OGG songs as well as MP3 and WAV. FLAC is decoded by AeroForge's own
+decoder (`userland/src/flac.rs`: 4 to 32-bit samples, fixed and LPC subframes, every stereo mode), and OGG
+files with Vorbis sound by lewton, a pure Rust Vorbis decoder kept in `userland/vendor/lewton` and changed
+to build without the standard library (the few float functions it needs are written out there); the Ogg
+pages around it are read in `media.rs`. WAV files can now also hold 32-bit floating point samples. OGG
+files with Opus sound say they can't be played yet. C:/Music/Formats on the test disk holds a short note in
+each kind of file (24-bit FLAC, mono FLAC, OGG, mono OGG, 8-bit, 24-bit and floating point WAV, and a
+64 kbit/s mono MP3), each at its own pitch; the boot test plays the folder through and finds every note,
+at its pitch, in the sound card's output.
+
 | Area | Status |
 |---|---|
 | Boot | UEFI only, Limine 9.x, higher-half kernel at `0xffffffff80000000`, user programs loaded as boot modules |

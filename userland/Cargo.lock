@@ -6,11 +6,19 @@ version = 4
 name = "aero-userland"
 version = "0.1.0"
 dependencies = [
+ "lewton",
  "nanomp3",
  "noto-sans-mono-bitmap",
  "zune-core",
  "zune-jpeg",
  "zune-png",
+]
+
+[[package]]
+name = "lewton"
+version = "0.10.2"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]
@@ -39,6 +47,12 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "zune-core"
