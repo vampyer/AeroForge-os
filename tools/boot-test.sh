@@ -749,6 +749,12 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-cpanel.ppm"
         point_at $(cp_at "Large size"); click; STAGE=cplarge
     elif [ $STAGE = cplarge ] && grep -q "\[desktop\] text size: " "$LOG"; then
+        # Larger text, then back to medium.
+        sleep 0.5; point_at $(cp_at "larger text"); click; STAGE=cpfontlarger
+    elif [ $STAGE = cpfontlarger ] && grep -q "\[desktop\] font size: larger, saved" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-larger.ppm"
+        point_at $(cp_at "medium text"); click; STAGE=cpfontmedium
+    elif [ $STAGE = cpfontmedium ] && grep -q "\[desktop\] font size: medium, saved" "$LOG"; then
         sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback1
     elif [ $STAGE = cpback1 ] && [ "$(cp_count "Control Panel")" -ge 2 ]; then
         # Sound: volume to half, a test sound (heard at a quarter of its
@@ -1032,7 +1038,7 @@ PY
         grep -q "\[desktop\] clock: 24-hour, saved" "$LOG" && grep -q "\[desktop\] clock: 12-hour, saved" "$LOG" \
             || { fail "Control Panel did not switch the taskbar clock to 24 hours and back"; }
         INI=$(mtype -i build/disk.img@@1M ::/AeroForge.ini)
-        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour"; do
+        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour" "font size = medium"; do
             echo "$INI" | grep -q "^$want" || { fail "/AeroForge.ini does not have \"$want\" ($INI)"; }
         done
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \
