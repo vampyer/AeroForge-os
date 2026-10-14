@@ -157,6 +157,84 @@ fn crisp(ink: u8) -> u32 {
 }
 
 /// The frame being built, clipped to the area being redrawn.
+/// The icons drawn by tools/make-icons.py, each 96 x 96, and copies of
+/// them shrunk to the sizes asked for so far.
+static ICON_FILE: &[u8] = include_bytes!("../icons.bin");
+
+struct Icons {
+    full: Vec<([u8; 16], usize, usize, Vec<u32>)>,
+    sized: Vec<(usize, i32, Vec<u32>)>,
+}
+struct IconCell(core::cell::UnsafeCell<Option<Icons>>);
+// SAFETY: only the desktop's main thread draws.
+unsafe impl Sync for IconCell {}
+static ICONS_CACHE: IconCell = IconCell(core::cell::UnsafeCell::new(None));
+
+fn icons_cache() -> &'static mut Icons {
+    // SAFETY: as above; nothing holds the reference across another call.
+    let cell = unsafe { &mut *ICONS_CACHE.0.get() };
+    cell.get_or_insert_with(|| {
+        let d = ICON_FILE;
+        let u16_at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]) as usize;
+        let mut full = Vec::new();
+        let count = if d.len() >= 8 && &d[..4] == b"AFIC" { u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize } else { 0 };
+        let mut at = 8;
+        for _ in 0..count {
+            let mut name = [0u8; 16];
+            name.copy_from_slice(&d[at..at + 16]);
+            let (w, h) = (u16_at(at + 16), u16_at(at + 18));
+            at += 20;
+            let mut px = Vec::with_capacity(w * h);
+            while px.len() < w * h {
+                let (clear, solid) = (u16_at(at), u16_at(at + 2));
+                at += 4;
+                px.resize(px.len() + clear, 0);
+                for _ in 0..solid {
+                    px.push(u32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]));
+                    at += 4;
+                }
+            }
+            full.push((name, w, h, px));
+        }
+        Icons { full, sized: Vec::new() }
+    })
+}
+
+/// Icon `name` at `size` x `size` (ARGB), shrunk by averaging the pixels
+/// each one covers, weighted by how solid they are.
+fn icon_pixels(name: &str, size: i32) -> Option<&'static [u32]> {
+    let icons = icons_cache();
+    let which = icons.full.iter().position(|(n, ..)| n.split(|&b| b == 0).next() == Some(name.as_bytes()))?;
+    if let Some(i) = icons.sized.iter().position(|(w, z, _)| *w == which && *z == size) {
+        return Some(&icons.sized[i].2);
+    }
+    let (_, w, h, src) = &icons.full[which];
+    let n = size.max(1) as usize;
+    let mut out = alloc::vec![0u32; n * n];
+    for dy in 0..n {
+        let (y0, y1) = (dy * h / n, ((dy + 1) * h).div_ceil(n).max(dy * h / n + 1));
+        for dx in 0..n {
+            let (x0, x1) = (dx * w / n, ((dx + 1) * w).div_ceil(n).max(dx * w / n + 1));
+            let (mut a, mut r, mut g, mut b, mut cnt) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for y in y0..y1.min(*h) {
+                for &p in &src[y * w + x0..y * w + x1.min(*w)] {
+                    let pa = p >> 24;
+                    a += pa;
+                    r += (p >> 16 & 255) * pa;
+                    g += (p >> 8 & 255) * pa;
+                    b += (p & 255) * pa;
+                    cnt += 1;
+                }
+            }
+            if a > 0 {
+                out[dy * n + dx] = ((a / cnt.max(1)) << 24) | ((r / a) << 16) | ((g / a) << 8) | (b / a);
+            }
+        }
+    }
+    icons.sized.push((which, size, out));
+    Some(&icons.sized.last().unwrap().2)
+}
+
 struct Canvas {
     px: Vec<u32>,
     w: i32,
@@ -166,6 +244,28 @@ struct Canvas {
 }
 
 impl Canvas {
+    /// Draws icon `name` (see tools/make-icons.py) `size` pixels square with
+    /// its top left at (x, y). Returns false if there is no such icon.
+    fn icon(&mut self, name: &str, x: i32, y: i32, size: i32) -> bool {
+        let Some(px) = icon_pixels(name, size) else { return false };
+        let c = Rect::new(x, y, size, size).intersect(&self.clip);
+        for yy in c.y..c.y + c.h {
+            let row = (yy * self.w) as usize;
+            let src = ((yy - y) * size) as usize;
+            for xx in c.x..c.x + c.w {
+                let p = px[src + (xx - x) as usize];
+                let a = p >> 24;
+                if a == 255 {
+                    self.px[row + xx as usize] = p & 0xFFFFFF;
+                } else if a > 0 {
+                    let under = &mut self.px[row + xx as usize];
+                    *under = blend(*under, p & 0xFFFFFF, a);
+                }
+            }
+        }
+        true
+    }
+
     fn fill(&mut self, r: Rect, color: u32) {
         let c = r.intersect(&self.clip);
         for y in c.y..c.y + c.h {
@@ -399,25 +499,28 @@ impl Canvas {
 
     /// A small yellow folder, 16 x 12 at scale 1.
     fn folder(&mut self, x: i32, y: i32, s: i32) {
-        self.fill(Rect::new(x, y, 7 * s, 3 * s), rgb(220, 170, 50));
-        self.gradient(Rect::new(x, y + 2 * s, 16 * s, 10 * s), rgb(255, 225, 120), rgb(230, 175, 50), 255);
-        self.frame(Rect::new(x, y + 2 * s, 16 * s, 10 * s), rgb(180, 130, 30));
+        self.icon("folder", x, y - 2 * s, 16 * s);
     }
 
     /// A small sheet of paper with a folded corner, 12 x 14 at scale 1.
     fn page(&mut self, x: i32, y: i32, s: i32) {
-        self.fill(Rect::new(x, y, 12 * s, 14 * s), 0xFFFFFF);
-        self.frame(Rect::new(x, y, 12 * s, 14 * s), rgb(120, 130, 150));
-        self.fill(Rect::new(x + 8 * s, y, 4 * s, 4 * s), rgb(210, 220, 235));
-        for i in 0..3 {
-            self.fill(Rect::new(x + 2 * s, y + (6 + 2 * i) * s, 8 * s, s), rgb(150, 170, 200));
-        }
+        self.icon("text", x - 2 * s, y - s, 16 * s);
     }
 
     /// A file's icon by what it is (see `file_kind`), 12 x 14 at scale 1
     /// like `page`; pictures, programs and compressed folders take a
     /// shape of their own in the same box.
     fn file_icon(&mut self, x: i32, y: i32, s: i32, kind: FileKind) {
+        let name = match kind {
+            FileKind::Text => "text",
+            FileKind::Sound => "sound",
+            FileKind::Picture => "picture",
+            FileKind::Program | FileKind::Archive | FileKind::Disc | FileKind::Settings | FileKind::Save => "",
+            _ => "page",
+        };
+        if !name.is_empty() && self.icon(name, x - 2 * s, y - s, 16 * s) {
+            return;
+        }
         match kind {
             FileKind::Picture => {
                 // A framed landscape: sky, sun and a green hill.
@@ -487,44 +590,6 @@ impl Canvas {
                     _ => {}
                 }
             }
-        }
-    }
-
-    /// The Computer icon: a flat screen on a stand, 40 x 36 at scale 1.
-    fn computer(&mut self, x: i32, y: i32, s: i32) {
-        let body = Rect::new(x, y, 40 * s, 28 * s);
-        self.rounded(body, 2 * s, false, rgb(70, 75, 85), rgb(20, 22, 28), 255);
-        let glass = Rect::new(x + 3 * s, y + 3 * s, 34 * s, 21 * s);
-        self.gradient(glass, rgb(120, 200, 250), rgb(20, 80, 170), 255);
-        self.shade(Rect::new(glass.x, glass.y, glass.w, glass.h / 2), 0xFFFFFF, 50);
-        self.fill(Rect::new(x + 17 * s, y + 28 * s, 6 * s, 4 * s), rgb(60, 60, 70));
-        self.rounded(Rect::new(x + 10 * s, y + 32 * s, 20 * s, 4 * s), 2 * s, false, rgb(110, 110, 120), rgb(40, 40, 50), 255);
-    }
-
-    /// The Calculator icon: a grey body, a green display and keys, 24 x 36.
-    fn calculator(&mut self, x: i32, y: i32, s: i32) {
-        let body = Rect::new(x, y, 24 * s, 36 * s);
-        self.rounded(body, 3 * s, false, rgb(120, 130, 145), rgb(50, 55, 65), 255);
-        self.fill(Rect::new(x + 3 * s, y + 3 * s, 18 * s, 8 * s), rgb(190, 225, 190));
-        for row in 0..4 {
-            for col in 0..3 {
-                let color = if row == 3 && col == 2 { rgb(240, 160, 60) } else { rgb(235, 238, 242) };
-                self.fill(Rect::new(x + (3 + col * 6) * s, y + (14 + row * 5) * s, 4 * s, 3 * s), color);
-            }
-        }
-    }
-
-    /// The Notes icon: a spiral notepad, 28 x 36 at scale 1.
-    fn notepad(&mut self, x: i32, y: i32, s: i32) {
-        let pad = Rect::new(x, y + 3 * s, 28 * s, 33 * s);
-        self.fill(pad, 0xFFFFFF);
-        self.frame(pad, rgb(110, 120, 140));
-        self.fill(Rect::new(x, y + 3 * s, 28 * s, 6 * s), rgb(80, 140, 210));
-        for i in 0..5 {
-            self.fill(Rect::new(x + 3 * s + i * 5 * s, y, 2 * s, 7 * s), rgb(90, 90, 100));
-        }
-        for i in 0..6 {
-            self.fill(Rect::new(x + 4 * s, y + (13 + 4 * i) * s, 20 * s, s), rgb(150, 180, 220));
         }
     }
 }
@@ -1565,17 +1630,7 @@ impl Desktop {
                 c.rounded(r, 3 * s, false, rgb(150, 200, 250), rgb(90, 150, 220), 60);
                 c.rounded_outline(r, 3 * s, false, rgb(200, 230, 255), 110);
             }
-            let (px, py) = (r.x + r.w / 2 - 20 * s, r.y + 6 * s);
-            match kind {
-                Kind::Computer => c.computer(px, py, s),
-                Kind::Notes => c.notepad(px + 6 * s, py, s),
-                Kind::Calculator => c.calculator(px + 8 * s, py, s),
-                _ => {
-                    c.orb(px + 20 * s, py + 19 * s, 17 * s, rgb(140, 210, 255), rgb(20, 90, 170));
-                    c.fill(Rect::new(px + 18 * s, py + 9 * s, 4 * s, 4 * s), 0xFFFFFF);
-                    c.fill(Rect::new(px + 18 * s, py + 16 * s, 4 * s, 13 * s), 0xFFFFFF);
-                }
-            }
+            c.icon(kind_icon(kind), r.x + r.w / 2 - 24 * s, r.y + 6 * s, 48 * s);
             let label = self.windows[self.index(kind)].title;
             let lx = r.x + (r.w - Font::Normal.width(s, label)) / 2;
             let ly = r.y + r.h - Font::Normal.h(s) - 4 * s;
@@ -1643,11 +1698,8 @@ impl Desktop {
             };
             c.rounded(b, 3 * s, false, a, z, alpha);
             c.rounded_outline(b, 3 * s, false, if active { rgb(220, 240, 255) } else { rgb(120, 150, 190) }, 160);
-            // A small window icon, then the title.
-            let icon = Rect::new(b.x + 8 * s, b.y + b.h / 2 - 8 * s, 18 * s, 16 * s);
-            c.fill(icon, rgb(235, 245, 255));
-            c.fill(Rect::new(icon.x, icon.y, icon.w, 4 * s), rgb(60, 130, 210));
-            c.frame(icon, rgb(20, 50, 90));
+            // The program's icon, then the title.
+            c.icon(kind_icon(kind), b.x + 6 * s, b.y + b.h / 2 - 12 * s, 24 * s);
             c.text(b.x + 34 * s, b.y + (b.h - Font::Normal.h(s)) / 2, win.title, 0xFFFFFF, Font::Normal);
         }
 
@@ -1682,10 +1734,7 @@ impl Desktop {
                 c.rounded(item, 3 * s, false, rgb(225, 240, 255), rgb(190, 220, 250), 255);
                 c.rounded_outline(item, 3 * s, false, rgb(120, 170, 230), 255);
             }
-            let icon = Rect::new(item.x + 8 * s, item.y + 6 * s, 22 * s, 20 * s);
-            c.fill(icon, rgb(235, 245, 255));
-            c.fill(Rect::new(icon.x, icon.y, icon.w, 5 * s), rgb(60, 130, 210));
-            c.frame(icon, rgb(20, 50, 90));
+            c.icon(kind_icon(*kind), item.x + 6 * s, item.y + 2 * s, 32 * s);
             let title = self.windows[self.index(*kind)].title;
             c.text(item.x + 40 * s, item.y + (item.h - Font::Normal.h(s)) / 2, title, 0x101010, Font::Normal);
         }
@@ -2929,51 +2978,30 @@ impl Canvas {
     /// A hard drive, 32 x 22 at scale 1: a grey box with a green light.
     /// A network drive: the drive on a cable and a green network bar.
     fn net_drive(&mut self, x: i32, y: i32, s: i32, connected: bool) {
-        self.drive(x, y - 3 * s, s, false);
-        self.fill(Rect::new(x + 15 * s, y + 19 * s, 3 * s, 4 * s), rgb(60, 70, 85));
-        let bar = if connected { rgb(40, 160, 70) } else { rgb(170, 60, 50) };
-        self.fill(Rect::new(x + 4 * s, y + 23 * s, 24 * s, 3 * s), bar);
+        self.icon("netdrive", x - 2 * s, y - 8 * s, 36 * s);
+        if !connected {
+            // Not connected: the green bar at the bottom turns red.
+            self.fill(Rect::new(x + 5 * s, y + 21 * s, 22 * s, 2 * s), rgb(190, 50, 40));
+        }
     }
 
     fn drive(&mut self, x: i32, y: i32, s: i32, removable: bool) {
-        let body = Rect::new(x, y + 6 * s, 32 * s, 16 * s);
-        let (top, bottom) = if removable { (rgb(120, 170, 230), rgb(40, 90, 170)) } else { (rgb(210, 215, 222), rgb(130, 136, 146)) };
-        self.rounded(body, 3 * s, false, top, bottom, 255);
-        self.rounded_outline(body, 3 * s, false, rgb(90, 96, 106), 255);
-        self.shade(Rect::new(body.x + 2 * s, body.y + 2 * s, body.w - 4 * s, 5 * s), 0xFFFFFF, 90);
-        self.fill(Rect::new(x + 24 * s, y + 15 * s, 4 * s, 3 * s), rgb(80, 220, 90));
+        self.icon(if removable { "usb" } else { "drive" }, x - 2 * s, y - 4 * s, 36 * s);
     }
 
     /// The small drive for the navigation pane, 16 x 12 at scale 1.
     fn small_drive(&mut self, x: i32, y: i32, s: i32, network: bool) {
-        let body = Rect::new(x, y + 1 * s, 16 * s, 9 * s);
-        self.gradient(body, rgb(215, 220, 228), rgb(140, 146, 156), 255);
-        self.frame(body, rgb(90, 96, 106));
-        self.fill(Rect::new(x + 11 * s, y + 6 * s, 3 * s, 2 * s), rgb(80, 220, 90));
-        if network {
-            // A cable down to a green bar: a network drive.
-            self.fill(Rect::new(x + 7 * s, y + 10 * s, 2 * s, 2 * s), rgb(60, 70, 85));
-            self.fill(Rect::new(x + 2 * s, y + 12 * s, 12 * s, 2 * s), rgb(40, 150, 70));
-        }
+        self.icon(if network { "netdrive" } else { "drive" }, x - s, y - 3 * s, 18 * s);
     }
 
     /// A small wastebasket for the Recycle Bin, 14 x 16 at scale 1.
     fn small_bin(&mut self, x: i32, y: i32, s: i32) {
-        self.fill(Rect::new(x, y + 2 * s, 14 * s, 2 * s), rgb(120, 140, 160));
-        self.fill(Rect::new(x + 5 * s, y, 4 * s, 2 * s), rgb(120, 140, 160));
-        let body = Rect::new(x + s, y + 4 * s, 12 * s, 12 * s);
-        self.gradient(body, rgb(225, 238, 250), rgb(160, 190, 220), 255);
-        self.frame(body, rgb(90, 110, 140));
-        for i in 0..3 {
-            self.fill(Rect::new(x + (4 + 3 * i) * s, y + 6 * s, s, 8 * s), rgb(110, 135, 165));
-        }
+        self.icon("bin", x - 2 * s, y - s, 18 * s);
     }
 
     /// A small screen for the navigation pane, 16 x 14 at scale 1.
     fn small_computer(&mut self, x: i32, y: i32, s: i32) {
-        self.fill(Rect::new(x, y, 16 * s, 11 * s), rgb(40, 44, 52));
-        self.gradient(Rect::new(x + s, y + s, 14 * s, 9 * s), rgb(120, 200, 250), rgb(20, 80, 170), 255);
-        self.fill(Rect::new(x + 5 * s, y + 11 * s, 6 * s, 3 * s), rgb(80, 80, 90));
+        self.icon("computer", x - s, y - 2 * s, 18 * s);
     }
 }
 
@@ -8090,6 +8118,20 @@ fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool
 
 /// The scale things are drawn at: 2 on big screens unless set otherwise
 /// (Large needs a screen of at least 1600 x 1000).
+/// Each program's icon (see tools/make-icons.py).
+fn kind_icon(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Computer => "computer",
+        Kind::Notes => "notes",
+        Kind::Calculator => "calculator",
+        Kind::Photos => "photos",
+        Kind::Music => "music",
+        Kind::ControlPanel => "controlpanel",
+        Kind::System => "system",
+        Kind::Welcome => "welcome",
+    }
+}
+
 fn ui_for(w: i32, h: i32, text_size: i32) -> i32 {
     match text_size {
         1 => 1,

@@ -602,6 +602,13 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.63 the icons are pictures, not shapes drawn in code: Computer, Notes, Calculator, Photos, Music,
+Control Panel, System and Welcome, folders, hard drives, USB sticks, network drives, the Recycle Bin and
+text, sound and picture files. They are AeroForge's own artwork, drawn by `tools/make-icons.py` (Python
+with Pillow) at 96 x 96 into `userland/src/icons.bin`, which the desktop builds in and shrinks to each
+size it needs (48 on the desktop, 32 in the Start menu, 24 on the taskbar, 16 in lists). Run
+`python3 tools/make-icons.py --sheet icons.png` to see them all.
+
 Since 0.62 Music plays FLAC and OGG songs as well as MP3 and WAV. FLAC is decoded by AeroForge's own
 decoder (`userland/src/flac.rs`: 4 to 32-bit samples, fixed and LPC subframes, every stereo mode), and OGG
 files with Vorbis sound by lewton, a pure Rust Vorbis decoder kept in `userland/vendor/lewton` and changed
