@@ -523,9 +523,10 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "copying window up: .* Cancel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$" || true)
         [ -n "$XY" ] || fail "no progress window came up while copying /Big.bin ($(grep -a '\[desktop\] \(copying\|pasted\|paste failed\|Can.t\)' "$LOG" | tail -4 | tr -d '\r' | tr '\n' ';'))"
         sleep 0.5; type_keys $'\x03'; sleep 0.5; monitor "sendkey tab"; sleep 0.5
-        # The button goes down once the copy has started, before the window
-        # is up, and is held until Cancel takes it.
-        point_at "${XY%,*}" "${XY#*,}"; type_keys $'\x16'; sleep 0.3; monitor "mouse_button 1"; STAGE=bigcancel
+        # The button goes down with the paste, before the window is up, and is
+        # held until Cancel takes it: on a fast machine the copy is over in
+        # about half a second.
+        point_at "${XY%,*}" "${XY#*,}"; type_keys $'\x16'; monitor "mouse_button 1"; STAGE=bigcancel
     elif [ $STAGE = bigcancel ] && grep -q "\[desktop\] \(Cancel pressed\|pasted /Big.bin as /docs/Big - Copy\|paste failed\)" "$LOG"; then
         monitor "mouse_button 0"; STAGE=bigcancelled
     elif [ $STAGE = bigcancelled ] && grep -q "\[desktop\] \(paste cancelled at\|pasted /Big.bin as /docs/Big - Copy\|paste failed\)" "$LOG"; then
