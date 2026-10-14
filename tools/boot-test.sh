@@ -213,6 +213,8 @@ cp_bar() {
 }
 cp_count() { grep -c "\[desktop\] Control Panel $1: .* | end" "$LOG" || true; }
 click() { monitor "mouse_button 1" "mouse_button 0"; }
+# Where Paint shows $1 (a tool or a colour), from its latest "[desktop] Paint: picture at ..." line.
+paint_at() { grep -a "\[desktop\] Paint: picture at .* | end" "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 menu_item() { grep -a "\[desktop\] menu: " "$LOG" | tail -1 | grep -o "$1 at [0-9]*,[0-9]*" | head -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' '; }
 # Where the desktop's Computer window shows the entry named $2 of folder $1,
 # from its latest "[desktop] Computer: <folder> = a | b; first row at x,y, rows h apart" line.
@@ -672,6 +674,36 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musiciconclose
     elif [ $STAGE = musiciconclose ] && [ "$(grep -c "\[desktop\] closed Music" "$LOG")" -ge 3 ]; then
+        # Paint, from the Start menu.
+        sleep 0.5; point_at 27 780; click; STAGE=paintmenu
+    elif [ $STAGE = paintmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
+        sleep 0.5
+        XY=$(grep -ao "Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintopen
+    elif [ $STAGE = paintopen ] && grep -q "\[desktop\] Paint: picture at .* | end" "$LOG"; then
+        # A red box from (20,20) to (140,80) of the picture, dragged out.
+        sleep 0.5
+        read -r IX IY <<< "$(grep -ao "Paint: picture at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$" | tr ',' ' ')"
+        point_at $(paint_at red); click; point_at $(paint_at Box); click
+        point_at $((IX + 20)) $((IY + 20)); monitor "mouse_button 1" "mouse_move 60 0" "mouse_move 60 30" "mouse_move 0 30" "mouse_button 0"
+        STAGE=paintbox
+    elif [ $STAGE = paintbox ] && grep -q "\[desktop\] Paint: Box from" "$LOG"; then
+        # Fill its inside blue, then a green brush stroke below it, taken back with Ctrl+Z.
+        sleep 0.5; point_at $(paint_at Fill); click; point_at $(paint_at blue); click
+        point_at $((IX + 60)) $((IY + 50)); click; STAGE=paintfill
+    elif [ $STAGE = paintfill ] && grep -q "\[desktop\] Paint: filled" "$LOG"; then
+        sleep 0.5; point_at $(paint_at Brush); click; point_at $(paint_at green); click
+        point_at $((IX + 20)) $((IY + 120)); monitor "mouse_button 1" "mouse_move 100 0" "mouse_move 100 0" "mouse_button 0"
+        STAGE=paintbrush
+    elif [ $STAGE = paintbrush ] && grep -q "\[desktop\] Paint: Brush from" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-paint.ppm"
+        type_keys $'\x1a'; STAGE=paintundo
+    elif [ $STAGE = paintundo ] && grep -q "\[desktop\] Paint: undone" "$LOG"; then
+        sleep 0.5; type_keys $'\x13'; STAGE=paintsave
+    elif [ $STAGE = paintsave ] && grep -q "\[desktop\] Paint: \(saved\|could not save\|.* did not read back\)" "$LOG"; then
+        read -r PX PY PW _ <<< "$(grep -ao "opened Paint at [0-9]*,[0-9]* ([0-9]*x[0-9]*)" "$LOG" | tail -1 | tr -c '0-9\n' ' ')"
+        sleep 0.5; point_at $((PX + PW - 27)) $((PY + 10)); click; STAGE=paintclose
+    elif [ $STAGE = paintclose ] && grep -q "\[desktop\] closed Paint" "$LOG"; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
@@ -692,7 +724,7 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = deskcalcdone ] && grep -q "\[desktop\] calculator: " "$LOG"; then
         # Control Panel, from the right of the Start menu.
         sleep 0.5; point_at 27 780; click; STAGE=cpmenu
-    elif [ $STAGE = cpmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
+    elif [ $STAGE = cpmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG")" -ge 3 ]; then
         sleep 0.5
         XY=$(grep -ao "Start menu open; Control Panel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cphome
@@ -886,6 +918,19 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "  pointer at (640, 200)" "$LOG" \
             || { fail "a USB tablet pointing at the middle top quarter did not put the pointer at 640,200 ($(grep -ao '  pointer at ([0-9, ]*)' "$LOG"))"; }
         grep -q "\[desktop\] calculator: 84" "$LOG" || { fail "Calculator did not work out 12+30*2 = 84 from typed keys and a click on ="; }
+        grep -q "\[desktop\] Paint: Box from 20,20 to 140,80" "$LOG" && grep -q "\[desktop\] Paint: saved /Pictures/Painting.bmp (" "$LOG" \
+            && mtype -i build/disk.img@@1M ::/Pictures/Painting.bmp > build/Painting.bmp && python3 - build/Painting.bmp <<'PY' \
+            || { fail "Paint did not save a red box filled blue, without the stroke taken back, to /Pictures/Painting.bmp ($(grep -a '\[desktop\] Paint: [A-Z]' "$LOG" | tail -6 | tr -d '\r' | tr '\n' ';'))"; }
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+off, w, h, bpp = struct.unpack_from('<I', d, 10)[0], *struct.unpack_from('<iiH', d, 18)[:2], struct.unpack_from('<H', d, 28)[0]
+row = (w * 3 + 3) & ~3
+px = lambda x, y: d[off + (h - 1 - y) * row + 3 * x: off + (h - 1 - y) * row + 3 * x + 3][::-1].hex()
+want = {(20, 50): 'e22b2b', (140, 30): 'e22b2b', (60, 50): '2f7fe0', (5, 5): 'ffffff', (100, 120): 'ffffff', (200, 200): 'ffffff'}
+got = {k: px(*k) for k in want}
+print('Painting.bmp: %dx%d, %d bits, %s' % (w, h, bpp, got))
+sys.exit(0 if bpp == 24 and got == want else 1)
+PY
         python3 tools/check-screen.py start build/gop-start.ppm || { fail "the Start button or the Start menu is wrong in the screenshot"; }
         python3 tools/check-screen.py snap build/gop-snap.ppm || { fail "the snapped window is not on the left half of the screenshot"; }
         CXY=$(grep -ao "opened Computer at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")

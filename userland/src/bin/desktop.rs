@@ -617,12 +617,13 @@ enum Kind {
     Photos,
     Music,
     ControlPanel,
+    Paint,
 }
 
-const KINDS: [Kind; 8] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Photos, Kind::Music, Kind::ControlPanel, Kind::System, Kind::Welcome];
+const KINDS: [Kind; 9] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::ControlPanel, Kind::System, Kind::Welcome];
 
 /// The programs on the left of the Start menu (Control Panel is on the right, as in Windows 7).
-const MENU: [Kind; 7] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Photos, Kind::Music, Kind::System, Kind::Welcome];
+const MENU: [Kind; 8] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::System, Kind::Welcome];
 
 /// A page of the Control Panel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -683,6 +684,225 @@ impl Default for Prefs {
 
 /// Desktop icons, top to bottom.
 const ICONS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System];
+
+/// Paint's tools, as on its toolbar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tool {
+    Pencil,
+    Brush,
+    Eraser,
+    Fill,
+    Line,
+    Box,
+}
+
+const TOOLS: [(Tool, &str); 6] =
+    [(Tool::Pencil, "Pencil"), (Tool::Brush, "Brush"), (Tool::Eraser, "Eraser"), (Tool::Fill, "Fill"), (Tool::Line, "Line"), (Tool::Box, "Box")];
+
+/// Paint's brush sizes (a radius in pixels), small to large.
+const PAINT_SIZES: [i32; 3] = [1, 4, 9];
+
+/// Paint's colours, along the bottom.
+const PAINT_COLORS: [(u32, &str); 14] = [
+    (0x000000, "black"),
+    (0x7F7F7F, "grey"),
+    (0xC3C3C3, "silver"),
+    (0xFFFFFF, "white"),
+    (0xE22B2B, "red"),
+    (0xFF8A1F, "orange"),
+    (0xF5CC1F, "yellow"),
+    (0x3FB34F, "green"),
+    (0x1FA8A0, "teal"),
+    (0x2F7FE0, "blue"),
+    (0x1C2F9C, "navy"),
+    (0x8E4FD0, "purple"),
+    (0xE45FB0, "pink"),
+    (0x8B5A2B, "brown"),
+];
+
+/// Paint's picture and how it is being drawn on.
+struct Paint {
+    px: Vec<u32>,
+    w: i32,
+    h: i32,
+    tool: Tool,
+    color: u32,
+    /// Index into PAINT_SIZES.
+    size: usize,
+    /// The stroke under way: where it started and where the pointer was last
+    /// (in picture pixels).
+    stroke: Option<((i32, i32), (i32, i32))>,
+    /// Earlier pictures, for Ctrl+Z (the last is the one before the latest stroke).
+    undo: Vec<Vec<u32>>,
+    /// Where it was last saved.
+    path: Option<String>,
+    changed: bool,
+    status: String,
+}
+
+impl Paint {
+    fn new(w: i32, h: i32) -> Paint {
+        Paint {
+            px: alloc::vec![0xFFFFFF; (w * h) as usize],
+            w,
+            h,
+            tool: Tool::Pencil,
+            color: 0x000000,
+            size: 1,
+            stroke: None,
+            undo: Vec::new(),
+            path: None,
+            changed: false,
+            status: String::new(),
+        }
+    }
+
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        if x >= 0 && y >= 0 && x < self.w && y < self.h {
+            self.px[(y * self.w + x) as usize] = color;
+        }
+    }
+
+    /// One touch of the tool at (x, y).
+    fn dab(&mut self, x: i32, y: i32) {
+        let r = PAINT_SIZES[self.size];
+        match self.tool {
+            Tool::Pencil | Tool::Line | Tool::Box => {
+                // A thin line: one pixel, or a small square for the larger sizes.
+                let half = if self.tool == Tool::Pencil { 0 } else { r / 3 };
+                for dy in -half..=half {
+                    for dx in -half..=half {
+                        self.put(x + dx, y + dy, self.color);
+                    }
+                }
+            }
+            Tool::Brush => {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx * dx + dy * dy <= r * r + r {
+                            self.put(x + dx, y + dy, self.color);
+                        }
+                    }
+                }
+            }
+            Tool::Eraser => {
+                let e = r + 2;
+                for dy in -e..=e {
+                    for dx in -e..=e {
+                        self.put(x + dx, y + dy, 0xFFFFFF);
+                    }
+                }
+            }
+            Tool::Fill => {}
+        }
+    }
+
+    /// Dabs all along the line from a to b (Bresenham).
+    fn line(&mut self, a: (i32, i32), b: (i32, i32)) {
+        let (mut x, mut y) = a;
+        let (dx, dy) = ((b.0 - x).abs(), -(b.1 - y).abs());
+        let (sx, sy) = (if x < b.0 { 1 } else { -1 }, if y < b.1 { 1 } else { -1 });
+        let mut err = dx + dy;
+        loop {
+            self.dab(x, y);
+            if (x, y) == b {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    fn rectangle(&mut self, a: (i32, i32), b: (i32, i32)) {
+        self.line(a, (b.0, a.1));
+        self.line((b.0, a.1), b);
+        self.line(b, (a.0, b.1));
+        self.line((a.0, b.1), a);
+    }
+
+    /// Fills the area of one colour around (x, y) with the colour chosen.
+    /// Returns how many pixels changed.
+    fn flood(&mut self, x: i32, y: i32) -> usize {
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return 0;
+        }
+        let (w, h) = (self.w, self.h);
+        let old = self.px[(y * w + x) as usize];
+        if old == self.color {
+            return 0;
+        }
+        let mut count = 0;
+        let mut todo = alloc::vec![(x, y)];
+        while let Some((x, y)) = todo.pop() {
+            // Along the row both ways, then look above and below.
+            let row = (y * w) as usize;
+            if self.px[row + x as usize] != old {
+                continue;
+            }
+            let (mut l, mut r) = (x, x);
+            while l > 0 && self.px[row + l as usize - 1] == old {
+                l -= 1;
+            }
+            while r < w - 1 && self.px[row + r as usize + 1] == old {
+                r += 1;
+            }
+            self.px[row + l as usize..=row + r as usize].fill(self.color);
+            count += (r - l + 1) as usize;
+            for ny in [y - 1, y + 1] {
+                if ny < 0 || ny >= h {
+                    continue;
+                }
+                let nrow = (ny * w) as usize;
+                let mut inside = false;
+                for nx in l..=r {
+                    let same = self.px[nrow + nx as usize] == old;
+                    if same && !inside {
+                        todo.push((nx, ny));
+                    }
+                    inside = same;
+                }
+            }
+        }
+        count
+    }
+
+    /// The picture as a 24-bit BMP file (bottom row first, rows padded to 4 bytes).
+    fn bmp(&self) -> Vec<u8> {
+        let row = ((self.w * 3 + 3) & !3) as usize;
+        let size = 54 + row * self.h as usize;
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&self.w.to_le_bytes());
+        out.extend_from_slice(&self.h.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&((row * self.h as usize) as u32).to_le_bytes());
+        out.extend_from_slice(&2835u32.to_le_bytes());
+        out.extend_from_slice(&2835u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for y in (0..self.h).rev() {
+            let start = out.len();
+            for &p in &self.px[(y * self.w) as usize..((y + 1) * self.w) as usize] {
+                out.extend_from_slice(&[p as u8, (p >> 8) as u8, (p >> 16) as u8]);
+            }
+            out.resize(start + row, 0);
+        }
+        out
+    }
+}
 
 /// Calculator keys, row by row; "=" fills two rows at the bottom right.
 const CALC_KEYS: [[&str; 4]; 5] = [
@@ -1251,6 +1471,7 @@ struct Desktop {
     /// The picture open in Photos, and the song in Music.
     photo: Option<Photo>,
     player: Option<Player>,
+    paint: Option<Paint>,
     /// A copy or move under way, with its progress window.
     progress: Option<Progress>,
     /// The Control Panel: its page, the settings, the date and time being
@@ -1515,6 +1736,7 @@ impl Desktop {
             Kind::Photos => self.photos_view(c, &client),
             Kind::Music => self.music_view(c, &client),
             Kind::ControlPanel => self.cp_view(c, &client),
+            Kind::Paint => self.paint_view(c, &client),
         }
     }
 
@@ -1923,6 +2145,7 @@ impl Desktop {
                     spots.extend((0..room.min(count.saturating_sub(first))).map(|i| self.music_row(&client, i)));
                 }
                 Kind::ControlPanel => spots.extend(self.cp_controls(&client).into_iter().map(|(_, r)| r)),
+                Kind::Paint => spots.extend(self.paint_spots(&client)),
                 Kind::Calculator => {
                     for row in 0..5 {
                         for col in 0..4 {
@@ -2032,8 +2255,9 @@ impl Desktop {
             if self.menu {
                 let cp = self.cp_menu_item();
                 let music = self.menu_item(MENU.iter().position(|&k| k == Kind::Music).unwrap_or(0));
-                println!("[desktop] Start menu open; Control Panel at {},{}; Music at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2,
-                    music.x + music.w / 2, music.y + music.h / 2);
+                let paint = self.menu_item(MENU.iter().position(|&k| k == Kind::Paint).unwrap_or(0));
+                println!("[desktop] Start menu open; Control Panel at {},{}; Music at {},{}; Paint at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2,
+                    music.x + music.w / 2, music.y + music.h / 2, paint.x + paint.w / 2, paint.y + paint.h / 2);
             }
             return dirty.union(&self.menu_rect()).union(&self.taskbar());
         }
@@ -2118,6 +2342,9 @@ impl Desktop {
                         dirty = dirty.union(&self.step_photo(next));
                     }
                 }
+            } else if self.windows[i].kind == Kind::Paint && self.client(&r).contains(x, y) {
+                let client = self.client(&r);
+                dirty = dirty.union(&self.paint_click(&client, x, y));
             } else if self.windows[i].kind == Kind::ControlPanel && self.client(&r).contains(x, y) {
                 let client = self.client(&r);
                 dirty = dirty.union(&self.cp_click(&client, x, y, double));
@@ -2232,6 +2459,9 @@ impl Desktop {
             }
             self.log_window(kind);
         }
+        if kind == Kind::Paint {
+            self.open_paint();
+        }
         if kind == Kind::Calculator {
             let k = self.calc_key(&self.client(&r), 3, 3);
             println!("[desktop] Calculator = key at {},{}", k.x + k.w / 2, k.y + k.h / 2);
@@ -2336,6 +2566,17 @@ impl Desktop {
             }
             if self.top_kind() == Some(Kind::Music) && k == b' ' {
                 dirty = dirty.union(&self.music_command(1));
+                continue;
+            }
+            if self.top_kind() == Some(Kind::Paint) && matches!(k, 0x13 | 0x1a | 0x0e) {
+                // Ctrl+S saves, Ctrl+Z takes back the last stroke, Ctrl+N starts again.
+                let at = self.windows.len() - 1;
+                let client = self.client(&self.windows[at].rect);
+                dirty = dirty.union(&match k {
+                    0x13 => self.save_paint(&client),
+                    0x1a => self.paint_undo(&client),
+                    _ => self.paint_new(&client),
+                });
                 continue;
             }
             if self.top_kind() == Some(Kind::Calculator) {
@@ -6426,6 +6667,293 @@ impl Desktop {
         c.text(b.x + (b.w - Font::Normal.width(s, label)) / 2, b.y + (b.h - Font::Normal.h(s)) / 2, label, rgb(20, 40, 80), Font::Normal);
     }
 
+    // -------------------------------------------------------------- Paint
+
+    /// Paint's toolbar along the top, its colours along the bottom and the
+    /// picture between them, shown at its own size from the top left.
+    fn paint_toolbar(&self, client: &Rect) -> Rect {
+        Rect::new(client.x, client.y, client.w, 40 * self.ui)
+    }
+    fn paint_palette(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x, client.y + client.h - 38 * s, client.w, 38 * s)
+    }
+    fn paint_area(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x, client.y + 40 * s, client.w, client.h - 78 * s)
+    }
+    /// Where the picture is: its top left, and the part of it shown.
+    fn paint_image(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let a = self.paint_area(client);
+        let (w, h) = self.paint.as_ref().map_or((0, 0), |p| (p.w, p.h));
+        Rect::new(a.x + 8 * s, a.y + 8 * s, w, h)
+    }
+    fn paint_tool(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let w = Font::Small.width(s, "Pencil") + 14 * s;
+        Rect::new(client.x + 8 * s + i as i32 * (w + 4 * s), client.y + 6 * s, w, 28 * s)
+    }
+    fn paint_size(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let last = self.paint_tool(client, TOOLS.len() - 1);
+        Rect::new(last.x + last.w + 14 * s + i as i32 * 32 * s, client.y + 6 * s, 28 * s, 28 * s)
+    }
+    /// New, Undo and Save, from the right.
+    fn paint_command(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let w = Font::Small.width(s, "Undo") + 20 * s;
+        Rect::new(client.x + client.w - 8 * s - (3 - i as i32) * (w + 4 * s) + 4 * s, client.y + 6 * s, w, 28 * s)
+    }
+    fn paint_color(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let b = self.paint_palette(client);
+        Rect::new(b.x + 50 * s + i as i32 * 26 * s, b.y + 8 * s, 22 * s, 22 * s)
+    }
+    fn paint_spots(&self, client: &Rect) -> Vec<Rect> {
+        let mut v: Vec<Rect> = (0..TOOLS.len()).map(|i| self.paint_tool(client, i)).collect();
+        v.extend((0..PAINT_SIZES.len()).map(|i| self.paint_size(client, i)));
+        v.extend((0..3).map(|i| self.paint_command(client, i)));
+        v.extend((0..PAINT_COLORS.len()).map(|i| self.paint_color(client, i)));
+        v
+    }
+
+    /// Paint opens with a white picture as big as its window has room for.
+    fn open_paint(&mut self) {
+        let at = self.index(Kind::Paint);
+        let client = self.client(&self.windows[at].rect);
+        if self.paint.is_none() {
+            let s = self.ui;
+            let a = self.paint_area(&client);
+            self.paint = Some(Paint::new((a.w - 16 * s).max(64), (a.h - 16 * s).max(64)));
+        }
+        self.log_paint(&client);
+    }
+
+    /// Where Paint's picture and buttons are, for the tests.
+    fn log_paint(&self, client: &Rect) {
+        let mid = |r: Rect| format!("{},{}", r.x + r.w / 2, r.y + r.h / 2);
+        let img = self.paint_image(client);
+        let tools: Vec<String> = TOOLS.iter().enumerate().map(|(i, (_, name))| format!("{} at {}", name, mid(self.paint_tool(client, i)))).collect();
+        let sizes: Vec<String> = (0..PAINT_SIZES.len()).map(|i| mid(self.paint_size(client, i))).collect();
+        let colors: Vec<String> = PAINT_COLORS.iter().enumerate().map(|(i, (_, name))| format!("{} at {}", name, mid(self.paint_color(client, i)))).collect();
+        println!("[desktop] Paint: picture at {},{} ({}x{}); {}; sizes at {}; {}; New at {}; Undo at {}; Save at {} | end", img.x, img.y, img.w, img.h,
+            tools.join(" | "), sizes.join(" | "), colors.join(" | "), mid(self.paint_command(client, 0)), mid(self.paint_command(client, 1)), mid(self.paint_command(client, 2)));
+    }
+
+    fn paint_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        let Some(p) = &self.paint else { return };
+        // The toolbar.
+        let t = self.paint_toolbar(client);
+        c.gradient(t, rgb(245, 250, 255), rgb(215, 230, 245), 255);
+        c.fill(Rect::new(t.x, t.y + t.h - 1, t.w, 1), rgb(160, 180, 205));
+        let hot = |r: &Rect| r.contains(self.pointer.x as i32, self.pointer.y as i32);
+        let button = |c: &mut Canvas, r: Rect, on: bool| {
+            let (top, bottom) = match (on, hot(&r)) {
+                (true, _) => (rgb(200, 225, 250), rgb(150, 195, 240)),
+                (false, true) => (rgb(235, 248, 255), rgb(170, 215, 250)),
+                (false, false) => (rgb(252, 253, 255), rgb(215, 225, 240)),
+            };
+            c.rounded(r, 3 * s, false, top, bottom, 255);
+            c.rounded_outline(r, 3 * s, false, if on { rgb(60, 110, 180) } else { rgb(120, 140, 170) }, 255);
+        };
+        let label = |c: &mut Canvas, r: Rect, text: &str| {
+            c.text(r.x + (r.w - Font::Small.width(s, text)) / 2, r.y + (r.h - Font::Small.h(s)) / 2, text, 0x102040, Font::Small);
+        };
+        for (i, &(tool, name)) in TOOLS.iter().enumerate() {
+            let r = self.paint_tool(client, i);
+            button(c, r, p.tool == tool);
+            label(c, r, name);
+        }
+        for (i, &radius) in PAINT_SIZES.iter().enumerate() {
+            let r = self.paint_size(client, i);
+            button(c, r, p.size == i);
+            let d = ((2 * radius + 1) * s).min(r.w - 8 * s).max(3 * s);
+            c.rounded(Rect::new(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d), d / 2, false, 0x202020, 0x202020, 255);
+        }
+        for (i, name) in ["New", "Undo", "Save"].iter().enumerate() {
+            let r = self.paint_command(client, i);
+            button(c, r, false);
+            label(c, r, name);
+        }
+        // The picture on a grey ground, with a shadow.
+        let a = self.paint_area(client);
+        c.fill(a, rgb(171, 182, 199));
+        let img = self.paint_image(client);
+        c.shade(Rect::new(img.x + 3 * s, img.y + 3 * s, img.w, img.h).intersect(&a), 0x000000, 50);
+        let d = img.intersect(&a).intersect(&c.clip);
+        for y in d.y..d.y + d.h {
+            let src = ((y - img.y) * p.w + (d.x - img.x)) as usize;
+            let row = (y * c.w + d.x) as usize;
+            c.px[row..row + d.w as usize].copy_from_slice(&p.px[src..src + d.w as usize]);
+        }
+        // The colours: the one in use, then the rest; and how it stands.
+        let b = self.paint_palette(client);
+        c.gradient(b, rgb(236, 242, 250), rgb(214, 224, 238), 255);
+        c.fill(Rect::new(b.x, b.y, b.w, 1), rgb(160, 180, 205));
+        let now = Rect::new(b.x + 10 * s, b.y + 5 * s, 28 * s, 28 * s);
+        c.fill(now, p.color);
+        c.frame(now, rgb(60, 70, 90));
+        for (i, &(color, _)) in PAINT_COLORS.iter().enumerate() {
+            let r = self.paint_color(client, i);
+            c.fill(r, color);
+            c.frame(r, if color == p.color { rgb(30, 90, 200) } else { rgb(120, 130, 150) });
+        }
+        let after = self.paint_color(client, PAINT_COLORS.len() - 1);
+        let room = ((b.x + b.w - after.x - after.w - 20 * s) / Font::Small.w(s)).max(0) as usize;
+        let status = if p.status.is_empty() { format!("{} x {}", p.w, p.h) } else { p.status.clone() };
+        let status: String = status.chars().take(room).collect();
+        c.text(after.x + after.w + 14 * s, b.y + (b.h - Font::Small.h(s)) / 2, &status, rgb(40, 55, 80), Font::Small);
+    }
+
+    /// A press in Paint: a button, a colour, or the start of a stroke.
+    fn paint_click(&mut self, client: &Rect, x: i32, y: i32) -> Rect {
+        let Some(p) = self.paint.as_ref() else { return Rect::EMPTY };
+        let (pw, ph) = (p.w, p.h);
+        if let Some(i) = (0..TOOLS.len()).find(|&i| self.paint_tool(client, i).contains(x, y)) {
+            self.paint.as_mut().unwrap().tool = TOOLS[i].0;
+            println!("[desktop] Paint: {}", TOOLS[i].1);
+            return self.paint_toolbar(client);
+        }
+        if let Some(i) = (0..PAINT_SIZES.len()).find(|&i| self.paint_size(client, i).contains(x, y)) {
+            self.paint.as_mut().unwrap().size = i;
+            println!("[desktop] Paint: size {}", i + 1);
+            return self.paint_toolbar(client);
+        }
+        if let Some(i) = (0..3).find(|&i| self.paint_command(client, i).contains(x, y)) {
+            return match i {
+                0 => self.paint_new(client),
+                1 => self.paint_undo(client),
+                _ => self.save_paint(client),
+            };
+        }
+        if let Some(i) = (0..PAINT_COLORS.len()).find(|&i| self.paint_color(client, i).contains(x, y)) {
+            self.paint.as_mut().unwrap().color = PAINT_COLORS[i].0;
+            println!("[desktop] Paint: colour {}", PAINT_COLORS[i].1);
+            return self.paint_palette(client);
+        }
+        let img = self.paint_image(client);
+        if !img.intersect(&self.paint_area(client)).contains(x, y) {
+            return Rect::EMPTY;
+        }
+        let at = ((x - img.x).clamp(0, pw - 1), (y - img.y).clamp(0, ph - 1));
+        let p = self.paint.as_mut().unwrap();
+        p.undo.push(p.px.clone());
+        if p.undo.len() > 8 {
+            p.undo.remove(0);
+        }
+        p.changed = true;
+        if p.tool == Tool::Fill {
+            let n = p.flood(at.0, at.1);
+            println!("[desktop] Paint: filled {} pixels at {},{}", n, at.0, at.1);
+            return self.paint_area(client);
+        }
+        p.stroke = Some((at, at));
+        p.dab(at.0, at.1);
+        self.paint_area(client)
+    }
+
+    /// The pointer moved or let go while a stroke is under way.
+    fn paint_step(&mut self, pt: aero::display::Pointer) -> Rect {
+        let at = self.index(Kind::Paint);
+        let client = self.client(&self.windows[at].rect);
+        let img = self.paint_image(&client);
+        let area = self.paint_area(&client);
+        let Some(p) = self.paint.as_mut() else { return Rect::EMPTY };
+        let Some((start, last)) = p.stroke else { return Rect::EMPTY };
+        let now = ((pt.x as i32 - img.x).clamp(0, p.w - 1), (pt.y as i32 - img.y).clamp(0, p.h - 1));
+        if now != last {
+            match p.tool {
+                Tool::Line | Tool::Box => {
+                    // Drawn again from the picture before the stroke as the pointer moves.
+                    if let Some(before) = p.undo.last() {
+                        p.px.copy_from_slice(before);
+                    }
+                    if p.tool == Tool::Line {
+                        p.line(start, now);
+                    } else {
+                        p.rectangle(start, now);
+                    }
+                }
+                _ => p.line(last, now),
+            }
+            p.stroke = Some((start, now));
+        }
+        if pt.buttons & 1 == 0 {
+            p.stroke = None;
+            let name = TOOLS.iter().find(|(t, _)| *t == p.tool).map_or("", |(_, n)| n);
+            println!("[desktop] Paint: {} from {},{} to {},{}", name, start.0, start.1, now.0, now.1);
+        }
+        area
+    }
+
+    fn paint_new(&mut self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let a = self.paint_area(client);
+        let (w, h) = ((a.w - 16 * s).max(64), (a.h - 16 * s).max(64));
+        let p = self.paint.as_mut().unwrap();
+        let (tool, color, size) = (p.tool, p.color, p.size);
+        *p = Paint::new(w, h);
+        p.tool = tool;
+        p.color = color;
+        p.size = size;
+        println!("[desktop] Paint: new picture ({}x{})", w, h);
+        *client
+    }
+
+    fn paint_undo(&mut self, client: &Rect) -> Rect {
+        let p = self.paint.as_mut().unwrap();
+        match p.undo.pop() {
+            Some(before) => {
+                p.px = before;
+                p.stroke = None;
+                p.changed = true;
+                println!("[desktop] Paint: undone");
+            }
+            None => p.status = String::from("Nothing to undo"),
+        }
+        *client
+    }
+
+    /// Saves the picture as a BMP file in Pictures (Painting.bmp, or the next
+    /// free name the first time), then reads it back to be sure.
+    fn save_paint(&mut self, client: &Rect) -> Rect {
+        let path = match self.paint.as_ref().and_then(|p| p.path.clone()) {
+            Some(path) => path,
+            None => {
+                let dir = if fs_list("/Pictures").is_ok() { "/Pictures" } else { "/" };
+                let taken: Vec<String> = fs_list(dir).unwrap_or_default().into_iter().map(|e| e.name).collect();
+                let names: Vec<&str> = taken.iter().map(|t| t.as_str()).collect();
+                join(dir, &free_name("Painting.bmp", &names, false, false))
+            }
+        };
+        let p = self.paint.as_mut().unwrap();
+        let data = p.bmp();
+        p.status = match fs_write(&path, &data) {
+            Ok(()) if matches!(fs_read(&path, data.len() + 1), Ok(back) if back == data) => {
+                println!("[desktop] Paint: saved {} ({}x{}, {} bytes)", path, p.w, p.h, data.len());
+                p.changed = false;
+                let name = split_path(&path).1;
+                p.path = Some(path);
+                format!("Saved as {}", name)
+            }
+            Ok(()) => {
+                println!("[desktop] Paint: {} did not read back the same", path);
+                String::from("Saved, but it did not read back the same")
+            }
+            Err(e) => {
+                println!("[desktop] Paint: could not save {} ({})", path, e);
+                String::from(match e {
+                    aero::E_RIGHTS => "Can't save here (read-only)",
+                    aero::E_FULL => "Can't save: the disk is full",
+                    _ => "Can't save",
+                })
+            }
+        };
+        self.paint_palette(client)
+    }
+
     // -------------------------------------------------------------- Music
 
     /// Music's song list down the left, the song playing on the right, and
@@ -8085,8 +8613,8 @@ fn clock(started_us: u64, hours24: bool) -> (String, String) {
 }
 
 /// Windows in the order they are stacked at start, back to front.
-const KINDS_BY_LAYER: [Kind; 8] =
-    [Kind::Welcome, Kind::System, Kind::Notes, Kind::Computer, Kind::Calculator, Kind::Photos, Kind::Music, Kind::ControlPanel];
+const KINDS_BY_LAYER: [Kind; 9] =
+    [Kind::Welcome, Kind::System, Kind::Notes, Kind::Computer, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::ControlPanel];
 
 /// A window's title, where it opens on a `w` x `h` screen at scale `s`, and
 /// whether it is open at start.
@@ -8101,6 +8629,10 @@ fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool
             ("Computer", Rect::new((w - cw - 20 * s).max(130 * s), 30 * s, cw, ch), false)
         }
         Kind::Calculator => ("Calculator", Rect::new(w / 2 - 40 * s, h / 7 + 10 * s, 260 * s, 350 * s), false),
+        Kind::Paint => {
+            let (pw, ph) = ((w - 80 * s).min(820 * s), (h - 110 * s).min(580 * s));
+            ("Paint", Rect::new((w - pw) / 2, 24 * s, pw, ph), false)
+        }
         Kind::Photos => {
             let (pw, ph) = ((w - 100 * s).min(900 * s), (h - 120 * s).min(660 * s));
             ("Photos", Rect::new((w - pw) / 2, 20 * s, pw, ph), false)
@@ -8127,6 +8659,7 @@ fn kind_icon(kind: Kind) -> &'static str {
         Kind::Photos => "photos",
         Kind::Music => "music",
         Kind::ControlPanel => "controlpanel",
+        Kind::Paint => "paint",
         Kind::System => "system",
         Kind::Welcome => "welcome",
     }
@@ -8385,6 +8918,7 @@ fn main() -> i64 {
         popup: None,
         photo: None,
         player: None,
+        paint: None,
         progress: None,
         cp_page: CpPage::Home,
         prefs,
@@ -8499,6 +9033,9 @@ fn main() -> i64 {
                     desk.resize = None;
                     dirty = dirty.union(&desk.window_area(i));
                 }
+            }
+            if desk.paint.as_ref().is_some_and(|pt| pt.stroke.is_some()) {
+                dirty = dirty.union(&desk.paint_step(p));
             }
             if desk.file_drag.is_some() {
                 dirty = dirty.union(&desk.file_drag_step(p));

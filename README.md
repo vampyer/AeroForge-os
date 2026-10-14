@@ -602,6 +602,11 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.64 there is Paint, in the Start menu: draw with a pencil or a round brush in three sizes, rub out
+with the eraser, fill an area with the paint bucket, or drag out straight lines and boxes, in fourteen
+colours. Ctrl+Z takes back the last strokes (up to eight), Ctrl+N starts a new picture and Ctrl+S (or
+Save) keeps it as a 24-bit BMP file in Pictures, `Painting.bmp` the first time, which Photos can show.
+
 Since 0.63 the icons are pictures, not shapes drawn in code: Computer, Notes, Calculator, Photos, Music,
 Control Panel, System and Welcome, folders, hard drives, USB sticks, network drives, the Recycle Bin and
 text, sound and picture files. They are AeroForge's own artwork, drawn by `tools/make-icons.py` (Python
