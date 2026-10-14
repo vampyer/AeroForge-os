@@ -1,9 +1,15 @@
 //! Pictures and sound files for the desktop: JPEG, PNG and BMP decoded to
-//! pixels, and MP3 and WAV decoded to the 48 kHz stereo samples the audio
-//! system calls take. JPEG and PNG use the zune-jpeg and zune-png crates,
-//! MP3 the nanomp3 crate (a Rust port of minimp3); BMP and WAV are read here.
+//! pixels, and MP3, WAV, FLAC and OGG (Vorbis) decoded to the 48 kHz stereo
+//! samples the audio system calls take. JPEG and PNG use the zune-jpeg and
+//! zune-png crates, MP3 the nanomp3 crate (a Rust port of minimp3), Vorbis
+//! the lewton crate (made no_std, in userland/vendor/lewton); BMP, WAV,
+//! FLAC (see flac.rs) and the Ogg pages around Vorbis are read here.
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use crate::flac;
+use lewton::audio::{read_audio_packet_generic, PreviousWindowRight};
+use lewton::header::{read_header_comment, read_header_ident, read_header_setup, IdentHeader, SetupHeader};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -176,7 +182,82 @@ const OUT_RATE: u64 = 48_000;
 
 enum Source {
     Mp3 { dec: nanomp3::Decoder, pos: usize },
-    Wav { start: usize, end: usize, pos: usize, bits: u16, block: usize },
+    /// `float`: 32-bit IEEE samples rather than whole numbers.
+    Wav { start: usize, end: usize, pos: usize, bits: u16, block: usize, float: bool },
+    Flac { start: usize, pos: usize, info: flac::Info, chans: Vec<Vec<i32>> },
+    Vorbis { ogg: Ogg, ident: alloc::boxed::Box<IdentHeader>, setup: alloc::boxed::Box<SetupHeader>, pwr: PreviousWindowRight },
+}
+
+/// Reads the packets of the first logical stream in an Ogg file, page by page.
+struct Ogg {
+    /// Where the next page starts.
+    pos: usize,
+    serial: Option<u32>,
+    /// A packet that goes on into the next page.
+    part: Vec<u8>,
+    ready: VecDeque<Vec<u8>>,
+    /// After a seek: drop the end of a packet begun on an earlier page.
+    skip_cont: bool,
+}
+
+impl Ogg {
+    fn new(pos: usize) -> Ogg {
+        Ogg { pos, serial: None, part: Vec::new(), ready: VecDeque::new(), skip_cont: false }
+    }
+
+    fn next(&mut self, d: &[u8]) -> Option<Vec<u8>> {
+        loop {
+            if let Some(p) = self.ready.pop_front() {
+                return Some(p);
+            }
+            // The next page; after a seek or damage, the next "OggS".
+            if d.get(self.pos..self.pos + 4) != Some(b"OggS") {
+                self.pos = find(d, b"OggS", self.pos)?;
+            }
+            let h = d.get(self.pos..self.pos + 27)?;
+            let flags = h[5];
+            let serial = u32::from_le_bytes([h[14], h[15], h[16], h[17]]);
+            let segs = h[26] as usize;
+            let lacing = d.get(self.pos + 27..self.pos + 27 + segs)?;
+            let body_len: usize = lacing.iter().map(|&l| l as usize).sum();
+            let mut at = self.pos + 27 + segs;
+            if at + body_len > d.len() || h[4] != 0 {
+                self.pos += 4;
+                continue;
+            }
+            self.pos = at + body_len;
+            if *self.serial.get_or_insert(serial) != serial {
+                continue;
+            }
+            let mut skipping = self.skip_cont && flags & 1 != 0;
+            self.skip_cont = false;
+            if flags & 1 == 0 {
+                self.part.clear();
+            }
+            for &l in lacing {
+                let seg = &d[at..at + l as usize];
+                at += l as usize;
+                if !skipping {
+                    self.part.extend_from_slice(seg);
+                }
+                if l < 255 {
+                    if !skipping {
+                        self.ready.push_back(core::mem::take(&mut self.part));
+                    }
+                    skipping = false;
+                }
+            }
+        }
+    }
+}
+
+fn find(d: &[u8], what: &[u8], from: usize) -> Option<usize> {
+    d.get(from..)?.windows(what.len()).position(|w| w == what).map(|i| from + i)
+}
+
+/// Scales a sample of `bits` bits to 16.
+fn to16(v: i32, bits: u8) -> i16 {
+    if bits > 16 { (v >> (bits - 16)) as i16 } else { (v << (16 - bits)) as i16 }
 }
 
 /// A song being played: decoded a piece at a time and turned into 48 kHz
@@ -184,7 +265,7 @@ enum Source {
 pub struct Song {
     data: Vec<u8>,
     source: Source,
-    /// "MP3" or "WAV", its own rate and channels.
+    /// "MP3", "WAV", "FLAC" or "OGG", its own rate and channels.
     pub format: &'static str,
     pub rate: u32,
     pub channels: u8,
@@ -205,9 +286,11 @@ pub struct Song {
 const FRAC: u64 = 1 << 16;
 
 impl Song {
-    /// Reads an MP3 or WAV file's header, ready to play from the start.
+    /// Reads a song's header, ready to play from the start.
     pub fn open(data: Vec<u8>) -> Result<Song, &'static str> {
         let wav = data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WAVE");
+        let ogg = data.starts_with(b"OggS");
+        let is_flac = flac::open(&data).is_ok() || data.starts_with(b"fLaC");
         let mut song = Song {
             data,
             source: Source::Mp3 { dec: nanomp3::Decoder::new(), pos: 0 },
@@ -222,6 +305,10 @@ impl Song {
         };
         if wav {
             song.open_wav()?;
+        } else if ogg {
+            song.open_ogg()?;
+        } else if is_flac {
+            song.open_flac()?;
         } else {
             song.open_mp3()?;
         }
@@ -243,19 +330,22 @@ impl Song {
                 let rate = u32_at(d, body + 4).ok_or(bad)?;
                 let block = u16_at(d, body + 12).ok_or(bad)? as usize;
                 let bits = u16_at(d, body + 14).ok_or(bad)?;
-                // 1 is PCM; 0xFFFE (extensible) is PCM too when its subformat says so.
-                let pcm = tag == 1 || (tag == 0xFFFE && u16_at(d, body + 24) == Some(1));
-                if !pcm || !matches!(bits, 8 | 16 | 24 | 32) || !(1..=8).contains(&channels) || !(8000..=192_000).contains(&rate) {
-                    return Err("only uncompressed (PCM) WAV files can be played");
+                // 1 is PCM and 3 is 32-bit floating point; 0xFFFE
+                // (extensible) is either, as its subformat says.
+                let kind = if tag == 0xFFFE { u16_at(d, body + 24).unwrap_or(0) } else { tag };
+                let float = kind == 3;
+                let ok = (kind == 1 && matches!(bits, 8 | 16 | 24 | 32)) || (float && bits == 32);
+                if !ok || !(1..=8).contains(&channels) || !(8000..=192_000).contains(&rate) {
+                    return Err("only uncompressed (PCM or floating point) WAV files can be played");
                 }
                 if block < channels as usize * bits as usize / 8 {
                     return Err(bad);
                 }
-                fmt = Some((channels, rate, block, bits));
+                fmt = Some((channels, rate, block, bits, float));
             } else if id == b"data" {
-                let (channels, rate, block, bits) = fmt.ok_or(bad)?;
+                let (channels, rate, block, bits, float) = fmt.ok_or(bad)?;
                 let end = (body + len).min(d.len());
-                self.source = Source::Wav { start: body, end, pos: body, bits, block };
+                self.source = Source::Wav { start: body, end, pos: body, bits, block, float };
                 self.format = "WAV";
                 self.rate = rate;
                 self.channels = channels as u8;
@@ -277,11 +367,68 @@ impl Song {
             first.get_or_insert((f.sample_rate, f.channels));
             samples += f.samples as u64;
         }
-        let (rate, channels) = first.ok_or("not an MP3 or WAV file")?;
+        let (rate, channels) = first.ok_or("not an MP3, WAV, FLAC or OGG file")?;
         self.rate = rate;
         self.channels = channels.num();
         self.frames = samples * OUT_RATE / rate.max(1) as u64;
         self.source = Source::Mp3 { dec: nanomp3::Decoder::new(), pos: start };
+        Ok(())
+    }
+
+    fn open_flac(&mut self) -> Result<(), &'static str> {
+        let (info, start) = flac::open(&self.data)?;
+        let first = flac::find_frame(&self.data, start, &info).ok_or("bad FLAC file")?;
+        self.format = "FLAC";
+        self.rate = info.rate;
+        self.channels = info.channels;
+        self.frames = info.samples * OUT_RATE / info.rate as u64;
+        self.source = Source::Flac { start: first, pos: first, info, chans: Vec::new() };
+        Ok(())
+    }
+
+    fn open_ogg(&mut self) -> Result<(), &'static str> {
+        let bad = "bad OGG file";
+        let mut ogg = Ogg::new(0);
+        let first = ogg.next(&self.data).ok_or(bad)?;
+        if first.starts_with(b"OpusHead") {
+            return Err("OGG files with Opus sound can't be played yet");
+        }
+        let ident = read_header_ident(&first).map_err(|_| "only OGG files with Vorbis sound can be played")?;
+        read_header_comment(&ogg.next(&self.data).ok_or(bad)?).map_err(|_| bad)?;
+        let setup = read_header_setup(&ogg.next(&self.data).ok_or(bad)?, ident.audio_channels, (ident.blocksize_0, ident.blocksize_1))
+            .map_err(|_| bad)?;
+        // The length: the last page's granule position counts the samples.
+        let mut samples = 0u64;
+        let mut at = self.data.len();
+        while at > 0 {
+            let from = at.saturating_sub(65_536);
+            let window = &self.data[from..at];
+            if let Some(i) = window.windows(4).rposition(|w| w == b"OggS") {
+                let p = from + i;
+                if let Some(h) = self.data.get(p..p + 27) {
+                    let g = i64::from_le_bytes([h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13]]);
+                    let serial = u32::from_le_bytes([h[14], h[15], h[16], h[17]]);
+                    if g > 0 && Some(serial) == ogg.serial {
+                        samples = g as u64;
+                        break;
+                    }
+                }
+                at = p;
+            } else {
+                at = from + 3.min(window.len());
+                if from == 0 {
+                    break;
+                }
+            }
+        }
+        self.format = "OGG";
+        self.rate = ident.audio_sample_rate;
+        self.channels = ident.audio_channels;
+        if self.rate == 0 {
+            return Err(bad);
+        }
+        self.frames = samples * OUT_RATE / self.rate as u64;
+        self.source = Source::Vorbis { ogg, ident: alloc::boxed::Box::new(ident), setup: alloc::boxed::Box::new(setup), pwr: PreviousWindowRight::new() };
         Ok(())
     }
 
@@ -304,6 +451,17 @@ impl Song {
                 let n = (frame * self.rate as u64 / OUT_RATE) as usize;
                 *pos = (*start + n * *block).min(*end);
             }
+            Source::Flac { start, pos, info, .. } => {
+                let at = *start + share(self.data.len() - *start);
+                *pos = flac::find_frame(&self.data, at, info).unwrap_or(self.data.len());
+            }
+            Source::Vorbis { ogg, pwr, .. } => {
+                let serial = ogg.serial;
+                *ogg = Ogg::new(share(self.data.len()));
+                ogg.serial = serial;
+                ogg.skip_cont = true;
+                *pwr = PreviousWindowRight::new();
+            }
             Source::Mp3 { dec, pos } => {
                 let start = nanomp3::id3v2_len(&self.data).min(self.data.len());
                 *pos = start + share(self.data.len() - start);
@@ -315,13 +473,18 @@ impl Song {
     /// Decodes some more of the song into `pending`; false at its end.
     fn decode_more(&mut self) -> bool {
         match &mut self.source {
-            Source::Wav { end, pos, bits, block, .. } => {
+            Source::Wav { end, pos, bits, block, float, .. } => {
                 let take = (*end - *pos) / *block;
                 let take = take.min(4096);
                 if take == 0 {
                     return false;
                 }
+                let float = *float;
                 let sample = |b: &[u8]| -> i16 {
+                    if float {
+                        let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]) * 32768.0;
+                        return v.max(-32768.0).min(32767.0) as i16;
+                    }
                     match *bits {
                         8 => ((b[0] as i16) - 128) << 8,
                         16 => i16::from_le_bytes([b[0], b[1]]),
@@ -338,6 +501,44 @@ impl Song {
                 }
                 *pos += take * *block;
                 true
+            }
+            Source::Flac { pos, info, chans, .. } => {
+                // Frames that fail to decode are skipped to the next one.
+                for _ in 0..16 {
+                    if *pos >= self.data.len() {
+                        return false;
+                    }
+                    match flac::frame(&self.data, *pos, info, chans) {
+                        Some((len, rate)) => {
+                            *pos += len;
+                            let (l, r) = (&chans[0], &chans[if chans.len() > 1 { 1 } else { 0 }]);
+                            self.pending.extend(l.iter().zip(r.iter()).map(|(&a, &b)| (to16(a, info.bits), to16(b, info.bits))));
+                            if rate != 0 {
+                                self.rate = rate;
+                            }
+                            return true;
+                        }
+                        None => match flac::find_frame(&self.data, *pos + 1, info) {
+                            Some(next) => *pos = next,
+                            None => return false,
+                        },
+                    }
+                }
+                false
+            }
+            Source::Vorbis { ogg, ident, setup, pwr } => {
+                for _ in 0..64 {
+                    let Some(packet) = ogg.next(&self.data) else { return false };
+                    let Ok(pcm) = read_audio_packet_generic::<Vec<Vec<i16>>>(ident, setup, &packet, pwr) else { continue };
+                    if pcm.is_empty() || pcm[0].is_empty() {
+                        continue;
+                    }
+                    // Vorbis puts the centre second when there are three or more.
+                    let right = match pcm.len() { 1 => 0, 2 => 1, _ => 2 };
+                    self.pending.extend(pcm[0].iter().zip(pcm[right].iter()).map(|(&a, &b)| (a, b)));
+                    return true;
+                }
+                false
             }
             Source::Mp3 { dec, pos } => {
                 let mut pcm = [0i16; nanomp3::MAX_SAMPLES_PER_FRAME];

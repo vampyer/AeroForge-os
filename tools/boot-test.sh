@@ -640,6 +640,38 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musicclose
     elif [ $STAGE = musicclose ] && grep -q "\[desktop\] closed Music" "$LOG"; then
+        # Music/Formats: a note in each kind of song file, played through from the first.
+        sleep 0.5; point_at $(row_of /Music Formats); double_click; STAGE=formats
+    elif [ $STAGE = formats ] && grep -q "\[desktop\] Computer: /Music/Formats = " "$LOG"; then
+        sleep 0.5; point_at $(row_of /Music/Formats "1 FLAC 24-bit.flac"); double_click; STAGE=formatsplay
+    elif [ $STAGE = formatsplay ] && grep -q "\[desktop\] Music: played /Music/Formats/8 MP3 64k.mp3 to the end\|\[desktop\] Music: /Music/Formats/[^,]*: \|no sound output" "$LOG"; then
+        XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=formatsclose
+    elif [ $STAGE = formatsclose ] && [ "$(grep -c "\[desktop\] closed Music" "$LOG")" -ge 2 ]; then
+        # Music on its own, from the Start menu: it lines up the songs in the Music folders.
+        sleep 0.5; point_at 27 780; click; STAGE=musicmenu
+    elif [ $STAGE = musicmenu ] && grep -q "\[desktop\] Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG"; then
+        sleep 0.5
+        XY=$(grep -ao "Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=musicicon
+    elif [ $STAGE = musicicon ] && [ "$(grep -c "\[desktop\] Music window at " "$LOG")" -ge 3 ]; then
+        # Its song list: click the second song; then the volume slider, at 80%.
+        sleep 0.5
+        ML=$(grep -a "\[desktop\] Music list: .* | end" "$LOG" | tail -1)
+        RX=$(echo "$ML" | sed 's/.*song 1 at \([0-9]*\),.*/\1/'); RY=$(echo "$ML" | sed 's/.*song 1 at [0-9]*,\([0-9]*\), rows \([0-9]*\) apart.*/\1 + \2/')
+        point_at "$RX" $((RY)); click; STAGE=musicrow
+    elif [ $STAGE = musicrow ] && grep -q "\[desktop\] Music: /Music/Little Tune.mp3, .* (2 of 10)" "$LOG"; then
+        sleep 0.5
+        ML=$(grep -a "\[desktop\] Music list: .* | end" "$LOG" | tail -1)
+        read -r VA VB VY <<< "$(echo "$ML" | sed 's/.*volume from \([0-9]*\) to \([0-9]*\) at \([0-9]*\) | end.*/\1 \2 \3/')"
+        point_at $((VA + (VB - VA) * 8 / 10)) "$VY"; click; STAGE=musicvol
+    elif [ $STAGE = musicvol ] && grep -q "\[desktop\] volume 80%" "$LOG"; then
+        XY=$(grep -ao "Music: Previous at .*; Stop at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click
+        sleep 1; monitor "screendump build/gop-musiclist.ppm"
+        XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musiciconclose
+    elif [ $STAGE = musiciconclose ] && [ "$(grep -c "\[desktop\] closed Music" "$LOG")" -ge 3 ]; then
         sleep 0.5
         # Snap Welcome to the left half by dragging its title bar to the edge.
         point_at 166 126; monitor "mouse_button 1"; monitor "mouse_move -100 0"; monitor "mouse_move -100 0"
@@ -660,7 +692,7 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = deskcalcdone ] && grep -q "\[desktop\] calculator: " "$LOG"; then
         # Control Panel, from the right of the Start menu.
         sleep 0.5; point_at 27 780; click; STAGE=cpmenu
-    elif [ $STAGE = cpmenu ] && grep -q "\[desktop\] Start menu open; Control Panel at " "$LOG"; then
+    elif [ $STAGE = cpmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
         sleep 0.5
         XY=$(grep -ao "Start menu open; Control Panel at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cphome
@@ -905,6 +937,23 @@ for _ in $(seq "$TIMEOUT"); do
             && grep -q "\[desktop\] Music: played /Music/Chimes.wav to the end" "$LOG" \
             && grep -q "\[desktop\] Music: /Music/Little Tune.mp3, MP3 44100 Hz, 2 channels, 0:09 (2 of 2)" "$LOG" \
             || { fail "Music did not play the WAV song and go on to the MP3 one"; }
+        # Formats: each file named, read with its own format, rate and channels, played to the end,
+        # and its note heard at its own pitch.
+        n=0
+        for want in "1 FLAC 24-bit.flac, FLAC 44100 Hz, 2 channels" "2 FLAC mono.flac, FLAC 22050 Hz, 1 channel" \
+            "3 OGG.ogg, OGG 44100 Hz, 2 channels" "4 OGG mono.ogg, OGG 22050 Hz, 1 channel" "5 WAV 8-bit.wav, WAV 22050 Hz, 1 channel" \
+            "6 WAV 24-bit.wav, WAV 48000 Hz, 2 channels" "7 WAV float.wav, WAV 44100 Hz, 2 channels" "8 MP3 64k.mp3, MP3 22050 Hz, 1 channel"; do
+            n=$((n + 1))
+            grep -q "\[desktop\] Music: /Music/Formats/$want, 0:00 ($n of 8)" "$LOG" && grep -q "\[desktop\] Music: played /Music/Formats/${want%%,*} to the end" "$LOG" \
+                || { fail "Music did not play /Music/Formats/${want%%,*} ($(grep -a "Music: /Music/Formats/${want%%,*}" "$LOG" | tail -1))"; }
+        done
+        grep -q "\[desktop\] Music: found 10 songs in Music folders" "$LOG" \
+            && grep -q "\[desktop\] Music: /Music/Chimes.wav, WAV 44100 Hz, 1 channel, 0:04 (1 of 10)" "$LOG" \
+            || { fail "Music opened from the Start menu did not line up the 10 songs in /Music ($(grep -a "Music: found" "$LOG" | tail -1))"; }
+        for hz in 330 392 440 494 587 659 740 880; do
+            echo "$TONE" | python3 -c "import re,sys; sys.exit(not any(0.5 <= float(m[0]) <= 0.7 and abs(float(m[1]) - $hz) <= $hz * 0.02 for m in re.findall(r'^tone ([0-9.]+) s, ([0-9]+) Hz', sys.stdin.read(), re.M)))" \
+                || { fail "the $hz Hz note from Music/Formats was not heard on the sound card ($TONE)"; }
+        done
         echo "$TONE" | grep -qE "^tone (3\.[5-9]|4\.[0-6])[0-9] s, .*peak (9[0-9]{3}|1[0-2][0-9]{3})$" \
             || { fail "the WAV song (4.5 s of chimes) was not heard on the sound card ($TONE)"; }
         echo "$TONE" | grep -qE "^tone ([5-9]|[1-9][0-9])\.[0-9]+ s" || { fail "the MP3 song was not heard on the sound card ($TONE)"; }
@@ -1091,8 +1140,8 @@ for _ in $(seq "$TIMEOUT"); do
             || { fail "a folder index on the NTFS volume is out of order"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
         grep -q "\[aerosmss\] staying at the console (/system/session.cfg says so)" "$LOG" || { fail "aerosmss did not keep the console for the test as session.cfg asks"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, and a note each from 24-bit and mono FLAC, stereo and mono OGG, 8-bit, 24-bit and floating point WAV and a 64 kbit/s MP3, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done
-fail "no prompt within ${TIMEOUT}s (test stage $STAGE)" "$LOG" "$FAKEBT_LOG"
+fail "no prompt within ${TIMEOUT} checks, ${SECONDS}s in all (test stage $STAGE)" "$LOG" "$FAKEBT_LOG"
