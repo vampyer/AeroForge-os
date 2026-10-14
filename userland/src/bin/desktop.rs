@@ -1448,6 +1448,8 @@ struct Desktop {
     /// Where the window being dragged will snap to if let go now.
     snap: Option<Rect>,
     menu: bool,
+    /// The Start menu shows every program, A to Z, instead of the usual few.
+    all_programs: bool,
     /// Windows hidden by "Show desktop", to bring back on the next click.
     peeked: Vec<Kind>,
     started_us: u64,
@@ -1543,7 +1545,7 @@ impl Desktop {
     fn menu_rect(&self) -> Rect {
         let s = self.ui;
         let t = self.taskbar();
-        Rect::new(2 * s, t.y - 380 * s, 480 * s, 380 * s)
+        Rect::new(2 * s, t.y - 420 * s, 480 * s, 420 * s)
     }
     fn menu_left(&self) -> Rect {
         let m = self.menu_rect();
@@ -1554,6 +1556,25 @@ impl Desktop {
         let l = self.menu_left();
         let s = self.ui;
         Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * 40 * s, l.w - 8 * s, 36 * s)
+    }
+    /// "All programs" at the foot of the Start menu's left side ("Back" when
+    /// the list of every program is showing).
+    fn all_button(&self) -> Rect {
+        let l = self.menu_left();
+        let s = self.ui;
+        Rect::new(l.x + 4 * s, l.y + l.h - 36 * s, l.w - 8 * s, 32 * s)
+    }
+    /// Every program, A to Z, for "All programs".
+    fn all_list(&self) -> Vec<Kind> {
+        let mut all = KINDS.to_vec();
+        all.sort_by_key(|&k| self.windows[self.index(k)].title);
+        all
+    }
+    /// Row `i` of the "All programs" list.
+    fn all_item(&self, i: usize) -> Rect {
+        let l = self.menu_left();
+        let s = self.ui;
+        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * 34 * s, l.w - 8 * s, 32 * s)
     }
     /// The Start menu's mouse speed buttons: slower (-) and faster (+), with
     /// ten bars between them.
@@ -1950,17 +1971,40 @@ impl Desktop {
         let l = self.menu_left();
         c.rounded(l, 4 * s, false, 0xFFFFFF, rgb(235, 242, 250), 255);
         c.rounded_outline(l, 4 * s, false, rgb(90, 120, 160), 255);
-        for (i, kind) in MENU.iter().enumerate() {
-            let item = self.menu_item(i);
+        let lit = |c: &mut Canvas, item: Rect| {
             if item.contains(self.pointer.x as i32, self.pointer.y as i32) {
                 c.rounded(item, 3 * s, false, rgb(225, 240, 255), rgb(190, 220, 250), 255);
                 c.rounded_outline(item, 3 * s, false, rgb(120, 170, 230), 255);
             }
-            c.icon(kind_icon(*kind), item.x + 6 * s, item.y + 2 * s, 32 * s);
-            let title = self.windows[self.index(*kind)].title;
-            c.text(item.x + 40 * s, item.y + (item.h - Font::Normal.h(s)) / 2, title, 0x101010, Font::Normal);
+        };
+        if self.all_programs {
+            for (i, kind) in self.all_list().into_iter().enumerate() {
+                let item = self.all_item(i);
+                lit(c, item);
+                c.icon(kind_icon(kind), item.x + 6 * s, item.y + 4 * s, 24 * s);
+                let title = self.windows[self.index(kind)].title;
+                c.text(item.x + 38 * s, item.y + (item.h - Font::Normal.h(s)) / 2, title, 0x101010, Font::Normal);
+            }
+        } else {
+            for (i, kind) in MENU.iter().enumerate() {
+                let item = self.menu_item(i);
+                lit(c, item);
+                c.icon(kind_icon(*kind), item.x + 6 * s, item.y + 2 * s, 32 * s);
+                let title = self.windows[self.index(*kind)].title;
+                c.text(item.x + 40 * s, item.y + (item.h - Font::Normal.h(s)) / 2, title, 0x101010, Font::Normal);
+            }
         }
-        c.text(l.x + 12 * s, l.y + l.h - Font::Normal.h(s) - 8 * s, "All programs", rgb(90, 90, 90), Font::Normal);
+        // "All programs" (or "Back"), with an arrow pointing the way it goes.
+        let ab = self.all_button();
+        lit(c, ab);
+        c.fill(Rect::new(ab.x + 6 * s, ab.y, ab.w - 12 * s, s), rgb(210, 220, 232));
+        let (ax, ay) = (ab.x + 12 * s, ab.y + ab.h / 2);
+        for k in 0..5 {
+            let h = if self.all_programs { (2 * k + 1) * s } else { (9 - 2 * k) * s };
+            c.fill(Rect::new(ax + k * s, ay - h / 2, s, h), rgb(40, 110, 50));
+        }
+        let label = if self.all_programs { "Back" } else { "All programs" };
+        c.text(ab.x + 28 * s, ab.y + (ab.h - Font::Normal.h(s)) / 2, label, 0x101010, Font::Normal);
         // Right: the date in large type, and the exit button.
         let rx = l.x + l.w + 14 * s;
         c.text(rx, m.y + 16 * s, &self.clock.0, 0xFFFFFF, Font::Large);
@@ -2118,7 +2162,9 @@ impl Desktop {
             return spots.into_iter().find(|r| r.contains(x, y)).unwrap_or(Rect::EMPTY);
         }
         if self.menu {
-            spots.extend((0..KINDS.len()).map(|i| self.menu_item(i)));
+            spots.extend((0..KINDS.len()).map(|i| if self.all_programs { self.all_item(i) } else { self.menu_item(i) }));
+            spots.push(self.all_button());
+            spots.push(self.cp_menu_item());
             spots.push(self.exit_button());
             spots.push(self.speed_button(false));
             spots.push(self.speed_button(true));
@@ -2224,9 +2270,32 @@ impl Desktop {
         if self.menu {
             self.menu = false;
             dirty = dirty.union(&self.menu_rect());
-            for (i, &kind) in MENU.iter().enumerate() {
-                if self.menu_item(i).contains(x, y) {
-                    return dirty.union(&self.open(kind));
+            if self.all_button().contains(x, y) {
+                self.menu = true;
+                self.all_programs = !self.all_programs;
+                if self.all_programs {
+                    let rows: Vec<String> = self.all_list().iter().enumerate().map(|(i, &k)| {
+                        let r = self.all_item(i);
+                        format!("{} at {},{}", self.windows[self.index(k)].title, r.x + r.w / 2, r.y + r.h / 2)
+                    }).collect();
+                    let b = self.all_button();
+                    println!("[desktop] All programs: {}; Back at {},{} | end", rows.join("; "), b.x + b.w / 2, b.y + b.h / 2);
+                } else {
+                    println!("[desktop] Start menu: back to the usual programs");
+                }
+                return dirty;
+            }
+            if self.all_programs {
+                for (i, kind) in self.all_list().into_iter().enumerate() {
+                    if self.all_item(i).contains(x, y) {
+                        return dirty.union(&self.open(kind));
+                    }
+                }
+            } else {
+                for (i, &kind) in MENU.iter().enumerate() {
+                    if self.menu_item(i).contains(x, y) {
+                        return dirty.union(&self.open(kind));
+                    }
                 }
             }
             if self.cp_menu_item().contains(x, y) {
@@ -2252,12 +2321,14 @@ impl Desktop {
         let (ox, oy, or) = self.start_button();
         if (x - ox) * (x - ox) + (y - oy) * (y - oy) <= or * or {
             self.menu = !menu_was_open;
+            self.all_programs = false;
             if self.menu {
+                let ab = self.all_button();
                 let cp = self.cp_menu_item();
                 let music = self.menu_item(MENU.iter().position(|&k| k == Kind::Music).unwrap_or(0));
                 let paint = self.menu_item(MENU.iter().position(|&k| k == Kind::Paint).unwrap_or(0));
-                println!("[desktop] Start menu open; Control Panel at {},{}; Music at {},{}; Paint at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2,
-                    music.x + music.w / 2, music.y + music.h / 2, paint.x + paint.w / 2, paint.y + paint.h / 2);
+                println!("[desktop] Start menu open; Control Panel at {},{}; Music at {},{}; Paint at {},{}; All programs at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2,
+                    music.x + music.w / 2, music.y + music.h / 2, paint.x + paint.w / 2, paint.y + paint.h / 2, ab.x + ab.w / 2, ab.y + ab.h / 2);
             }
             return dirty.union(&self.menu_rect()).union(&self.taskbar());
         }
@@ -8895,6 +8966,7 @@ fn main() -> i64 {
         resize: None,
         snap: None,
         menu: false,
+        all_programs: false,
         peeked: Vec::new(),
         started_us,
         clock: clock(started_us, prefs.hours24),
