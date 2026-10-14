@@ -1867,7 +1867,12 @@ impl Desktop {
                 Kind::Computer => spots.extend(self.files_spots(&client)),
                 Kind::Notes => spots.push(self.notes_save(&client)),
                 Kind::Photos => spots.extend([self.photo_button(&client, false), self.photo_button(&client, true)]),
-                Kind::Music => spots.extend((0..4).map(|i| self.music_button(&client, i))),
+                Kind::Music => {
+                    spots.extend((0..4).map(|i| self.music_button(&client, i)));
+                    let (room, first) = self.music_rows(&client);
+                    let count = self.player.as_ref().map_or(0, |p| p.list.len());
+                    spots.extend((0..room.min(count.saturating_sub(first))).map(|i| self.music_row(&client, i)));
+                }
                 Kind::ControlPanel => spots.extend(self.cp_controls(&client).into_iter().map(|(_, r)| r)),
                 Kind::Calculator => {
                     for row in 0..5 {
@@ -2069,8 +2074,21 @@ impl Desktop {
                 dirty = dirty.union(&self.cp_click(&client, x, y, double));
             } else if self.windows[i].kind == Kind::Music && self.client(&r).contains(x, y) {
                 let client = self.client(&r);
+                let (room, first) = self.music_rows(&client);
+                let count = self.player.as_ref().map_or(0, |p| p.list.len());
+                let vol = self.music_volume(&client);
                 if let Some(b) = (0..4).find(|&b| self.music_button(&client, b).contains(x, y)) {
                     dirty = dirty.union(&self.music_command(b));
+                } else if let Some(row) = (0..room.min(count.saturating_sub(first))).find(|&i| self.music_row(&client, i).contains(x, y)) {
+                    if let Some(p) = self.player.as_mut() {
+                        p.at = first + row;
+                    }
+                    self.load_song(true);
+                    dirty = dirty.union(&client);
+                } else if Rect::new(vol.x - 8 * self.ui, vol.y - 10 * self.ui, vol.w + 16 * self.ui, vol.h + 20 * self.ui).contains(x, y) {
+                    let along = ((x - vol.x).clamp(0, vol.w) * 100 / vol.w.max(1)) as u32;
+                    self.set_volume(along, false);
+                    dirty = dirty.union(&client);
                 } else if self.music_bar(&client).contains(x, y) {
                     let bar = self.music_bar(&client);
                     if let Some(p) = self.player.as_mut() {
@@ -6382,16 +6400,59 @@ impl Desktop {
 
     // -------------------------------------------------------------- Music
 
+    /// Music's song list down the left, the song playing on the right, and
+    /// the controls along the bottom.
+    fn music_list(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x, client.y, (client.w * 2 / 5).min(260 * s), client.h - 64 * s)
+    }
+    fn music_controls(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x, client.y + client.h - 64 * s, client.w, 64 * s)
+    }
+    /// The songs the list has room for, and the first one shown (so the one
+    /// playing is always in view).
+    fn music_rows(&self, client: &Rect) -> (usize, usize) {
+        let s = self.ui;
+        let room = ((self.music_list(client).h - 40 * s) / (26 * s)).max(1) as usize;
+        let at = self.player.as_ref().map_or(0, |p| p.at);
+        (room, (at + 1).saturating_sub(room))
+    }
+    /// Row `i` of those shown in the list.
+    fn music_row(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let l = self.music_list(client);
+        Rect::new(l.x + 6 * s, l.y + 34 * s + i as i32 * 26 * s, l.w - 12 * s, 24 * s)
+    }
     fn music_bar(&self, client: &Rect) -> Rect {
         let s = self.ui;
-        Rect::new(client.x + 20 * s, client.y + 92 * s, client.w - 40 * s, 12 * s)
+        let l = self.music_list(client);
+        let x0 = l.x + l.w + 24 * s;
+        Rect::new(x0, client.y + 132 * s, client.x + client.w - 24 * s - x0, 12 * s)
     }
     /// Previous, Play/Pause, Stop and Next, left to right.
     fn music_button(&self, client: &Rect, i: usize) -> Rect {
         let s = self.ui;
-        let (w, gap) = (86 * s, 10 * s);
-        let x0 = client.x + (client.w - 4 * w - 3 * gap) / 2;
-        Rect::new(x0 + i as i32 * (w + gap), client.y + client.h - 52 * s, w, 34 * s)
+        let k = self.music_controls(client);
+        let (w, gap) = (76 * s, 8 * s);
+        let x0 = k.x + 16 * s;
+        Rect::new(x0 + i as i32 * (w + gap), k.y + 15 * s, w, 34 * s)
+    }
+    fn music_volume(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let k = self.music_controls(client);
+        let w = (k.w - 4 * 84 * s - 150 * s).clamp(60 * s, 140 * s);
+        Rect::new(k.x + k.w - 56 * s - w, k.y + 27 * s, w, 10 * s)
+    }
+
+    /// Sets the volume (out of 100) and keeps it for next time.
+    fn set_volume(&mut self, volume: u32, muted: bool) {
+        self.prefs.volume = volume.min(100);
+        self.prefs.muted = muted;
+        let applied = aero::audio::volume(Some((self.prefs.volume, self.prefs.muted))).is_ok();
+        let saved = self.save_settings();
+        println!("[desktop] volume {}%{}{}{}", self.prefs.volume, if self.prefs.muted { ", muted" } else { "" },
+            if applied { "" } else { " (no sound card)" }, if saved { ", saved" } else { "" });
     }
 
     /// Opens a song in Music and plays it, with the others in its folder after it.
@@ -6435,6 +6496,11 @@ impl Desktop {
             format!("{} at {},{}", names[i], b.x + b.w / 2, b.y + b.h / 2)
         }).collect();
         println!("[desktop] Music: {}", spots.join("; "));
+        let (room, first) = self.music_rows(&client);
+        let row = self.music_row(&client, 0);
+        let vol = self.music_volume(&client);
+        println!("[desktop] Music list: song {} at {},{}, rows {} apart, {} shown; volume from {} to {} at {} | end", first + 1,
+            row.x + row.w / 2, row.y + row.h / 2, 26 * self.ui, room, vol.x, vol.x + vol.w, vol.y + vol.h / 2);
     }
 
     /// A button: 0 previous, 1 play or pause, 2 stop, 3 next.
@@ -6515,53 +6581,103 @@ impl Desktop {
 
     fn music_view(&self, c: &mut Canvas, client: &Rect) {
         let s = self.ui;
+        let (px, py) = (self.pointer.x as i32, self.pointer.y as i32);
+        let grey = rgb(80, 85, 95);
         c.gradient(*client, rgb(250, 252, 255), rgb(225, 234, 246), 255);
-        // A note in a blue disc.
-        let (cx, cy) = (client.x + 44 * s, client.y + 44 * s);
-        c.orb(cx, cy, 26 * s, rgb(120, 190, 250), rgb(20, 80, 170));
-        c.fill(Rect::new(cx + 2 * s, cy - 14 * s, 3 * s, 22 * s), 0xFFFFFF);
-        c.fill(Rect::new(cx + 2 * s, cy - 14 * s, 10 * s, 4 * s), 0xFFFFFF);
-        c.orb(cx - 2 * s, cy + 9 * s, 5 * s, 0xFFFFFF, rgb(220, 230, 245));
-        let tx = client.x + 86 * s;
-        let room = ((client.x + client.w - 16 * s - tx) / Font::Normal.w(s)).max(1) as usize;
-        let Some(p) = &self.player else {
-            c.text(tx, client.y + 20 * s, "No songs found", rgb(30, 57, 145), Font::Normal);
-            let tip = "Put songs in a Music folder, or open one from Computer.";
-            let room = ((client.x + client.w - 16 * s - tx) / Font::Small.w(s)).max(1) as usize;
-            c.text(tx, client.y + 50 * s, &tip.chars().take(room).collect::<String>(), rgb(80, 85, 95), Font::Small);
-            return;
-        };
-        let name: String = split_path(&p.list[p.at]).1.chars().take(room).collect();
-        c.text(tx, client.y + 18 * s, &name, rgb(30, 57, 145), Font::Normal);
-        let d = p.deck.lock();
-        let line = match (&d.song, p.error.is_empty()) {
-            (_, false) => p.error.clone(),
-            (Some(song), true) => format!("{}, {}.{} kHz, {}", song.format, song.rate / 1000, song.rate % 1000 / 100,
-                if song.channels == 1 { "mono" } else { "stereo" }),
-            (None, true) => String::new(),
-        };
-        let small_room = ((client.x + client.w - 16 * s - tx) / Font::Small.w(s)).max(1) as usize;
-        let line: String = line.chars().take(small_room).collect();
-        c.text(tx, client.y + 50 * s, &line, if p.error.is_empty() { rgb(80, 85, 95) } else { rgb(170, 30, 20) }, Font::Small);
-        // How far through: a bar to click, and the time.
+        // The song list.
+        let l = self.music_list(client);
+        c.gradient(l, rgb(255, 255, 255), rgb(240, 245, 251), 255);
+        c.fill(Rect::new(l.x + l.w - s, l.y, s, l.h), rgb(190, 205, 225));
+        let count = self.player.as_ref().map_or(0, |p| p.list.len());
+        c.text(l.x + 12 * s, l.y + 8 * s, &format!("Songs ({})", count), rgb(30, 57, 145), Font::Normal);
+        let (room, first) = self.music_rows(client);
+        let cols = |w: i32, f: Font| (w / f.w(s)).max(1) as usize;
+        match &self.player {
+            None => {
+                let mut y = l.y + 40 * s;
+                for line in ["No songs found.", "Put songs in a Music", "folder, or open one", "from Computer."] {
+                    c.text(l.x + 12 * s, y, &line.chars().take(cols(l.w - 24 * s, Font::Small)).collect::<String>(), grey, Font::Small);
+                    y += Font::Small.h(s) + 4 * s;
+                }
+            }
+            Some(p) => {
+                let playing = p.deck.lock().playing;
+                for i in 0..room.min(p.list.len().saturating_sub(first)) {
+                    let r = self.music_row(client, i);
+                    let n = first + i;
+                    if n == p.at {
+                        c.rounded(r, 3 * s, false, rgb(220, 236, 252), rgb(193, 220, 250), 255);
+                        c.rounded_outline(r, 3 * s, false, rgb(125, 162, 206), 255);
+                    } else if r.contains(px, py) {
+                        c.rounded(r, 3 * s, false, rgb(240, 247, 254), rgb(228, 240, 252), 255);
+                    }
+                    let mark = if n == p.at && playing { ">" } else { "" };
+                    c.text(r.x + 6 * s, r.y + (r.h - Font::Normal.h(s)) / 2, mark, rgb(30, 100, 200), Font::Normal);
+                    let name = split_path(&p.list[n]).1;
+                    let name = name.rsplit_once('.').map_or(name.as_str(), |(a, _)| a);
+                    let tx = r.x + 22 * s;
+                    c.text(tx, r.y + (r.h - Font::Normal.h(s)) / 2, &name.chars().take(cols(r.x + r.w - 6 * s - tx, Font::Normal)).collect::<String>(),
+                        if n == p.at { rgb(20, 40, 90) } else { 0x202020 }, Font::Normal);
+                }
+            }
+        }
+        // The song playing: a note in a blue disc, its name, kind and progress.
+        let x0 = l.x + l.w + 24 * s;
+        let (cx, cy) = (x0 + 40 * s, client.y + 58 * s);
+        c.orb(cx, cy, 38 * s, rgb(120, 190, 250), rgb(20, 80, 170));
+        c.fill(Rect::new(cx + 3 * s, cy - 20 * s, 4 * s, 31 * s), 0xFFFFFF);
+        c.fill(Rect::new(cx + 3 * s, cy - 20 * s, 14 * s, 6 * s), 0xFFFFFF);
+        c.orb(cx - 3 * s, cy + 13 * s, 7 * s, 0xFFFFFF, rgb(220, 230, 245));
+        let tx = x0 + 96 * s;
+        let right = client.x + client.w - 20 * s;
         let bar = self.music_bar(client);
+        let (title, line, error, heard, total, playing) = match &self.player {
+            None => (String::from("Nothing playing"), String::new(), false, 0, 0, false),
+            Some(p) => {
+                let d = p.deck.lock();
+                let line = match (&d.song, p.error.is_empty()) {
+                    (_, false) => p.error.clone(),
+                    (Some(song), true) => format!("{}, {}.{} kHz, {}", song.format, song.rate / 1000, song.rate % 1000 / 100,
+                        if song.channels == 1 { "mono" } else { "stereo" }),
+                    (None, true) => String::new(),
+                };
+                let total = d.song.as_ref().map_or(0, |s| s.frames);
+                (split_path(&p.list[p.at]).1, line, !p.error.is_empty(), p.heard.min(total), total, d.playing)
+            }
+        };
+        c.text(tx, client.y + 32 * s, &title.chars().take(cols(right - tx, Font::Normal)).collect::<String>(), rgb(30, 57, 145), Font::Normal);
+        c.text(tx, client.y + 64 * s, &line.chars().take(cols(right - tx, Font::Small)).collect::<String>(),
+            if error { rgb(170, 30, 20) } else { grey }, Font::Small);
         c.fill(bar, rgb(225, 228, 233));
         c.frame(bar, rgb(150, 155, 165));
-        let total = d.song.as_ref().map_or(0, |s| s.frames);
-        let heard = p.heard.min(total);
         if total > 0 {
             let fill = ((bar.w - 2 * s) as u64 * heard / total) as i32;
             c.gradient(Rect::new(bar.x + s, bar.y + s, fill, bar.h - 2 * s), rgb(110, 180, 250), rgb(30, 100, 200), 255);
         }
-        let time = format!("{} / {}", minutes(heard / 48_000), minutes(total / 48_000));
-        c.text(bar.x, bar.y + bar.h + 8 * s, &time, rgb(60, 65, 75), Font::Small);
-        let place = format!("{} of {}", p.at + 1, p.list.len());
-        c.text(bar.x + bar.w - Font::Small.width(s, &place), bar.y + bar.h + 8 * s, &place, rgb(60, 65, 75), Font::Small);
-        let labels = ["|<", if d.playing { "Pause" } else { "Play" }, "Stop", ">|"];
-        drop(d);
+        c.text(bar.x, bar.y + bar.h + 8 * s, &format!("{} / {}", minutes(heard / 48_000), minutes(total / 48_000)), rgb(60, 65, 75), Font::Small);
+        if let Some(p) = &self.player {
+            let place = format!("{} of {}", p.at + 1, p.list.len());
+            c.text(bar.x + bar.w - Font::Small.width(s, &place), bar.y + bar.h + 8 * s, &place, rgb(60, 65, 75), Font::Small);
+        }
+        // The controls: a dark glass strip, as Windows 7's player has.
+        let k = self.music_controls(client);
+        c.gradient(k, rgb(60, 78, 104), rgb(20, 30, 46), 255);
+        c.fill(Rect::new(k.x, k.y, k.w, s), rgb(120, 150, 190));
+        let labels = ["|<", if playing { "Pause" } else { "Play" }, "Stop", ">|"];
         for (i, label) in labels.iter().enumerate() {
             self.round_button(c, self.music_button(client, i), label);
         }
+        let v = self.music_volume(client);
+        c.text(v.x - Font::Small.width(s, "Volume") - 10 * s, v.y + (v.h - Font::Small.h(s)) / 2, "Volume", rgb(220, 230, 245), Font::Small);
+        c.fill(v, rgb(40, 50, 66));
+        c.frame(v, rgb(140, 160, 190));
+        let filled = (v.w - 1) * self.prefs.volume as i32 / 100;
+        c.gradient(Rect::new(v.x + s, v.y + s, (filled - 2 * s).max(0), v.h - 2 * s), rgb(110, 180, 250), rgb(30, 100, 200), 255);
+        let knob = Rect::new(v.x + filled - 6 * s, v.y - 6 * s, 12 * s, v.h + 12 * s);
+        c.rounded(knob, 3 * s, false, rgb(250, 252, 255), rgb(190, 210, 235), 255);
+        c.rounded_outline(knob, 3 * s, false, rgb(70, 100, 150), 255);
+        let pct = if self.prefs.muted { String::from("Muted") } else { format!("{}%", self.prefs.volume) };
+        c.text(v.x + v.w + 10 * s, v.y + (v.h - Font::Small.h(s)) / 2, &pct, rgb(220, 230, 245), Font::Small);
     }
 
     // ------------------------------------------------------ Control Panel
@@ -6676,17 +6792,8 @@ impl Desktop {
                 self.set_ui(n);
                 return Rect::new(0, 0, self.w, self.h);
             }
-            Ctl::Volume | Ctl::Mute => {
-                if ctl == Ctl::Volume {
-                    self.prefs.volume = ((along + 5) / 10) as u32;
-                } else {
-                    self.prefs.muted = !self.prefs.muted;
-                }
-                let applied = aero::audio::volume(Some((self.prefs.volume, self.prefs.muted))).is_ok();
-                let saved = self.save_settings();
-                println!("[desktop] volume {}%{}{}{}", self.prefs.volume, if self.prefs.muted { ", muted" } else { "" },
-                    if applied { "" } else { " (no sound card)" }, if saved { ", saved" } else { "" });
-            }
+            Ctl::Volume => self.set_volume(((along + 5) / 10) as u32, self.prefs.muted),
+            Ctl::Mute => self.set_volume(self.prefs.volume, !self.prefs.muted),
             Ctl::TestSound => {
                 // A short bell: 880 Hz, fading out over half a second.
                 let n = 24_000usize;
@@ -7970,7 +8077,10 @@ fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool
             let (pw, ph) = ((w - 100 * s).min(900 * s), (h - 120 * s).min(660 * s));
             ("Photos", Rect::new((w - pw) / 2, 20 * s, pw, ph), false)
         }
-        Kind::Music => ("Music", Rect::new(w / 2 - 230 * s, h / 2 - 160 * s, 460 * s, 240 * s), false),
+        Kind::Music => {
+            let (mw, mh) = ((w - 100 * s).min(720 * s), (h - 120 * s).min(420 * s));
+            ("Music", Rect::new((w - mw) / 2, (h - mh) / 2 - 20 * s, mw, mh), false)
+        }
         Kind::ControlPanel => {
             let (cw, ch) = (680 * s, (h - 120 * s).min(440 * s));
             ("Control Panel", Rect::new((w - cw) / 2, 40 * s, cw, ch), false)

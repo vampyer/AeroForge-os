@@ -612,7 +612,9 @@ each kind of file (24-bit FLAC, mono FLAC, OGG, mono OGG, 8-bit, 24-bit and floa
 64 kbit/s mono MP3), each at its own pitch; the boot test plays the folder through and finds every note,
 at its pitch, in the sound card's output. Opened from the Start menu with no song picked, Music lines up the
 songs in the Music folder at the top of each drive (and the folders in it), ready to play, or says it found
-none. Control Panel's test sound now plays from its own thread, as Music does, so a slow redraw can't leave
+none. The Music window has the songs down its left side to click, the song playing with its progress on
+the right, and Previous, Play/Pause, Stop, Next and a volume slider on a dark strip along the bottom, the
+way Windows 7's player does. Control Panel's test sound now plays from its own thread, as Music does, so a slow redraw can't leave
 a gap in it.
 
 | Area | Status |

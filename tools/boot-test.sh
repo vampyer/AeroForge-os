@@ -655,7 +655,20 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Start menu open; .*; Music at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=musicicon
     elif [ $STAGE = musicicon ] && [ "$(grep -c "\[desktop\] Music window at " "$LOG")" -ge 3 ]; then
+        # Its song list: click the second song; then the volume slider, at 80%.
         sleep 0.5
+        ML=$(grep -a "\[desktop\] Music list: .* | end" "$LOG" | tail -1)
+        RX=$(echo "$ML" | sed 's/.*song 1 at \([0-9]*\),.*/\1/'); RY=$(echo "$ML" | sed 's/.*song 1 at [0-9]*,\([0-9]*\), rows \([0-9]*\) apart.*/\1 + \2/')
+        point_at "$RX" $((RY)); click; STAGE=musicrow
+    elif [ $STAGE = musicrow ] && grep -q "\[desktop\] Music: /Music/Little Tune.mp3, .* (2 of 10)" "$LOG"; then
+        sleep 0.5
+        ML=$(grep -a "\[desktop\] Music list: .* | end" "$LOG" | tail -1)
+        read -r VA VB VY <<< "$(echo "$ML" | sed 's/.*volume from \([0-9]*\) to \([0-9]*\) at \([0-9]*\) | end.*/\1 \2 \3/')"
+        point_at $((VA + (VB - VA) * 8 / 10)) "$VY"; click; STAGE=musicvol
+    elif [ $STAGE = musicvol ] && grep -q "\[desktop\] volume 80%" "$LOG"; then
+        XY=$(grep -ao "Music: Previous at .*; Stop at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click
+        sleep 1; monitor "screendump build/gop-musiclist.ppm"
         XY=$(grep -ao "Music window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; monitor "mouse_button 1" "mouse_button 0"; STAGE=musiciconclose
     elif [ $STAGE = musiciconclose ] && [ "$(grep -c "\[desktop\] closed Music" "$LOG")" -ge 3 ]; then
