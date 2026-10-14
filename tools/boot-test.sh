@@ -525,9 +525,11 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; type_keys $'\x03'; sleep 0.5; monitor "sendkey tab"; sleep 0.5
         # The button goes down with the paste, before the window is up, and is
         # held until Cancel takes it: on a fast machine the copy is over in
-        # about half a second.
-        point_at "${XY%,*}" "${XY#*,}"; type_keys $'\x16'; monitor "mouse_button 1"; STAGE=bigcancel
+        # about half a second, so both go in one monitor connection (a second
+        # one took about as long, and the copy sometimes finished first).
+        point_at "${XY%,*}" "${XY#*,}"; fast_monitor "sendkey ctrl-v" "mouse_button 1"; STAGE=bigcancel
     elif [ $STAGE = bigcancel ] && grep -q "\[desktop\] \(Cancel pressed\|pasted /Big.bin as /docs/Big - Copy\|paste failed\)" "$LOG"; then
+        grep -q "\[desktop\] pasted /Big.bin as /docs/Big - Copy" "$LOG" && fail "the 12 MB copy was over before Cancel was pressed"
         monitor "mouse_button 0"; STAGE=bigcancelled
     elif [ $STAGE = bigcancelled ] && grep -q "\[desktop\] \(paste cancelled at\|pasted /Big.bin as /docs/Big - Copy\|paste failed\)" "$LOG"; then
         # Back to the left (Tab), where README.TXT is the last row.
