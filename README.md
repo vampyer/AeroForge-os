@@ -710,6 +710,7 @@ drivers/igc/              Intel Ethernet driver, igb/igc: I210/I211, I225/I226 (
 drivers/btmtk/            MediaTek Bluetooth firmware loader, MT7921/MT7922 (C++)
 drivers/hda/              Intel High Definition Audio driver (C++)
 tools/boot-test.sh        headless QEMU boot test
+tools/soak-test.sh        hour-long desktop soak test (DURATION=seconds)
 tools/make-disk.sh        builds the NVMe test disk (GPT + FAT32) from tools/disk-files/
 tools/make-sata-disk.sh   builds the SATA test disk (MBR + FAT32) from tools/sata-files/
 tools/make-usb-disk.sh    builds the USB stick images (MBR + FAT32 or exFAT) from tools/usb-files/ and tools/usb2-files/
@@ -746,6 +747,7 @@ make disk               # (re)builds build/disk.img (NVMe drive) and build/sata.
 make run                # QEMU window; type into the AeroKernel shell
 make run-headless       # serial log on stdout, no window
 ./tools/boot-test.sh    # CI-style pass/fail boot
+./tools/soak-test.sh    # an hour of opening and closing programs, music and copies
 ```
 
 On Windows, the simplest route is WSL2 (Ubuntu) with the commands above; `make run` opens
