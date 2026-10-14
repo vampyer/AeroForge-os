@@ -1543,7 +1543,7 @@ impl Desktop {
     fn menu_rect(&self) -> Rect {
         let s = self.ui;
         let t = self.taskbar();
-        Rect::new(2 * s, t.y - 380 * s, 480 * s, 380 * s)
+        Rect::new(2 * s, t.y - 420 * s, 480 * s, 420 * s)
     }
     fn menu_left(&self) -> Rect {
         let m = self.menu_rect();

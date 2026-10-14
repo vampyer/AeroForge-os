@@ -800,7 +800,7 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-start.ppm"
         # Mouse speed 5 -> 6 with the menu's + button (saved to /AeroForge.ini);
         # then a quick move of 40 counts goes 40 * 10/8 * 3/2 = 75 pixels.
-        point_at 441 555; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        point_at 441 515; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
         monitor "mouse_move 40 0"; sleep 0.5
         monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
@@ -913,7 +913,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (460x290)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
         grep -q "pointer speed 5 of 10" "$LOG" || { fail "the shell's mouse speed command did not set speed 5"; }
         grep -q "\[desktop\] mouse speed 6, saved" "$LOG" || { fail "the Start menu's + button did not raise the mouse speed to 6 and save it"; }
-        grep -q "\[desktop\] pointer ended at 516,555" "$LOG" \
+        grep -q "\[desktop\] pointer ended at 516,515" "$LOG" \
             || { fail "at mouse speed 6 a quick 40-count move did not go 75 pixels ($(grep -ao 'pointer ended at [0-9,]*' "$LOG"))"; }
         mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -q "^mouse speed = 6" \
             || { fail "the mouse speed was not saved to /AeroForge.ini on the NVMe disk"; }
