@@ -680,7 +680,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at 27 780; click; STAGE=paintmenu
     elif [ $STAGE = paintmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
         sleep 0.5
-        XY=$(grep -ao "Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        # Paint by way of "All programs", which lists every program A to Z.
+        XY=$(grep -ao "Start menu open; .*; All programs at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintall
+    elif [ $STAGE = paintall ] && grep -q "\[desktop\] All programs: .* | end" "$LOG"; then
+        AP=$(grep -a "\[desktop\] All programs: .* | end" "$LOG" | tail -1)
+        case "$AP" in
+            *"All programs: Calculator at "*"; Computer at "*"; Control Panel at "*"; Music at "*"; Notes at "*"; Paint at "*"; Photos at "*"; System at "*"; Welcome"*) ;;
+            *) fail "All programs does not list the nine programs A to Z: $AP" ;;
+        esac
+        sleep 0.5; monitor "screendump build/gop-allprograms.ppm"
+        XY=$(echo "$AP" | grep -o "Paint at [0-9]*,[0-9]*" | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintopen
     elif [ $STAGE = paintopen ] && grep -q "\[desktop\] Paint: picture at .* | end" "$LOG"; then
         # A red box from (20,20) to (140,80) of the picture, dragged out.
