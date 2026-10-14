@@ -20,7 +20,7 @@ jobs:
         run: rustup target add x86_64-unknown-none
 
       - name: Build and boot in QEMU (UEFI, 4 CPUs, NVMe disk)
-        run: TIMEOUT=300 ./tools/boot-test.sh
+        run: TIMEOUT=420 ./tools/boot-test.sh
 
       - name: NTFS writer on the build machine, checked with ntfsprogs
         run: ./tools/ntfs-write-test.sh

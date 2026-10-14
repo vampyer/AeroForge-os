@@ -1131,4 +1131,4 @@ for _ in $(seq "$TIMEOUT"); do
     fi
     sleep 1
 done
-fail "no prompt within ${TIMEOUT}s (test stage $STAGE)" "$LOG" "$FAKEBT_LOG"
+fail "no prompt within ${TIMEOUT} checks, ${SECONDS}s in all (test stage $STAGE)" "$LOG" "$FAKEBT_LOG"
