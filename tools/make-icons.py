@@ -409,9 +409,42 @@ def page(kind):
     return img
 
 
+def paint_icon():
+    """An artist's palette with dabs of colour and a brush across it."""
+    img = new()
+    board = ellipse((8, 18, 84, 82))
+    hole = ellipse((22, 54, 34, 66))
+    notch = ellipse((60, 58, 92, 90))
+    m = ImageChops.subtract(ImageChops.subtract(mask(board), mask(hole)), mask(notch))
+    sh = m.filter(ImageFilter.GaussianBlur(S(3)))
+    paint(img, ImageChops.offset(sh, 0, S(2.5)).point(lambda v: v * 110 // 255), (0, 0, 0, 255))
+    paint(img, m, gradient(rgba(0xF3DDB0), rgba(0xC69455), 18, 82))
+    shine = ImageChops.multiply(m, mask(ellipse((14, 20, 70, 50))).filter(ImageFilter.GaussianBlur(S(4))))
+    paint(img, shine, (255, 255, 255, 90))
+    edge = ImageChops.subtract(m, m.filter(ImageFilter.MinFilter(S(1.0) * 2 + 1)))
+    paint(img, edge, rgba(0x7A5428))
+    for (cx, cy, c) in [(26, 36, 0xE23B3B), (40, 27, 0xF5C61F), (56, 26, 0x3FB34F), (70, 35, 0x2F7FE0), (73, 50, 0x8E4FD0)]:
+        dab = ellipse((cx - 6, cy - 5, cx + 6, cy + 5))
+        shadow(img, dab, 1.0, 0.8, 120)
+        paint(img, mask(dab), gradient(rgba(c), rgba(c, 255), cy - 5, cy + 5))
+        paint(img, mask(ellipse((cx - 4, cy - 4, cx + 1, cy - 1))), (255, 255, 255, 150))
+    # The brush: a wooden handle, a metal band and a red-tipped head.
+    brush = Image.new('RGBA', (W, W), (0, 0, 0, 0))
+    handle = (40, 60, 90, 66)
+    shadow(brush, rrect(handle, 3), 2, 2, 90)
+    paint(brush, mask(rrect(handle, 3)), gradient(rgba(0x4C7FD6), rgba(0x1D3F86), 60, 66))
+    gloss(brush, rrect((41, 60.5, 89, 62.5), 1), 170, 60, 1.0, (0, 60.5, 0, 62.5))
+    paint(brush, mask(lambda d: d.rectangle([S(32), S(59), S(41), S(67)], fill=255)), gradient(rgba(0xE6EAF0), rgba(0x8A919C), 59, 67))
+    paint(brush, mask(poly([(32, 59), (32, 67), (20, 64.5), (17, 63), (20, 61.5)])), gradient(rgba(0x5A4030), rgba(0x2A1C14), 59, 67))
+    paint(brush, mask(poly([(23, 61), (23, 66), (17, 63)])), rgba(0xE23B3B))
+    brush = brush.rotate(32, resample=Image.BICUBIC, center=(S(54), S(63)))
+    img.alpha_composite(brush)
+    return img
+
+
 ICONS = [
     ('computer', computer), ('notes', notes), ('calculator', calculator), ('photos', photos), ('music', music),
-    ('controlpanel', control_panel), ('system', system), ('welcome', welcome), ('folder', folder), ('drive', drive),
+    ('controlpanel', control_panel), ('paint', paint_icon), ('system', system), ('welcome', welcome), ('folder', folder), ('drive', drive),
     ('usb', usb), ('netdrive', network_drive), ('bin', recycle_bin), ('page', lambda: page('blank')),
     ('text', lambda: page('text')), ('sound', lambda: page('sound')), ('picture', lambda: page('picture')),
 ]

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aerokernel"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "font8x8",
  "smoltcp",
