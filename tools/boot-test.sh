@@ -749,11 +749,12 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-cpanel.ppm"
         point_at $(cp_at "Large size"); click; STAGE=cplarge
     elif [ $STAGE = cplarge ] && grep -q "\[desktop\] text size: " "$LOG"; then
-        # Larger text, then back to medium.
-        sleep 0.5; point_at $(cp_at "larger text"); click; STAGE=cpfontlarger
-    elif [ $STAGE = cpfontlarger ] && grep -q "\[desktop\] font size: larger, saved" "$LOG"; then
-        sleep 1; monitor "screendump build/gop-larger.ppm"
-        point_at $(cp_at "medium text"); click; STAGE=cpfontmedium
+        # Smaller text, then back to medium. (Smaller first: bigger text
+        # grows the page, which moves the buttons away from the logged spots.)
+        sleep 0.5; point_at $(cp_at "smaller text"); click; STAGE=cpfontsmaller
+    elif [ $STAGE = cpfontsmaller ] && grep -q "\[desktop\] font size: smaller, saved" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-smaller.ppm"
+        point_at $(cp_at "bigger text"); click; STAGE=cpfontmedium
     elif [ $STAGE = cpfontmedium ] && grep -q "\[desktop\] font size: medium, saved" "$LOG"; then
         sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback1
     elif [ $STAGE = cpback1 ] && [ "$(cp_count "Control Panel")" -ge 2 ]; then

@@ -125,8 +125,8 @@ enum Font {
     Tiny,
 }
 
-/// The text size chosen in Control Panel: -1 smaller, 0 medium, 1 larger.
-/// Every style but Large steps one glyph size up or down with it.
+/// The text size chosen in Control Panel: -1 smaller, 0 medium, 1 larger,
+/// 2 extra large, 3 largest. Every style but Large steps one size with it.
 static TEXT_LEVEL: AtomicI32 = AtomicI32::new(0);
 
 fn text_level() -> i32 {
@@ -134,24 +134,33 @@ fn text_level() -> i32 {
 }
 
 impl Font {
-    fn style(self, ui: i32) -> (FontWeight, RasterHeight) {
-        const SIZES: [RasterHeight; 4] = [RasterHeight::Size16, RasterHeight::Size20, RasterHeight::Size24, RasterHeight::Size32];
+    /// The glyphs to draw from, and how tall to draw them: the font's own
+    /// sizes go up to 32 pixels, bigger text is those glyphs scaled up.
+    fn style(self, ui: i32) -> (FontWeight, RasterHeight, i32) {
+        const SIZES: [i32; 6] = [16, 20, 24, 32, 40, 48];
         let weight = if self == Font::Bold { FontWeight::Bold } else { FontWeight::Regular };
         let step = match self {
-            Font::Large => 3,
+            Font::Large => 3 + text_level().max(0),
             Font::Normal | Font::Bold => 2 + text_level(),
             Font::Small => 1 + text_level(),
             Font::Tiny => text_level(),
         } + if ui >= 2 { 1 } else { 0 };
-        (weight, SIZES[step.clamp(0, 3) as usize])
+        let px = SIZES[step.clamp(0, 5) as usize];
+        let raster = match px {
+            16 => RasterHeight::Size16,
+            20 => RasterHeight::Size20,
+            24 => RasterHeight::Size24,
+            _ => RasterHeight::Size32,
+        };
+        (weight, raster, px)
     }
     /// The width of one character (the font is monospaced).
     fn w(self, ui: i32) -> i32 {
-        let (weight, size) = self.style(ui);
-        get_raster_width(weight, size) as i32
+        let (weight, raster, px) = self.style(ui);
+        get_raster_width(weight, raster) as i32 * px / raster.val() as i32
     }
     fn h(self, ui: i32) -> i32 {
-        self.style(ui).1.val() as i32
+        self.style(ui).2
     }
     fn width(self, ui: i32, text: &str) -> i32 {
         text.chars().count() as i32 * self.w(ui)
@@ -321,7 +330,7 @@ impl Canvas {
     }
 
     fn text(&mut self, x: i32, y: i32, s: &str, color: u32, font: Font) {
-        let (weight, size) = font.style(self.ui);
+        let (weight, size, px) = font.style(self.ui);
         let (cw, ch) = (font.w(self.ui), font.h(self.ui));
         for (i, c) in s.chars().enumerate() {
             let gx = x + i as i32 * cw;
@@ -330,6 +339,10 @@ impl Canvas {
                 continue;
             }
             let Some(glyph) = get_raster(c, weight, size).or_else(|| get_raster('?', weight, size)) else { continue };
+            if px != size.val() as i32 {
+                self.glyph_scaled(glyph.raster(), gx, y, ch, &box_, color);
+                continue;
+            }
             for (row, line) in glyph.raster().iter().enumerate() {
                 let py = y + row as i32;
                 if py < box_.y || py >= box_.y + box_.h {
@@ -426,6 +439,32 @@ impl Canvas {
     }
 
     /// Text with a soft light glow behind it, as on glass title bars.
+    /// A glyph drawn `h` pixels tall from its smaller raster, smoothly
+    /// (each pixel blends the four source pixels around where it falls).
+    fn glyph_scaled(&mut self, raster: &[&[u8]], gx: i32, y: i32, h: i32, box_: &Rect, color: u32) {
+        let (sh, sw) = (raster.len() as i32, raster.first().map_or(0, |r| r.len()) as i32);
+        if sh == 0 || sw == 0 {
+            return;
+        }
+        let ink_at = |cx: i32, cy: i32| raster[cy.clamp(0, sh - 1) as usize][cx.clamp(0, sw - 1) as usize] as i32;
+        for py in box_.y..box_.y + box_.h {
+            // Where this pixel's centre falls in the glyph, in 256ths.
+            let fy = ((py - y) * 2 + 1) * sh * 128 / h - 128;
+            let (y0, ty) = (fy.div_euclid(256), fy.rem_euclid(256));
+            for px in box_.x..box_.x + box_.w {
+                let fx = ((px - gx) * 2 + 1) * sh * 128 / h - 128;
+                let (x0, tx) = (fx.div_euclid(256), fx.rem_euclid(256));
+                let top = ink_at(x0, y0) * (256 - tx) + ink_at(x0 + 1, y0) * tx;
+                let bottom = ink_at(x0, y0 + 1) * (256 - tx) + ink_at(x0 + 1, y0 + 1) * tx;
+                let ink = ((top * (256 - ty) + bottom * ty) >> 16) as u8;
+                if ink > 0 {
+                    let p = &mut self.px[(py * self.w + px) as usize];
+                    *p = blend(*p, color, crisp(ink));
+                }
+            }
+        }
+    }
+
     fn glow_text(&mut self, x: i32, y: i32, s: &str, color: u32, font: Font) {
         let ui = self.ui;
         let (w, h) = (font.width(ui, s), font.h(ui));
@@ -658,8 +697,8 @@ enum Ctl {
     Page(CpPage),
     Background(usize),
     TextSize(i32),
-    /// Smaller (-1), medium (0) or larger (1) text.
-    FontSize(i32),
+    /// Text one size smaller (false) or bigger (true).
+    FontStep(bool),
     Volume,
     Mute,
     TestSound,
@@ -1523,10 +1562,10 @@ struct Desktop {
 
 impl Desktop {
     fn taskbar(&self) -> Rect {
-        Rect::new(0, self.h - TASKBAR * self.ui, self.w, TASKBAR * self.ui)
+        Rect::new(0, self.h - taskbar_h(self.ui), self.w, taskbar_h(self.ui))
     }
     fn title_h(&self) -> i32 {
-        TITLE * self.ui
+        (TITLE * self.ui).max(Font::Bold.h(self.ui) + 6 * self.ui)
     }
     fn client(&self, r: &Rect) -> Rect {
         let b = BORDER * self.ui;
@@ -1572,25 +1611,28 @@ impl Desktop {
     }
     fn menu_rect(&self) -> Rect {
         let s = self.ui;
-        let t = self.taskbar();
-        Rect::new(2 * s, t.y - 420 * s, 480 * s, 420 * s)
+        let (t, g) = (self.taskbar(), grow(s));
+        // Taller and wider as the text grows.
+        Rect::new(2 * s, t.y - 420 * s - 11 * g, 480 * s + 12 * g, 420 * s + 11 * g)
     }
     fn menu_left(&self) -> Rect {
         let m = self.menu_rect();
         let s = self.ui;
-        Rect::new(m.x + 8 * s, m.y + 8 * s, 250 * s, m.h - 56 * s)
+        Rect::new(m.x + 8 * s, m.y + 8 * s, 250 * s + 6 * grow(s), m.h - 56 * s - grow(s))
     }
     fn menu_item(&self, i: usize) -> Rect {
         let l = self.menu_left();
         let s = self.ui;
-        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * 40 * s, l.w - 8 * s, 36 * s)
+        let g = grow(s);
+        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * (40 * s + g), l.w - 8 * s, 36 * s + g)
     }
     /// "All programs" at the foot of the Start menu's left side ("Back" when
     /// the list of every program is showing).
     fn all_button(&self) -> Rect {
         let l = self.menu_left();
         let s = self.ui;
-        Rect::new(l.x + 4 * s, l.y + l.h - 36 * s, l.w - 8 * s, 32 * s)
+        let g = grow(s);
+        Rect::new(l.x + 4 * s, l.y + l.h - 36 * s - g, l.w - 8 * s, 32 * s + g)
     }
     /// Every program, A to Z, for "All programs".
     fn all_list(&self) -> Vec<Kind> {
@@ -1602,7 +1644,8 @@ impl Desktop {
     fn all_item(&self, i: usize) -> Rect {
         let l = self.menu_left();
         let s = self.ui;
-        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * 34 * s, l.w - 8 * s, 32 * s)
+        let g = grow(s);
+        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * (34 * s + g), l.w - 8 * s, 32 * s + g)
     }
     /// The Start menu's mouse speed buttons: slower (-) and faster (+), with
     /// ten bars between them.
@@ -1611,20 +1654,22 @@ impl Desktop {
         let m = self.menu_rect();
         let s = self.ui;
         let rx = l.x + l.w + 14 * s;
-        Rect::new(rx + if faster { 152 * s } else { 0 }, m.y + 160 * s, 30 * s, 30 * s)
+        Rect::new(rx + if faster { 152 * s } else { 0 }, m.y + 160 * s + 4 * grow(s), 30 * s, 30 * s)
     }
     /// "Control Panel" on the right of the Start menu, under the mouse speed.
     fn cp_menu_item(&self) -> Rect {
         let l = self.menu_left();
         let m = self.menu_rect();
         let s = self.ui;
-        Rect::new(l.x + l.w + 8 * s, m.y + 214 * s, m.x + m.w - (l.x + l.w) - 16 * s, 36 * s)
+        let g = grow(s);
+        Rect::new(l.x + l.w + 8 * s, m.y + 214 * s + 5 * g, m.x + m.w - (l.x + l.w) - 16 * s, 36 * s + g)
     }
     fn exit_button(&self) -> Rect {
         let m = self.menu_rect();
         let s = self.ui;
         let w = (190 * s).max(Font::Normal.width(s, "Exit to console") + 24 * s);
-        Rect::new(m.x + m.w - 10 * s - w, m.y + m.h - 42 * s, w, 34 * s)
+        let g = grow(s);
+        Rect::new(m.x + m.w - 10 * s - w, m.y + m.h - 42 * s - g, w, 34 * s + g)
     }
     fn cursor_rect(&self) -> Rect {
         // Room for the arrow and for the resize arrows centred on the pointer,
@@ -1684,12 +1729,12 @@ impl Desktop {
     }
 
     fn notes_toolbar(&self, client: &Rect) -> Rect {
-        Rect::new(client.x, client.y, client.w, 32 * self.ui)
+        Rect::new(client.x, client.y, client.w, (32 * self.ui).max(Font::Normal.h(self.ui) + 8 * self.ui))
     }
     fn notes_save(&self, client: &Rect) -> Rect {
         let s = self.ui;
         let t = self.notes_toolbar(client);
-        Rect::new(t.x + 6 * s, t.y + 4 * s, 64 * s, t.h - 8 * s)
+        Rect::new(t.x + 6 * s, t.y + 4 * s, (64 * s).max(Font::Normal.width(s, "Save") + 16 * s), t.h - 8 * s)
     }
     fn index(&self, kind: Kind) -> usize {
         self.windows.iter().position(|w| w.kind == kind).unwrap_or(0)
@@ -2046,10 +2091,11 @@ impl Desktop {
         // Right: the date in large type, and the exit button.
         let rx = l.x + l.w + 14 * s;
         c.text(rx, m.y + 16 * s, &self.clock.0, 0xFFFFFF, Font::Large);
-        c.text(rx, m.y + 56 * s, &self.clock.1, rgb(210, 230, 250), Font::Normal);
-        c.text(rx, m.y + 84 * s, "AeroForge", rgb(210, 230, 250), Font::Normal);
+        let g = grow(s);
+        c.text(rx, m.y + 56 * s + g, &self.clock.1, rgb(210, 230, 250), Font::Normal);
+        c.text(rx, m.y + 84 * s + 2 * g, "AeroForge", rgb(210, 230, 250), Font::Normal);
         // Mouse speed: - and + buttons with ten bars between them.
-        c.text(rx, m.y + 128 * s, &format!("Mouse speed {}", self.mouse_speed), 0xFFFFFF, Font::Normal);
+        c.text(rx, m.y + 128 * s + 3 * g, &format!("Mouse speed {}", self.mouse_speed), 0xFFFFFF, Font::Normal);
         for faster in [false, true] {
             let b = self.speed_button(faster);
             let live = if faster { self.mouse_speed < 10 } else { self.mouse_speed > 1 };
@@ -2263,7 +2309,7 @@ impl Desktop {
     /// Where a window dragged with the pointer at (x, y) snaps to: the whole
     /// work area at the top edge, the left or right half at the sides.
     fn snap_target(&self, x: i32, y: i32) -> Option<Rect> {
-        let work_h = self.h - TASKBAR * self.ui;
+        let work_h = self.h - taskbar_h(self.ui);
         if y <= 0 {
             Some(Rect::new(0, 0, self.w, work_h))
         } else if x <= 0 {
@@ -2285,7 +2331,7 @@ impl Desktop {
     }
 
     fn maximize(&mut self, i: usize) {
-        let work = Rect::new(0, 0, self.w, self.h - TASKBAR * self.ui);
+        let work = Rect::new(0, 0, self.w, self.h - taskbar_h(self.ui));
         let win = &mut self.windows[i];
         match win.restore.take() {
             Some(old) => win.rect = old,
@@ -3366,27 +3412,28 @@ impl Desktop {
         self.client(&self.windows[self.index(Kind::Computer)].rect)
     }
     fn files_nav(&self, c: &Rect) -> Rect {
-        Rect::new(c.x, c.y, c.w, 40 * self.ui)
+        Rect::new(c.x, c.y, c.w, 40 * self.ui + grow(self.ui))
     }
     /// Back (0), Forward (1) and Up (2): centre and radius.
     fn files_arrow(&self, c: &Rect, i: i32) -> (i32, i32, i32) {
         let s = self.ui;
-        (c.x + 20 * s + i * 30 * s, c.y + 20 * s, if i == 2 { 10 * s } else { 12 * s })
+        (c.x + 20 * s + i * 30 * s, c.y + 20 * s + grow(s) / 2, if i == 2 { 10 * s } else { 12 * s })
     }
     fn files_address(&self, c: &Rect) -> Rect {
         let s = self.ui;
         let search = self.files_search(c);
-        Rect::new(c.x + 112 * s, c.y + 6 * s, search.x - 8 * s - (c.x + 112 * s), 28 * s)
+        Rect::new(c.x + 112 * s, c.y + 6 * s, search.x - 8 * s - (c.x + 112 * s), 28 * s + grow(s))
     }
     /// The search box, right of the address, as in Windows 7.
     fn files_search(&self, c: &Rect) -> Rect {
         let s = self.ui;
         let w = (c.w / 4).clamp(120 * s, 240 * s);
-        Rect::new(c.x + c.w - 8 * s - w, c.y + 6 * s, w, 28 * s)
+        Rect::new(c.x + c.w - 8 * s - w, c.y + 6 * s, w, 28 * s + grow(s))
     }
     /// The tabs, under the address.
     fn files_tabs(&self, c: &Rect) -> Rect {
-        Rect::new(c.x, c.y + 40 * self.ui, c.w, 30 * self.ui)
+        let g = grow(self.ui);
+        Rect::new(c.x, c.y + 40 * self.ui + g, c.w, 30 * self.ui + g)
     }
     /// Tab `i`'s button in the strip, and its close (x) box.
     fn tab_rect(&self, c: &Rect, i: usize) -> Rect {
@@ -3434,18 +3481,21 @@ impl Desktop {
         Rect::new(p.x - 6 * s - w, p.y, w, p.h)
     }
     fn files_commands(&self, c: &Rect) -> Rect {
-        Rect::new(c.x, c.y + 70 * self.ui, c.w, 34 * self.ui)
+        let g = grow(self.ui);
+        Rect::new(c.x, c.y + 70 * self.ui + 2 * g, c.w, 34 * self.ui + g)
     }
     fn files_status_bar(&self, c: &Rect) -> Rect {
-        Rect::new(c.x, c.y + c.h - 28 * self.ui, c.w, 28 * self.ui)
+        let g = grow(self.ui);
+        Rect::new(c.x, c.y + c.h - 28 * self.ui - g, c.w, 28 * self.ui + g)
     }
     fn files_body(&self, c: &Rect) -> Rect {
         let s = self.ui;
-        Rect::new(c.x, c.y + 104 * s, c.w, c.h - 104 * s - 28 * s)
+        let g = grow(s);
+        Rect::new(c.x, c.y + 104 * s + 3 * g, c.w, c.h - 104 * s - 28 * s - 4 * g)
     }
     fn files_pane(&self, c: &Rect) -> Rect {
         let b = self.files_body(c);
-        Rect::new(b.x, b.y, (240 * self.ui).min(b.w / 3), b.h)
+        Rect::new(b.x, b.y, (240 * self.ui + 4 * grow(self.ui)).min(b.w / 3), b.h)
     }
     /// Right of the navigation pane: the folder shown, or both sides,
     /// then the preview pane if it is on.
@@ -3641,7 +3691,7 @@ impl Desktop {
         self.scrollbar_in(&self.files_content(c))
     }
     fn files_row_h(&self) -> i32 {
-        30 * self.ui
+        30 * self.ui + grow(self.ui)
     }
     fn files_visible(&self, c: &Rect) -> usize {
         self.visible_in(&self.files_content(c))
@@ -7070,17 +7120,19 @@ impl Desktop {
     /// the controls along the bottom.
     fn music_list(&self, client: &Rect) -> Rect {
         let s = self.ui;
-        Rect::new(client.x, client.y, (client.w * 2 / 5).min(260 * s), client.h - 64 * s)
+        Rect::new(client.x, client.y, (client.w * 2 / 5).min(260 * s + 8 * grow(s)), client.h - 64 * s - grow(s))
     }
     fn music_controls(&self, client: &Rect) -> Rect {
         let s = self.ui;
-        Rect::new(client.x, client.y + client.h - 64 * s, client.w, 64 * s)
+        let g = grow(s);
+        Rect::new(client.x, client.y + client.h - 64 * s - g, client.w, 64 * s + g)
     }
     /// The songs the list has room for, and the first one shown (so the one
     /// playing is always in view).
     fn music_rows(&self, client: &Rect) -> (usize, usize) {
         let s = self.ui;
-        let room = ((self.music_list(client).h - 40 * s) / (26 * s)).max(1) as usize;
+        let g = grow(s);
+        let room = ((self.music_list(client).h - 40 * s - g) / (26 * s + g)).max(1) as usize;
         let at = self.player.as_ref().map_or(0, |p| p.at);
         (room, (at + 1).saturating_sub(room))
     }
@@ -7088,7 +7140,8 @@ impl Desktop {
     fn music_row(&self, client: &Rect, i: usize) -> Rect {
         let s = self.ui;
         let l = self.music_list(client);
-        Rect::new(l.x + 6 * s, l.y + 34 * s + i as i32 * 26 * s, l.w - 12 * s, 24 * s)
+        let g = grow(s);
+        Rect::new(l.x + 6 * s, l.y + 34 * s + g + i as i32 * (26 * s + g), l.w - 12 * s, 24 * s + g)
     }
     fn music_bar(&self, client: &Rect) -> Rect {
         let s = self.ui;
@@ -7100,15 +7153,19 @@ impl Desktop {
     fn music_button(&self, client: &Rect, i: usize) -> Rect {
         let s = self.ui;
         let k = self.music_controls(client);
-        let (w, gap) = (76 * s, 8 * s);
+        let (w, gap) = ((76 * s).max(Font::Small.width(s, "Pause") + 16 * s), 8 * s);
         let x0 = k.x + 16 * s;
-        Rect::new(x0 + i as i32 * (w + gap), k.y + 15 * s, w, 34 * s)
+        Rect::new(x0 + i as i32 * (w + gap), k.y + 15 * s, w, 34 * s + grow(s))
     }
     fn music_volume(&self, client: &Rect) -> Rect {
         let s = self.ui;
         let k = self.music_controls(client);
-        let w = (k.w - 4 * 84 * s - 150 * s).clamp(60 * s, 140 * s);
-        Rect::new(k.x + k.w - 56 * s - w, k.y + 27 * s, w, 10 * s)
+        let last = self.music_button(client, 3);
+        // Room for "Volume" before the bar and "100%" after it.
+        let label = (142 * s).max(Font::Small.width(s, "Volume") + Font::Small.width(s, "100%") + 42 * s);
+        let w = (k.x + k.w - (last.x + last.w) - label).clamp(60 * s, 140 * s);
+        let right = (56 * s).max(Font::Small.width(s, "100%") + 16 * s);
+        Rect::new(k.x + k.w - right - w, k.y + 27 * s + grow(s) / 2, w, 10 * s)
     }
 
     /// Sets the volume (out of 100) and keeps it for next time.
@@ -7351,7 +7408,7 @@ impl Desktop {
     /// Everything to click on the page shown, with where it is.
     fn cp_controls(&self, client: &Rect) -> Vec<(Ctl, Rect)> {
         let s = self.ui;
-        let (x0, y0) = (client.x + 24 * s, client.y + 64 * s);
+        let (x0, y0, g) = (client.x + 24 * s, client.y + 64 * s + grow(s), grow(s));
         let mut out = Vec::new();
         if self.cp_page == CpPage::Home {
             // Four categories, two by two.
@@ -7369,13 +7426,13 @@ impl Desktop {
             CpPage::Display => {
                 let (sw, sh) = (128 * s, 80 * s);
                 for i in 0..BACKGROUNDS.len() {
-                    out.push((Ctl::Background(i), Rect::new(x0 + i as i32 * (sw + 18 * s), y0 + 34 * s, sw, sh)));
+                    out.push((Ctl::Background(i), Rect::new(x0 + i as i32 * (sw + 18 * s), y0 + 34 * s + g, sw, sh)));
                 }
-                for (k, level) in [-1, 0, 1].iter().enumerate() {
-                    out.push((Ctl::FontSize(*level), Rect::new(x0 + k as i32 * 170 * s, y0 + 212 * s, 150 * s, 32 * s)));
-                }
+                // - and + either side of the size's name.
+                out.push((Ctl::FontStep(false), Rect::new(x0, y0 + 210 * s + 3 * g, 40 * s, 36 * s + g)));
+                out.push((Ctl::FontStep(true), Rect::new(x0 + 300 * s + 4 * g, y0 + 210 * s + 3 * g, 40 * s, 36 * s + g)));
                 for (k, size) in [1, 2].iter().enumerate() {
-                    out.push((Ctl::TextSize(*size), Rect::new(x0 + k as i32 * 220 * s, y0 + 298 * s, 200 * s, 32 * s)));
+                    out.push((Ctl::TextSize(*size), Rect::new(x0 + k as i32 * (220 * s + 4 * g), y0 + 298 * s + 5 * g, 200 * s + 4 * g, 32 * s + g)));
                 }
             }
             CpPage::Sound => {
@@ -7415,7 +7472,7 @@ impl Desktop {
                 Ctl::Page(p) => String::from(cp_title(*p)),
                 Ctl::Background(i) => String::from(BACKGROUNDS[*i].0),
                 Ctl::TextSize(n) => String::from(if *n == 1 { "Normal size" } else { "Large size" }),
-                Ctl::FontSize(n) => format!("{} text", font_name(*n)),
+                Ctl::FontStep(bigger) => String::from(if *bigger { "bigger text" } else { "smaller text" }),
                 Ctl::Field(i, up) => format!("{} {}", ["Year", "Month", "Day", "Hour", "Minute"][*i], if *up { "+" } else { "-" }),
                 Ctl::Hours24(h) => String::from(if *h { "24-hour" } else { "12-hour" }),
                 other => format!("{:?}", other),
@@ -7451,7 +7508,11 @@ impl Desktop {
                 println!("[desktop] background: {}{}", BACKGROUNDS[i].0, if saved { ", saved" } else { "" });
                 return Rect::new(0, 0, self.w, self.h);
             }
-            Ctl::FontSize(n) => {
+            Ctl::FontStep(bigger) => {
+                let n = (self.prefs.font + if bigger { 1 } else { -1 }).clamp(-1, 3);
+                if n == self.prefs.font {
+                    return Rect::EMPTY;
+                }
                 self.prefs.font = n;
                 TEXT_LEVEL.store(n, Ordering::Relaxed);
                 // The windows that are mostly text take their new size where they are.
@@ -7460,7 +7521,7 @@ impl Desktop {
                     if matches!(kind, Kind::Welcome | Kind::System | Kind::Notes) && self.windows[i].restore.is_none() {
                         let (_, r, _) = window_place(kind, self.w, self.h, self.ui);
                         let old = self.windows[i].rect;
-                        self.windows[i].rect = Rect::new(old.x.min(self.w - r.w - 8 * self.ui).max(0), old.y.min(self.h - TASKBAR * self.ui - 8 * self.ui - r.h).max(0), r.w, r.h);
+                        self.windows[i].rect = Rect::new(old.x.min(self.w - r.w - 8 * self.ui).max(0), old.y.min(self.h - taskbar_h(self.ui) - 8 * self.ui - r.h).max(0), r.w, r.h);
                     }
                 }
                 let saved = self.save_settings();
@@ -7574,7 +7635,7 @@ impl Desktop {
 
     fn cp_view(&self, c: &mut Canvas, client: &Rect) {
         let s = self.ui;
-        let (x0, y0) = (client.x + 24 * s, client.y + 64 * s);
+        let (x0, y0, g) = (client.x + 24 * s, client.y + 64 * s + grow(s), grow(s));
         let blue = rgb(30, 57, 145);
         let grey = rgb(80, 85, 95);
         c.gradient(*client, rgb(250, 252, 255), rgb(228, 236, 247), 255);
@@ -7664,16 +7725,20 @@ impl Desktop {
                     let name = BACKGROUNDS[i].0;
                     c.text(r.x + (r.w - Font::Small.width(s, name)) / 2, r.y + r.h + 8 * s, name, if chosen { blue } else { grey }, Font::Small);
                 }
-                c.text(x0, y0 + 176 * s, "Text size", 0x202020, Font::Normal);
-                for (level, label) in [(-1, "Smaller"), (0, "Medium"), (1, "Larger")] {
-                    check(c, at(Ctl::FontSize(level)), self.prefs.font == level, label, true);
-                }
-                c.text(x0, y0 + 262 * s, "Size of everything", 0x202020, Font::Normal);
+                c.text(x0, y0 + 176 * s + 2 * g, "Text size", 0x202020, Font::Normal);
+                let minus = at(Ctl::FontStep(false));
+                let plus = at(Ctl::FontStep(true));
+                self.round_button(c, minus, "-");
+                self.round_button(c, plus, "+");
+                let name = ["Small", "Medium", "Large", "Larger", "Largest"][(self.prefs.font + 1).clamp(0, 4) as usize];
+                let mid = minus.x + minus.w + (plus.x - minus.x - minus.w - Font::Normal.width(s, name)) / 2;
+                c.text(mid, minus.y + (minus.h - Font::Normal.h(s)) / 2, name, blue, Font::Normal);
+                c.text(x0, y0 + 262 * s + 4 * g, "Size of everything", 0x202020, Font::Normal);
                 let large_ok = ui_for(self.w, self.h, 2) == 2;
                 check(c, at(Ctl::TextSize(1)), self.ui == 1, "Normal", true);
                 check(c, at(Ctl::TextSize(2)), self.ui == 2, "Twice as big", true);
                 let note = if large_ok { String::new() } else { String::from(" (twice as big needs 1600 x 1000)") };
-                c.text(x0, y0 + 344 * s, &format!("Screen: {} x {}{}", self.w, self.h, note), grey, Font::Small);
+                c.text(x0, y0 + 344 * s + 6 * g, &format!("Screen: {} x {}{}", self.w, self.h, note), grey, Font::Small);
             }
             CpPage::Sound => {
                 let (v, muted) = (self.prefs.volume, self.prefs.muted);
@@ -8758,8 +8823,8 @@ fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool
     let f = |v: i32| v * Font::Normal.h(1) / 24;
     // ...but stay on the screen, above the taskbar.
     let fit = |r: Rect| {
-        let (rw, rh) = (r.w.min(w - 16 * s), r.h.min(h - TASKBAR * s - 16 * s));
-        Rect::new(r.x.min(w - 8 * s - rw), r.y.min(h - TASKBAR * s - 8 * s - rh), rw, rh)
+        let (rw, rh) = (r.w.min(w - 16 * s), r.h.min(h - taskbar_h(s) - 16 * s));
+        Rect::new(r.x.min(w - 8 * s - rw), r.y.min(h - taskbar_h(s) - 8 * s - rh), rw, rh)
     };
     match kind {
         Kind::Welcome => ("Welcome", fit(Rect::new(w / 12, h / 7, f(460) * s, f(290) * s)), true),
@@ -8780,11 +8845,11 @@ fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool
             ("Photos", Rect::new((w - pw) / 2, 20 * s, pw, ph), false)
         }
         Kind::Music => {
-            let (mw, mh) = ((w - 100 * s).min(720 * s), (h - 120 * s).min(420 * s));
+            let (mw, mh) = ((w - 100 * s).min(f(720) * s), (h - 120 * s).min(f(420) * s));
             ("Music", Rect::new((w - mw) / 2, (h - mh) / 2 - 20 * s, mw, mh), false)
         }
         Kind::ControlPanel => {
-            let (cw, ch) = (680 * s, (h - 120 * s).min(500 * s));
+            let (cw, ch) = ((w - 16 * s).min(f(680) * s), (h - 120 * s).min(f(500) * s));
             ("Control Panel", Rect::new((w - cw) / 2, 40 * s, cw, ch), false)
         }
     }
@@ -8807,11 +8872,24 @@ fn kind_icon(kind: Kind) -> &'static str {
     }
 }
 
+/// How much taller than medium the text is at scale `s`: room that rows
+/// of text set out at medium size need to add.
+fn grow(s: i32) -> i32 {
+    (Font::Normal.h(s) - 24 * s).max(0)
+}
+
+/// The taskbar's height: room for a line of text, or the clock's two.
+fn taskbar_h(s: i32) -> i32 {
+    (TASKBAR * s).max(Font::Normal.h(s) + 12 * s).max(2 * Font::Tiny.h(s) + 4 * s)
+}
+
 /// How the ini file and the log name text size `level`.
 fn font_name(level: i32) -> &'static str {
     match level {
         -1 => "smaller",
         1 => "larger",
+        2 => "extra large",
+        3 => "largest",
         _ => "medium",
     }
 }
@@ -9005,7 +9083,7 @@ fn saved_prefs() -> Prefs {
                 "muted" => p.muted = yes,
                 "background" => p.background = BACKGROUNDS.iter().position(|b| b.0.eq_ignore_ascii_case(value)).unwrap_or(0),
                 "text size" => p.text_size = match value { "normal" => 1, "large" => 2, _ => 0 },
-                "font size" => p.font = match value { "smaller" => -1, "larger" => 1, _ => 0 },
+                "font size" => p.font = match value { "smaller" => -1, "larger" => 1, "extra large" => 2, "largest" => 3, _ => 0 },
                 "clock" => p.hours24 = value == "24-hour",
                 _ => {}
             }
@@ -9026,7 +9104,7 @@ fn main() -> i64 {
     };
     let (w, h) = (screen.width as i32, screen.height as i32);
     let prefs = saved_prefs();
-    TEXT_LEVEL.store(prefs.font.clamp(-1, 1), Ordering::Relaxed);
+    TEXT_LEVEL.store(prefs.font.clamp(-1, 3), Ordering::Relaxed);
     let ui = ui_for(w, h, prefs.text_size);
     let windows = KINDS_BY_LAYER.iter().map(|&kind| {
         let (title, rect, open) = window_place(kind, w, h, ui);
