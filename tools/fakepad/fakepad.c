@@ -18,6 +18,10 @@
  * report ID 1: X at minimum, Y centred, Z at maximum, Rz centred, hat left,
  * buttons 2 and 10 held.
  *
+ * SIGUSR2 (--xinput) plays a short script instead, a report every 50 ms:
+ * at rest, the left stick half right, at rest, Start tapped, at rest, B
+ * tapped, then at rest for good ("script done" in the log).
+ *
  * SIGUSR1 unplugs the pad (usbredir device disconnect, which QEMU passes on
  * to the guest as an unplug) and the next one plugs it in again.
  *
@@ -46,11 +50,18 @@ static int reports_started;
 static double next_report;
 static int reports_sent;
 static volatile sig_atomic_t toggle_plug;
+static volatile sig_atomic_t script_go;
+static double script_t0 = -1;
 static int plugged;
 
 static void on_usr1(int sig) {
     (void)sig;
     toggle_plug = 1;
+}
+
+static void on_usr2(int sig) {
+    (void)sig;
+    script_go = 1;
 }
 
 static void say(const char *fmt, ...) {
@@ -171,12 +182,23 @@ static void send_report(void) {
             send_in(led, sizeof led);
         }
         /* 00 14, buttons, LT, RT, LX, LY, RX, RY, 6 reserved bytes. */
-        const uint16_t buttons = 0x0002 | 0x0008     /* d-pad down, right */
+        uint16_t buttons = 0x0002 | 0x0008           /* d-pad down, right */
                                | 0x0010              /* Start */
                                | 0x0100              /* LB */
                                | 0x1000 | 0x8000;    /* A, Y */
-        const int16_t lx = 32767, ly = 32767, rx = -32768, ry = 0;
-        const uint8_t r[20] = {0x00, 0x14, (uint8_t)buttons, (uint8_t)(buttons >> 8), 255, 0,
+        int16_t lx = 32767, ly = 32767, rx = -32768, ry = 0;
+        uint8_t lt = 255;
+        if (script_t0 >= 0) {
+            const double t = now() - script_t0;
+            buttons = 0;
+            lx = ly = rx = ry = 0;
+            lt = 0;
+            if (t >= 0.6 && t < 1.1) lx = 16384;
+            else if (t >= 1.6 && t < 1.8) buttons = 0x0010;  /* Start */
+            else if (t >= 2.4 && t < 2.6) buttons = 0x2000;  /* B */
+            if (t >= 3.0 && t < 3.06) say("script done");
+        }
+        const uint8_t r[20] = {0x00, 0x14, (uint8_t)buttons, (uint8_t)(buttons >> 8), lt, 0,
                                (uint8_t)lx, (uint8_t)(lx >> 8), (uint8_t)ly, (uint8_t)(ly >> 8),
                                (uint8_t)rx, (uint8_t)(rx >> 8), (uint8_t)ry, (uint8_t)(ry >> 8)};
         send_in(r, sizeof r);
@@ -375,6 +397,7 @@ int main(int argc, char **argv) {
     }
     xinput = strcmp(argv[2], "--xinput") == 0;
     signal(SIGUSR1, on_usr1);
+    signal(SIGUSR2, on_usr2);
 
     int listener = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -430,9 +453,15 @@ int main(int argc, char **argv) {
                 present();
             }
         }
+        if (script_go) {
+            script_go = 0;
+            script_t0 = now();
+            next_report = 0;
+            say("script started");
+        }
         if (reports_started && now() >= next_report) {
             send_report();
-            next_report = now() + 1.0;
+            next_report = now() + (script_t0 >= 0 && now() - script_t0 < 3.5 ? 0.05 : 1.0);
         }
         if (usbredirparser_has_data_to_write(parser) && usbredirparser_do_write(parser) != 0) break;
     }

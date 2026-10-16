@@ -602,6 +602,19 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.66 a gamepad drives the desktop. The left stick moves the pointer (further for a bigger push;
+the right stick moves it slowly for fine aiming), A clicks, X right-clicks, Start or the Guide button
+opens the Start menu, B closes it or a right-click menu, and RB and LB switch between the open windows.
+A pad only takes over once it has been seen at rest, so one with a stuck button cannot. Programs move
+the pointer with system call 65 (`Screen::move_pointer` in libaero); only the screen's owner may.
+
+Since 0.65 Control Panel's Display page has a text size with − and + buttons, in five steps from Small to Largest (the two biggest
+draw the 32 px font scaled up). It changes the text
+everywhere (windows, menus, the taskbar and the desktop icons' names) without making the whole screen
+twice as big, so it works on any screen; Welcome, System, Notes, Paint, Music, Computer and the Start menu grow to fit, taskbar buttons
+narrow when there are many, and the choice is kept in `/AeroForge.ini` as `font size`. The Start menu's
+"All programs" lists every program from A to Z, with Back to return.
+
 Since 0.64 there is Paint, in the Start menu: draw with a pencil or a round brush in three sizes, rub out
 with the eraser, fill an area with the paint bucket, or drag out straight lines and boxes, in fourteen
 colours. Ctrl+Z takes back the last strokes (up to eight), Ctrl+N starts a new picture and Ctrl+S (or

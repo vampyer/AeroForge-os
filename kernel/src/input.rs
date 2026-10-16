@@ -159,3 +159,23 @@ pub fn pointer(pid: u64) -> Option<u64> {
     let d = DOUBLES.load(Ordering::Relaxed) as u64 & 0x7;
     Some(x | y << 16 | b << 32 | m << 36 | p << 40 | d << 60)
 }
+
+/// A gamepad (read by the screen's owner, the desktop) moves the pointer by
+/// (dx, dy) and, with Some, sets the buttons (bit 0 primary, bit 1 secondary,
+/// never swapped). None if `pid` does not own the screen.
+pub fn nudge(pid: u64, dx: i32, dy: i32, buttons: Option<u32>) -> Option<()> {
+    if OWNER.load(Ordering::Acquire) != pid {
+        return None;
+    }
+    let (w, h) = crate::console::CONSOLE.lock().screen_size().unwrap_or((1280, 800));
+    let x = (usb::MOUSE_X.load(Ordering::Relaxed) + dx.clamp(-4096, 4096)).clamp(0, w as i32 - 1);
+    let y = (usb::MOUSE_Y.load(Ordering::Relaxed) + dy.clamp(-4096, 4096)).clamp(0, h as i32 - 1);
+    usb::MOUSE_X.store(x, Ordering::Relaxed);
+    usb::MOUSE_Y.store(y, Ordering::Relaxed);
+    if let Some(now) = buttons {
+        let now = now & 3;
+        let old = usb::MOUSE_BUTTONS.swap(now, Ordering::Relaxed);
+        self::buttons(old, now);
+    }
+    Some(())
+}
