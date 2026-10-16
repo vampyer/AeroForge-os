@@ -188,6 +188,7 @@ pub const SYS_FILE_APPEND: u64 = 61;
 pub const SYS_AUDIO_VOLUME: u64 = 62;
 pub const SYS_MOUSE_BUTTONS: u64 = 63;
 pub const SYS_TIME_SET: u64 = 64;
+pub const SYS_POINTER_MOVE: u64 = 65;
 
 /// User addresses end here (the lower half of the address space).
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -962,6 +963,13 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, i64> {
                 return Err(E_NOTFOUND);
             }
             Ok(sound::queued(proc_.pid) as u64)
+        }
+        SYS_POINTER_MOVE => {
+            // Moves the pointer by (a0, a1) as signed numbers; a2 bit 8 set =
+            // the buttons become a2 & 3. Only for the program that owns the screen.
+            let buttons = (a2 & 0x100 != 0).then_some((a2 & 3) as u32);
+            input::nudge(proc_.pid, a0 as i64 as i32, a1 as i64 as i32, buttons).ok_or(E_RIGHTS)?;
+            Ok(0)
         }
         SYS_GAMEPAD_READ => {
             // Gamepad a0's state into a gamepad::State at a1; returns how many gamepads there are.

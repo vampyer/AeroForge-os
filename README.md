@@ -602,6 +602,12 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.66 a gamepad drives the desktop. The left stick moves the pointer (further for a bigger push;
+the right stick moves it slowly for fine aiming), A clicks, X right-clicks, Start or the Guide button
+opens the Start menu, B closes it or a right-click menu, and RB and LB switch between the open windows.
+A pad only takes over once it has been seen at rest, so one with a stuck button cannot. Programs move
+the pointer with system call 65 (`Screen::move_pointer` in libaero); only the screen's owner may.
+
 Since 0.65 Control Panel's Display page has a text size with − and + buttons, in five steps from Small to Largest (the two biggest
 draw the 32 px font scaled up). It changes the text
 everywhere (windows, menus, the taskbar and the desktop icons' names) without making the whole screen

@@ -812,6 +812,18 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Control Panel window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cpclosed
     elif [ $STAGE = cpclosed ] && grep -q "\[desktop\] closed Control Panel" "$LOG"; then
+        # The Xbox pad drives the desktop: at rest, the left stick half right
+        # for half a second moves the pointer right, Start opens the Start
+        # menu and B closes it again.
+        point_at 640 300; kill -USR2 $XPAD_PID; STAGE=padscript
+    elif [ $STAGE = padscript ] && grep -q "\[desktop\] gamepad: B" "$LOG"; then
+        grep -q "\[desktop\] gamepad: Controller ready" "$LOG" || fail "the desktop did not take the Xbox pad once it was at rest"
+        PXY=$(grep -ao "\[desktop\] gamepad: pointer at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        [ -n "$PXY" ] && [ "${PXY#*,}" = 300 ] && [ "${PXY%,*}" -gt 680 ] && [ "${PXY%,*}" -lt 840 ] \
+            || fail "the pad's left stick did not move the pointer right from 640,300 (${PXY:-no move logged})"
+        grep -A3 -a "\[desktop\] gamepad: Start" "$LOG" | grep -q "Start menu open" || fail "the pad's Start button did not open the Start menu"
+        STAGE=padmenu
+    elif [ $STAGE = padmenu ]; then
         # Open the Start menu for a screenshot of it and the Start button.
         sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
         sleep 1; monitor "screendump build/gop-start.ppm"

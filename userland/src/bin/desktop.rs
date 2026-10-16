@@ -1524,6 +1524,18 @@ struct Desktop {
     file_drag: Option<FileDrag>,
     /// The modifier keys held as the key being handled was typed.
     key_mods: u8,
+    /// The gamepad: when it was last read, the pointer movement still owed
+    /// (thousandths of a pixel), its buttons held, and the mouse buttons it holds.
+    pad_us: u64,
+    pad_rest: (i64, i64),
+    pad_held: u16,
+    pad_mouse: u8,
+    /// Pads seen at rest (no button held, sticks in the middle) since they
+    /// connected, a bit each: only those count, so a pad that sends a stuck
+    /// button or a bent stick from the start cannot take the pointer over.
+    pad_armed: u8,
+    /// Whether a stick is moving the pointer (logged when it stops).
+    pad_moving: bool,
     /// The navigation pane's tree: the places opened (lower case), and the
     /// folders found in each.
     tree_open: Vec<String>,
@@ -2685,6 +2697,127 @@ impl Desktop {
         self.files_area().union(&self.bring(Kind::Notes))
     }
 
+
+    /// The gamepad drives the desktop: the left stick moves the pointer (the
+    /// right stick too, slowly, for fine aiming), A clicks, X right-clicks,
+    /// B closes the Start menu or a right-click menu, Start (or Guide) opens
+    /// the Start menu, and RB and LB switch between the open windows.
+    fn gamepad(&mut self, now: u64) -> Rect {
+        use aero::gamepad as pad;
+        let mut dirty = Rect::EMPTY;
+        // How far a stick may lean and still count as in the middle.
+        const DEAD: i64 = 7000;
+        let (mut held, mut left, mut right) = (0u16, (0i16, 0i16), (0i16, 0i16));
+        let mut i = 0;
+        while let Ok((st, n)) = pad::read(i) {
+            let bit = 1u8 << i.min(7);
+            let rest = st.xbuttons == 0 && st.thumbs.iter().all(|&v| (v as i64).abs() <= DEAD);
+            if st.connected == 0 {
+                self.pad_armed &= !bit;
+            } else if rest && self.pad_armed & bit == 0 {
+                self.pad_armed |= bit;
+                println!("[desktop] gamepad: {} ready", st.name());
+            }
+            if st.connected != 0 && self.pad_armed & bit != 0 {
+                held |= st.xbuttons;
+                let [lx, ly, rx, ry] = st.thumbs;
+                if (lx as i32).abs() + (ly as i32).abs() > (left.0 as i32).abs() + (left.1 as i32).abs() {
+                    left = (lx, ly);
+                }
+                if (rx as i32).abs() + (ry as i32).abs() > (right.0 as i32).abs() + (right.1 as i32).abs() {
+                    right = (rx, ry);
+                }
+            }
+            i += 1;
+            if i >= n.min(8) {
+                break;
+            }
+        }
+        let dt = if self.pad_us == 0 { 0 } else { now.saturating_sub(self.pad_us).min(50_000) as i64 };
+        self.pad_us = now;
+        if i == 0 {
+            return dirty;
+        }
+        // Thousandths of a pixel this frame for one stick axis: nothing in
+        // the middle (worn sticks drift), then faster the further it goes,
+        // up to `top` pixels a second.
+        let step = |v: i16, top: i64| -> i64 {
+            let a = ((v as i64).abs() - DEAD).max(0);
+            let span = 32767 - DEAD;
+            (top * 1000 * a / span * a / span) * dt / 1_000_000 * (v as i64).signum()
+        };
+        let s = self.ui as i64;
+        // Up on a stick is positive, up on the screen is not.
+        self.pad_rest.0 += step(left.0, 1400 * s) + step(right.0, 200 * s);
+        self.pad_rest.1 -= step(left.1, 1400 * s) + step(right.1, 200 * s);
+        let dx = (self.pad_rest.0 / 1000) as i32;
+        let dy = (self.pad_rest.1 / 1000) as i32;
+        self.pad_rest.0 -= dx as i64 * 1000;
+        self.pad_rest.1 -= dy as i64 * 1000;
+        if [left.0, left.1, right.0, right.1].iter().all(|&v| (v as i64).abs() <= DEAD) {
+            // Sticks back in the middle leave no movement owed.
+            self.pad_rest = (0, 0);
+            if self.pad_moving {
+                self.pad_moving = false;
+                if let Ok(p) = gfx().screen.pointer() {
+                    println!("[desktop] gamepad: pointer at {},{}", p.x, p.y);
+                }
+            }
+        } else {
+            self.pad_moving = true;
+        }
+        let mouse = (held & pad::A != 0) as u8 | ((held & pad::X != 0) as u8) << 1;
+        let buttons = (mouse != self.pad_mouse).then_some(mouse);
+        if dx != 0 || dy != 0 || buttons.is_some() {
+            if gfx().screen.move_pointer(dx, dy, buttons).is_ok() {
+                self.pad_mouse = mouse;
+            }
+        }
+        let pressed = held & !self.pad_held;
+        self.pad_held = held;
+        if pressed & (pad::START | pad::GUIDE) != 0 {
+            println!("[desktop] gamepad: Start");
+            let (ox, oy, _) = self.start_button();
+            dirty = dirty.union(&self.click(ox, oy, false));
+        }
+        if pressed & pad::B != 0 {
+            println!("[desktop] gamepad: B");
+            if self.popup.is_some() {
+                dirty = dirty.union(&self.popup_area());
+                self.popup = None;
+            } else if self.menu {
+                self.menu = false;
+                self.all_programs = false;
+                dirty = dirty.union(&self.menu_rect()).union(&self.taskbar());
+            }
+        }
+        if pressed & (pad::LEFT_SHOULDER | pad::RIGHT_SHOULDER) != 0 {
+            dirty = dirty.union(&self.switch_window(pressed & pad::RIGHT_SHOULDER != 0));
+        }
+        dirty
+    }
+
+    /// The next open window to the front (`forward`, like Alt+Tab), or the
+    /// one in front to the back.
+    fn switch_window(&mut self, forward: bool) -> Rect {
+        let full = Rect::new(0, 0, self.w, self.h);
+        if forward {
+            let top = self.windows.iter().rposition(|w| w.shown());
+            let Some(i) = self.windows.iter().position(|w| w.open) else { return Rect::EMPTY };
+            if Some(i) == top {
+                return Rect::EMPTY;
+            }
+            self.windows[i].minimized = false;
+            let at = self.raise(i);
+            println!("[desktop] gamepad: switched to {}", self.windows[at].title);
+        } else {
+            let Some(t) = self.windows.iter().rposition(|w| w.shown()) else { return Rect::EMPTY };
+            let w = self.windows.remove(t);
+            self.windows.insert(0, w);
+            println!("[desktop] gamepad: switched to {}", self.top().map_or("the desktop", |w| w.title));
+        }
+        full
+    }
 
     fn typed(&mut self, keys: &[(u8, u8)]) -> Rect {
         let mut dirty = Rect::EMPTY;
@@ -9145,6 +9278,12 @@ fn main() -> i64 {
         mouse_speed: { saved_network_drives(); saved_mouse_speed() },
         file_drag: None,
         key_mods: 0,
+        pad_us: 0,
+        pad_rest: (0, 0),
+        pad_held: 0,
+        pad_mouse: 0,
+        pad_armed: 0,
+        pad_moving: false,
         tree_open: alloc::vec![String::new()],
         tree_kids: Vec::new(),
         popup: None,
@@ -9280,6 +9419,7 @@ fn main() -> i64 {
         if let Ok(n) = gfx().screen.keys_with_modifiers(&mut keys) {
             dirty = dirty.union(&desk.typed(&keys[..n]));
         }
+        dirty = dirty.union(&desk.gamepad(aero::clock_us()));
         dirty = dirty.union(&desk.pump_music());
         // Twice a second: the clock, the System window and the Notes caret.
         let now = aero::clock_us();
