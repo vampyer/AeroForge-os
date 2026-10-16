@@ -680,7 +680,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at 27 780; click; STAGE=paintmenu
     elif [ $STAGE = paintmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
         sleep 0.5
-        XY=$(grep -ao "Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        # Paint by way of "All programs", which lists every program A to Z.
+        XY=$(grep -ao "Start menu open; .*; All programs at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintall
+    elif [ $STAGE = paintall ] && grep -q "\[desktop\] All programs: .* | end" "$LOG"; then
+        AP=$(grep -a "\[desktop\] All programs: .* | end" "$LOG" | tail -1)
+        case "$AP" in
+            *"All programs: Calculator at "*"; Computer at "*"; Control Panel at "*"; Music at "*"; Notes at "*"; Paint at "*"; Photos at "*"; System at "*"; Welcome"*) ;;
+            *) fail "All programs does not list the nine programs A to Z: $AP" ;;
+        esac
+        sleep 0.5; monitor "screendump build/gop-allprograms.ppm"
+        XY=$(echo "$AP" | grep -o "Paint at [0-9]*,[0-9]*" | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintopen
     elif [ $STAGE = paintopen ] && grep -q "\[desktop\] Paint: picture at .* | end" "$LOG"; then
         # A red box from (20,20) to (140,80) of the picture, dragged out.
@@ -739,6 +749,13 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-cpanel.ppm"
         point_at $(cp_at "Large size"); click; STAGE=cplarge
     elif [ $STAGE = cplarge ] && grep -q "\[desktop\] text size: " "$LOG"; then
+        # Smaller text, then back to medium. (Smaller first: bigger text
+        # grows the page, which moves the buttons away from the logged spots.)
+        sleep 0.5; point_at $(cp_at "smaller text"); click; STAGE=cpfontsmaller
+    elif [ $STAGE = cpfontsmaller ] && grep -q "\[desktop\] font size: smaller, saved" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-smaller.ppm"
+        point_at $(cp_at "bigger text"); click; STAGE=cpfontmedium
+    elif [ $STAGE = cpfontmedium ] && grep -q "\[desktop\] font size: medium, saved" "$LOG"; then
         sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback1
     elif [ $STAGE = cpback1 ] && [ "$(cp_count "Control Panel")" -ge 2 ]; then
         # Sound: volume to half, a test sound (heard at a quarter of its
@@ -800,7 +817,7 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-start.ppm"
         # Mouse speed 5 -> 6 with the menu's + button (saved to /AeroForge.ini);
         # then a quick move of 40 counts goes 40 * 10/8 * 3/2 = 75 pixels.
-        point_at 441 555; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        point_at 441 515; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
         monitor "mouse_move 40 0"; sleep 0.5
         monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
@@ -913,7 +930,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (460x290)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
         grep -q "pointer speed 5 of 10" "$LOG" || { fail "the shell's mouse speed command did not set speed 5"; }
         grep -q "\[desktop\] mouse speed 6, saved" "$LOG" || { fail "the Start menu's + button did not raise the mouse speed to 6 and save it"; }
-        grep -q "\[desktop\] pointer ended at 516,555" "$LOG" \
+        grep -q "\[desktop\] pointer ended at 516,515" "$LOG" \
             || { fail "at mouse speed 6 a quick 40-count move did not go 75 pixels ($(grep -ao 'pointer ended at [0-9,]*' "$LOG"))"; }
         mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -q "^mouse speed = 6" \
             || { fail "the mouse speed was not saved to /AeroForge.ini on the NVMe disk"; }
@@ -1022,7 +1039,7 @@ PY
         grep -q "\[desktop\] clock: 24-hour, saved" "$LOG" && grep -q "\[desktop\] clock: 12-hour, saved" "$LOG" \
             || { fail "Control Panel did not switch the taskbar clock to 24 hours and back"; }
         INI=$(mtype -i build/disk.img@@1M ::/AeroForge.ini)
-        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour"; do
+        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour" "font size = medium"; do
             echo "$INI" | grep -q "^$want" || { fail "/AeroForge.ini does not have \"$want\" ($INI)"; }
         done
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \

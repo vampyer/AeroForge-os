@@ -99,10 +99,10 @@ def main():
             sys.exit(f'{path}: the Start button has no white ring ({ox},{oy + 12} is {white})')
         if not max(star) < 80:
             sys.exit(f'{path}: the Start button has no black star in the middle ({ox},{oy + 1} is {star})')
-        # The menu's near-white program list, below its five entries.
-        menu = at(60, h - 40 - 380 + 8 + 250)
+        # The menu's near-white program list, between two of its entries.
+        menu = at(60, h - 40 - 420 + 8 + 250)
         if not min(menu) > 225:
-            sys.exit(f'{path}: the Start menu is not open (60,{h - 162} is {menu})')
+            sys.exit(f'{path}: the Start menu is not open (60,{h - 202} is {menu})')
         want = {}
     elif mode == 'cpanel':
         warm = 0
