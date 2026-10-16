@@ -1719,7 +1719,15 @@ impl Desktop {
     }
     fn icon_rect(&self, i: usize) -> Rect {
         let s = self.ui;
-        Rect::new(4 * s, 10 * s + i as i32 * 94 * s, 116 * s, 86 * s)
+        // Wide and tall enough for every name, so the biggest text sizes do
+        // not cut them off at the screen's edge.
+        let w = (116 * s).max(self.icon_label_width(Font::Tiny) + 8 * s);
+        let h = (86 * s).max(58 * s + Font::Normal.h(s));
+        Rect::new(4 * s, 10 * s + i as i32 * (h + 8 * s), w, h)
+    }
+    /// The widest desktop icon name in `font`.
+    fn icon_label_width(&self, font: Font) -> i32 {
+        ICONS.iter().map(|&k| font.width(self.ui, self.windows[self.index(k)].title)).max().unwrap_or(0)
     }
 
     /// The calculator's display and key `(row, col)` inside its client area.
@@ -1967,8 +1975,8 @@ impl Desktop {
             }
             c.icon(kind_icon(kind), r.x + r.w / 2 - 24 * s, r.y + 6 * s, 48 * s);
             let label = self.windows[self.index(kind)].title;
-            // The biggest text that fits under the icon.
-            let font = [Font::Normal, Font::Small, Font::Tiny].into_iter().find(|f| f.width(s, label) <= r.w - 4 * s).unwrap_or(Font::Tiny);
+            // One size for every name: the biggest they all fit in.
+            let font = [Font::Normal, Font::Small].into_iter().find(|&f| self.icon_label_width(f) <= r.w - 4 * s).unwrap_or(Font::Tiny);
             let lx = r.x + (r.w - font.width(s, label)) / 2;
             let ly = r.y + r.h - font.h(s) - 4 * s;
             c.text(lx + s, ly + s, label, 0x000000, font);
@@ -2021,7 +2029,12 @@ impl Desktop {
         c.start_orb(ox, oy, or, hot);
 
         let top = self.top_kind();
-        for (i, kind) in self.task_order().into_iter().enumerate() {
+        // One size for every button's title: the chosen text size while five
+        // letters and ".." still fit, else smaller; long titles are cut short.
+        let order = self.task_order();
+        let room = order.first().map_or(0, |_| self.task_button(0).w - 40 * s);
+        let font = [Font::Normal, Font::Small].into_iter().find(|&f| f.width(s, "Abcde..") <= room).unwrap_or(Font::Tiny);
+        for (i, kind) in order.into_iter().enumerate() {
             let win = &self.windows[self.index(kind)];
             let b = self.task_button(i);
             let active = win.shown() && Some(kind) == top;
@@ -2037,7 +2050,16 @@ impl Desktop {
             c.rounded_outline(b, 3 * s, false, if active { rgb(220, 240, 255) } else { rgb(120, 150, 190) }, 160);
             // The program's icon, then the title.
             c.icon(kind_icon(kind), b.x + 6 * s, b.y + b.h / 2 - 12 * s, 24 * s);
-            c.text_in(Rect::new(b.x, b.y, b.w - 6 * s, b.h), b.x + 34 * s, b.y + (b.h - Font::Normal.h(s)) / 2, win.title, 0xFFFFFF, Font::Normal);
+            let room = b.w - 40 * s;
+            let mut title = String::from(win.title);
+            if font.width(s, &title) > room {
+                while !title.is_empty() && font.width(s, &format!("{}..", title)) > room {
+                    title.pop();
+                }
+                title.truncate(title.trim_end().len());
+                title.push_str("..");
+            }
+            c.text_in(Rect::new(b.x, b.y, b.w - 6 * s, b.h), b.x + 34 * s, b.y + (b.h - font.h(s)) / 2, &title, 0xFFFFFF, font);
         }
 
         // Clock: time over date, then the "show desktop" strip.
@@ -7871,7 +7893,12 @@ impl Desktop {
                 check(c, at(Ctl::TextSize(1)), self.ui == 1, "Normal", true);
                 check(c, at(Ctl::TextSize(2)), self.ui == 2, "Twice as big", true);
                 let note = if large_ok { String::new() } else { String::from(" (twice as big needs 1600 x 1000)") };
-                c.text(x0, y0 + 344 * s + 6 * g, &format!("Screen: {} x {}{}", self.w, self.h, note), grey, Font::Small);
+                // Only when it fits: with the biggest text it would run out of the window.
+                let line = format!("Screen: {} x {}{}", self.w, self.h, note);
+                let ny = y0 + 344 * s + 6 * g;
+                if ny + Font::Small.h(s) <= client.y + client.h - 4 * s && x0 + Font::Small.width(s, &line) <= client.x + client.w - 8 * s {
+                    c.text(x0, ny, &line, grey, Font::Small);
+                }
             }
             CpPage::Sound => {
                 let (v, muted) = (self.prefs.volume, self.prefs.muted);
