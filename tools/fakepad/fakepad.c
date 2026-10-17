@@ -230,7 +230,7 @@ static void send_report(void) {
             else if (t >= 1.6 && t < 1.8) buttons = 0x0010;  /* Start */
             else if (t >= 2.4 && t < 2.6) buttons = 0x2000;  /* B */
             else if (t >= 3.0 && t < 3.2) buttons = 0x0400;  /* Guide */
-            else if (t >= 4.4 && t < 4.7) buttons = 0x0008;  /* d-pad right */
+            else if (t >= 4.4 && t < 4.6) buttons = 0x0008;  /* d-pad right */
             else if (t >= 5.6 && t < 5.9) buttons = 0x1000;  /* A */
             if (t >= 6.4 && t < 6.46) say("script done");
         }
