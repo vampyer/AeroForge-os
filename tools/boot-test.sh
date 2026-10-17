@@ -814,14 +814,34 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = cpclosed ] && grep -q "\[desktop\] closed Control Panel" "$LOG"; then
         # The Xbox pad drives the desktop: at rest, the left stick half right
         # for half a second moves the pointer right, Start opens the Start
-        # menu and B closes it again.
+        # menu and B closes it again; Guide brings up Game Mode, d-pad right
+        # picks its second tile (Notes) and A opens it.
         point_at 640 300; kill -USR2 $XPAD_PID; STAGE=padscript
-    elif [ $STAGE = padscript ] && grep -q "\[desktop\] gamepad: B" "$LOG"; then
+    elif [ $STAGE = padscript ] && grep -q "\[desktop\] Game Mode: opened \|fakepad(xinput): script done" "$LOG" "$FAKEPAD_LOG"; then
+        sleep 1
         grep -q "\[desktop\] gamepad: Controller ready" "$LOG" || fail "the desktop did not take the Xbox pad once it was at rest"
         PXY=$(grep -ao "\[desktop\] gamepad: pointer at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         [ -n "$PXY" ] && [ "${PXY#*,}" = 300 ] && [ "${PXY%,*}" -gt 680 ] && [ "${PXY%,*}" -lt 840 ] \
             || fail "the pad's left stick did not move the pointer right from 640,300 (${PXY:-no move logged})"
         grep -A3 -a "\[desktop\] gamepad: Start" "$LOG" | grep -q "Start menu open" || fail "the pad's Start button did not open the Start menu"
+        grep -q "\[desktop\] gamepad: B" "$LOG" || fail "the pad's B button was not seen"
+        grep -q "\[desktop\] Game Mode: Computer at .*; Notes at .*; start option at [0-9]*,[0-9]* | end" "$LOG" \
+            && grep -q "\[desktop\] Game Mode: chose Notes" "$LOG" \
+            || fail "the pad's Guide button did not bring up Game Mode, or its d-pad did not move to Notes"
+        grep -q "\[desktop\] Game Mode: opened Notes" "$LOG" || fail "the pad's A button did not open Notes from Game Mode"
+        # Game Mode from the Start menu, and its start-up option turned on.
+        GMC=$(grep -c "\[desktop\] Start menu: Game Mode at" "$LOG")
+        sleep 0.5; point_at 27 780; click; STAGE=gmmenu
+    elif [ $STAGE = gmmenu ] && [ "$(grep -c "\[desktop\] Start menu: Game Mode at" "$LOG")" -gt "$GMC" ]; then
+        XY=$(grep -ao "Start menu: Game Mode at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; click; STAGE=gmopen
+    elif [ $STAGE = gmopen ] && [ "$(grep -c "\[desktop\] Game Mode: .*start option at" "$LOG")" -ge 2 ]; then
+        sleep 1; monitor "screendump build/gop-gamemode.ppm"
+        XY=$(grep -ao "start option at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=gmstart
+    elif [ $STAGE = gmstart ] && grep -q "\[desktop\] Game Mode at start: on, saved" "$LOG"; then
+        sleep 0.5; monitor "sendkey esc"; STAGE=gmaway
+    elif [ $STAGE = gmaway ] && grep -q "\[desktop\] Game Mode put away" "$LOG"; then
         STAGE=padmenu
     elif [ $STAGE = padmenu ]; then
         # Open the Start menu for a screenshot of it and the Start button.
@@ -1051,7 +1071,7 @@ PY
         grep -q "\[desktop\] clock: 24-hour, saved" "$LOG" && grep -q "\[desktop\] clock: 12-hour, saved" "$LOG" \
             || { fail "Control Panel did not switch the taskbar clock to 24 hours and back"; }
         INI=$(mtype -i build/disk.img@@1M ::/AeroForge.ini)
-        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour" "font size = medium"; do
+        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour" "font size = medium" "game mode at start = yes"; do
             echo "$INI" | grep -q "^$want" || { fail "/AeroForge.ini does not have \"$want\" ($INI)"; }
         done
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \

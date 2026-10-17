@@ -673,9 +673,10 @@ enum Kind {
     Music,
     ControlPanel,
     Paint,
+    Games,
 }
 
-const KINDS: [Kind; 9] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::ControlPanel, Kind::System, Kind::Welcome];
+const KINDS: [Kind; 10] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::Games, Kind::ControlPanel, Kind::System, Kind::Welcome];
 
 /// The programs on the left of the Start menu (Control Panel is on the right, as in Windows 7).
 const MENU: [Kind; 8] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::System, Kind::Welcome];
@@ -733,16 +734,20 @@ struct Prefs {
     double_ms: u64,
     swapped: bool,
     hours24: bool,
+    /// Open Game Mode, filling the screen, when the desktop starts.
+    game_start: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { background: 0, text_size: 0, font: 0, volume: 100, muted: false, double_ms: 500, swapped: false, hours24: false }
+        Prefs { background: 0, text_size: 0, font: 0, volume: 100, muted: false, double_ms: 500, swapped: false, hours24: false, game_start: false }
     }
 }
 
+/// Game Mode's tiles, in order.
+const GAME: [Kind; 9] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::ControlPanel, Kind::System, Kind::Welcome];
 /// Desktop icons, top to bottom.
-const ICONS: [Kind; 4] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System];
+const ICONS: [Kind; 5] = [Kind::Computer, Kind::Notes, Kind::Calculator, Kind::System, Kind::Games];
 
 /// Paint's tools, as on its toolbar.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1536,6 +1541,15 @@ struct Desktop {
     pad_armed: u8,
     /// Whether a stick is moving the pointer (logged when it stops).
     pad_moving: bool,
+    /// Pad buttons that did something in game mode, ignored until let go
+    /// (so the A that opened a program does not also click in it).
+    pad_eaten: u16,
+    /// Game mode's held direction (-1 left / up as -2, 1 right, 2 down;
+    /// 0 none) and when it next repeats.
+    pad_dir: i8,
+    pad_repeat_us: u64,
+    /// Game Mode's chosen tile.
+    game_sel: usize,
     /// The navigation pane's tree: the places opened (lower case), and the
     /// folders found in each.
     tree_open: Vec<String>,
@@ -1625,7 +1639,7 @@ impl Desktop {
         let s = self.ui;
         let (t, g) = (self.taskbar(), grow(s));
         // Taller and wider as the text grows.
-        Rect::new(2 * s, t.y - 420 * s - 11 * g, 480 * s + 12 * g, 420 * s + 11 * g)
+        Rect::new(2 * s, t.y - 420 * s - 13 * g, 480 * s + 12 * g, 420 * s + 13 * g)
     }
     fn menu_left(&self) -> Rect {
         let m = self.menu_rect();
@@ -1657,7 +1671,7 @@ impl Desktop {
         let l = self.menu_left();
         let s = self.ui;
         let g = grow(s);
-        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * (34 * s + g), l.w - 8 * s, 32 * s + g)
+        Rect::new(l.x + 4 * s, l.y + 6 * s + i as i32 * (32 * s + g), l.w - 8 * s, 30 * s + g)
     }
     /// The Start menu's mouse speed buttons: slower (-) and faster (+), with
     /// ten bars between them.
@@ -1675,6 +1689,11 @@ impl Desktop {
         let s = self.ui;
         let g = grow(s);
         Rect::new(l.x + l.w + 8 * s, m.y + 214 * s + 5 * g, m.x + m.w - (l.x + l.w) - 16 * s, 36 * s + g)
+    }
+    /// Game mode, under Control Panel on the right of the Start menu.
+    fn game_menu_item(&self) -> Rect {
+        let cp = self.cp_menu_item();
+        Rect::new(cp.x, cp.y + cp.h + 6 * self.ui, cp.w, cp.h)
     }
     fn exit_button(&self) -> Rect {
         let m = self.menu_rect();
@@ -1857,6 +1876,7 @@ impl Desktop {
             Kind::Music => self.music_view(c, &client),
             Kind::ControlPanel => self.cp_view(c, &client),
             Kind::Paint => self.paint_view(c, &client),
+            Kind::Games => self.game_view(c, &client),
         }
         c.clip = outer;
     }
@@ -2161,6 +2181,12 @@ impl Desktop {
             c.rounded_outline(cp, 3 * s, false, rgb(170, 210, 245), 255);
         }
         c.text(cp.x + 10 * s, cp.y + (cp.h - Font::Normal.h(s)) / 2, "Control Panel", 0xFFFFFF, Font::Normal);
+        let gm = self.game_menu_item();
+        if gm.contains(self.pointer.x as i32, self.pointer.y as i32) {
+            c.rounded(gm, 3 * s, false, rgb(90, 150, 210), rgb(40, 90, 150), 230);
+            c.rounded_outline(gm, 3 * s, false, rgb(170, 210, 245), 255);
+        }
+        c.text(gm.x + 10 * s, gm.y + (gm.h - Font::Normal.h(s)) / 2, "Game Mode", 0xFFFFFF, Font::Normal);
         let e = self.exit_button();
         let hover = e.contains(self.pointer.x as i32, self.pointer.y as i32);
         c.rounded(e, 3 * s, false, if hover { rgb(250, 180, 150) } else { rgb(230, 150, 120) }, rgb(170, 50, 25), 240);
@@ -2283,6 +2309,7 @@ impl Desktop {
             spots.extend((0..KINDS.len()).map(|i| if self.all_programs { self.all_item(i) } else { self.menu_item(i) }));
             spots.push(self.all_button());
             spots.push(self.cp_menu_item());
+            spots.push(self.game_menu_item());
             spots.push(self.exit_button());
             spots.push(self.speed_button(false));
             spots.push(self.speed_button(true));
@@ -2419,6 +2446,9 @@ impl Desktop {
             if self.cp_menu_item().contains(x, y) {
                 return dirty.union(&self.open(Kind::ControlPanel));
             }
+            if self.game_menu_item().contains(x, y) {
+                return dirty.union(&self.game_mode(true));
+            }
             if self.exit_button().contains(x, y) {
                 self.quit = true;
                 return dirty;
@@ -2447,6 +2477,8 @@ impl Desktop {
                 let paint = self.menu_item(MENU.iter().position(|&k| k == Kind::Paint).unwrap_or(0));
                 println!("[desktop] Start menu open; Control Panel at {},{}; Music at {},{}; Paint at {},{}; All programs at {},{}", cp.x + cp.w / 2, cp.y + cp.h / 2,
                     music.x + music.w / 2, music.y + music.h / 2, paint.x + paint.w / 2, paint.y + paint.h / 2, ab.x + ab.w / 2, ab.y + ab.h / 2);
+                let gm = self.game_menu_item();
+                println!("[desktop] Start menu: Game Mode at {},{}", gm.x + gm.w / 2, gm.y + gm.h / 2);
             }
             return dirty.union(&self.menu_rect()).union(&self.taskbar());
         }
@@ -2531,6 +2563,9 @@ impl Desktop {
                         dirty = dirty.union(&self.step_photo(next));
                     }
                 }
+            } else if self.windows[i].kind == Kind::Games && self.client(&r).contains(x, y) {
+                let client = self.client(&r);
+                dirty = dirty.union(&self.game_click(&client, x, y));
             } else if self.windows[i].kind == Kind::Paint && self.client(&r).contains(x, y) {
                 let client = self.client(&r);
                 dirty = dirty.union(&self.paint_click(&client, x, y));
@@ -2617,6 +2652,9 @@ impl Desktop {
 
     /// Opens a window from its icon or the Start menu.
     fn open(&mut self, kind: Kind) -> Rect {
+        if kind == Kind::Games {
+            return self.game_mode(true).union(&self.taskbar());
+        }
         let at = self.index(kind);
         if kind == Kind::Computer && !self.windows[at].open {
             // A fresh start: one tab, one pane.
@@ -2722,8 +2760,9 @@ impl Desktop {
 
     /// The gamepad drives the desktop: the left stick moves the pointer (the
     /// right stick too, slowly, for fine aiming), A clicks, X right-clicks,
-    /// B closes the Start menu or a right-click menu, Start (or Guide) opens
-    /// the Start menu, and RB and LB switch between the open windows.
+    /// B closes the Start menu or a right-click menu, Start opens the Start
+    /// menu, Guide switches to game mode, and RB and LB switch between the
+    /// open windows.
     fn gamepad(&mut self, now: u64) -> Rect {
         use aero::gamepad as pad;
         let mut dirty = Rect::EMPTY;
@@ -2772,6 +2811,11 @@ impl Desktop {
         // Up on a stick is positive, up on the screen is not.
         self.pad_rest.0 += step(left.0, 1400 * s) + step(right.0, 200 * s);
         self.pad_rest.1 -= step(left.1, 1400 * s) + step(right.1, 200 * s);
+        let game = self.top_kind() == Some(Kind::Games) && self.popup.is_none() && !self.menu;
+        if game {
+            // The sticks pick tiles instead of moving the pointer.
+            self.pad_rest = (0, 0);
+        }
         let dx = (self.pad_rest.0 / 1000) as i32;
         let dy = (self.pad_rest.1 / 1000) as i32;
         self.pad_rest.0 -= dx as i64 * 1000;
@@ -2788,16 +2832,58 @@ impl Desktop {
         } else {
             self.pad_moving = true;
         }
-        let mouse = (held & pad::A != 0) as u8 | ((held & pad::X != 0) as u8) << 1;
+        let pressed = held & !self.pad_held;
+        self.pad_held = held;
+        self.pad_eaten &= held;
+        if game {
+            // Everything pressed in Game Mode stays there.
+            self.pad_eaten |= pressed;
+            // The d-pad or the left stick picks a tile; held, it repeats.
+            let lean = |v: i16| (v as i64).abs() > 16000;
+            let dir: i8 = if held & pad::DPAD_LEFT != 0 || (lean(left.0) && left.0 < 0) {
+                -1
+            } else if held & pad::DPAD_RIGHT != 0 || (lean(left.0) && left.0 > 0) {
+                1
+            } else if held & pad::DPAD_UP != 0 || (lean(left.1) && left.1 > 0) {
+                -2
+            } else if held & pad::DPAD_DOWN != 0 || (lean(left.1) && left.1 < 0) {
+                2
+            } else {
+                0
+            };
+            if dir != self.pad_dir || (dir != 0 && now >= self.pad_repeat_us) {
+                self.pad_repeat_us = now + if dir != self.pad_dir { 400_000 } else { 150_000 };
+                self.pad_dir = dir;
+                if dir != 0 {
+                    dirty = dirty.union(&self.game_step(dir));
+                }
+            }
+            if pressed & pad::A != 0 {
+                dirty = dirty.union(&self.game_open(self.game_sel));
+            } else if pressed & (pad::B | pad::GUIDE) != 0 {
+                dirty = dirty.union(&self.game_mode(false));
+            } else if pressed & pad::START != 0 {
+                dirty = dirty.union(&self.game_mode(false));
+                let (ox, oy, _) = self.start_button();
+                dirty = dirty.union(&self.click(ox, oy, false));
+            }
+            return dirty;
+        }
+        self.pad_dir = 0;
+        let free = held & !self.pad_eaten;
+        let mouse = (free & pad::A != 0) as u8 | ((free & pad::X != 0) as u8) << 1;
         let buttons = (mouse != self.pad_mouse).then_some(mouse);
         if dx != 0 || dy != 0 || buttons.is_some() {
             if gfx().screen.move_pointer(dx, dy, buttons).is_ok() {
                 self.pad_mouse = mouse;
             }
         }
-        let pressed = held & !self.pad_held;
-        self.pad_held = held;
-        if pressed & (pad::START | pad::GUIDE) != 0 {
+        if pressed & pad::GUIDE != 0 {
+            println!("[desktop] gamepad: Guide");
+            self.pad_eaten |= pressed;
+            return dirty.union(&self.game_mode(true));
+        }
+        if pressed & pad::START != 0 {
             println!("[desktop] gamepad: Start");
             let (ox, oy, _) = self.start_button();
             dirty = dirty.union(&self.click(ox, oy, false));
@@ -2841,10 +2927,219 @@ impl Desktop {
         full
     }
 
+    /// Game Mode's header (its name and the clock) inside `client`.
+    fn game_header(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        Rect::new(client.x, client.y, client.w, 76 * s + grow(s))
+    }
+    /// Game Mode's footer: what the buttons do, and the start-up option.
+    fn game_footer(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let h = 56 * s + grow(s);
+        Rect::new(client.x, client.y + client.h - h, client.w, h)
+    }
+    /// The "Start with RetroForgeDX" check box in the footer.
+    fn game_start_box(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let f = self.game_footer(client);
+        let w = 32 * s + Font::Small.width(s, "Start with RetroForgeDX");
+        Rect::new(f.x + f.w - w - 24 * s, f.y + (f.h - 28 * s) / 2, w, 28 * s)
+    }
+    /// Game Mode's tiles: rows of big squares between header and footer,
+    /// as big as fit (up to 196 at medium text).
+    fn game_tile(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let (head, foot) = (self.game_header(client), self.game_footer(client));
+        let area = Rect::new(client.x + 24 * s, head.y + head.h + 12 * s, client.w - 48 * s, foot.y - head.y - head.h - 24 * s);
+        let gap = 24 * s;
+        let n = GAME.len() as i32;
+        // The biggest tile size whose grid fits the area.
+        let mut size = 196 * s + 2 * grow(s);
+        let (mut cols, mut rows);
+        loop {
+            cols = ((area.w + gap) / (size + gap)).clamp(1, n);
+            rows = (n + cols - 1) / cols;
+            if rows * size + (rows - 1) * gap <= area.h || size <= 64 * s {
+                break;
+            }
+            size -= 8 * s;
+        }
+        let (col, row) = (i as i32 % cols, i as i32 / cols);
+        let x0 = area.x + (area.w - (cols * size + (cols - 1) * gap)) / 2;
+        let y0 = area.y + (area.h - (rows * size + (rows - 1) * gap)).max(0) / 2;
+        Rect::new(x0 + col * (size + gap), y0 + row * (size + gap), size, size)
+    }
+    fn game_client(&self) -> Rect {
+        self.client(&self.windows[self.index(Kind::Games)].rect)
+    }
+    fn game_cols(&self) -> usize {
+        let c = self.game_client();
+        let y = self.game_tile(&c, 0).y;
+        (0..GAME.len()).take_while(|&i| self.game_tile(&c, i).y == y).count().max(1)
+    }
+
+    /// Game Mode on: opened (or brought back) filling the screen above the
+    /// taskbar. Off: put away to the taskbar, showing the desktop again.
+    fn game_mode(&mut self, on: bool) -> Rect {
+        let at = self.index(Kind::Games);
+        let front = self.top_kind() == Some(Kind::Games);
+        if on == front {
+            return Rect::EMPTY;
+        }
+        self.menu = false;
+        self.popup = None;
+        let full = Rect::new(0, 0, self.w, self.h);
+        if !on {
+            self.windows[at].minimized = true;
+            println!("[desktop] Game Mode put away");
+            return full;
+        }
+        let first = !self.windows[at].open;
+        self.bring(Kind::Games);
+        let at = self.index(Kind::Games);
+        if first || self.windows[at].restore.is_none() {
+            let work = Rect::new(0, 0, self.w, self.h - taskbar_h(self.ui));
+            let win = &mut self.windows[at];
+            if win.restore.is_none() {
+                win.restore = Some(win.rect);
+            }
+            win.rect = work;
+        }
+        let client = self.game_client();
+        let rows: Vec<String> = GAME.iter().enumerate().map(|(i, &k)| {
+            let r = self.game_tile(&client, i);
+            format!("{} at {},{}", self.windows[self.index(k)].title, r.x + r.w / 2, r.y + r.h / 2)
+        }).collect();
+        let b = self.game_start_box(&client);
+        println!("[desktop] Game Mode: {}; start option at {},{} | end", rows.join("; "), b.x + 14 * self.ui, b.y + b.h / 2);
+        full
+    }
+
+    /// Moves Game Mode's choice: -1 left, 1 right, -2 up, 2 down.
+    fn game_step(&mut self, dir: i8) -> Rect {
+        let (n, cols) = (GAME.len() as i32, self.game_cols() as i32);
+        let at = self.game_sel as i32;
+        let to = match dir {
+            -1 => (at - 1).max(0),
+            1 => (at + 1).min(n - 1),
+            -2 if at >= cols => at - cols,
+            2 if at + cols < n => at + cols,
+            2 if at / cols < (n - 1) / cols => n - 1,
+            _ => at,
+        };
+        if to == at {
+            return Rect::EMPTY;
+        }
+        let client = self.game_client();
+        let old = self.game_tile(&client, self.game_sel);
+        self.game_sel = to as usize;
+        println!("[desktop] Game Mode: chose {}", self.windows[self.index(GAME[self.game_sel])].title);
+        let m = 12 * self.ui;
+        let around = |r: Rect| Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m);
+        around(old).union(&around(self.game_tile(&client, self.game_sel))).intersect(&client)
+    }
+
+    /// Opens a program from Game Mode, filling the screen above the taskbar.
+    fn game_open(&mut self, i: usize) -> Rect {
+        let kind = GAME[i.min(GAME.len() - 1)];
+        self.game_sel = i;
+        println!("[desktop] Game Mode: opened {}", self.windows[self.index(kind)].title);
+        self.open(kind);
+        let at = self.index(kind);
+        if self.windows[at].restore.is_none() {
+            let work = Rect::new(0, 0, self.w, self.h - taskbar_h(self.ui));
+            let win = &mut self.windows[at];
+            win.restore = Some(win.rect);
+            win.rect = work;
+        }
+        Rect::new(0, 0, self.w, self.h)
+    }
+
+    /// Game Mode's inside: a dark backdrop, its name and the time, the
+    /// tiles, and along the bottom what the buttons do and the start-up option.
+    fn game_view(&self, c: &mut Canvas, client: &Rect) {
+        let s = self.ui;
+        c.gradient(*client, rgb(18, 26, 44), rgb(6, 9, 18), 255);
+        let head = self.game_header(client);
+        c.gradient(head, rgb(40, 70, 120), rgb(18, 26, 44), 200);
+        let ty = head.y + (head.h - Font::Large.h(s)) / 2;
+        c.text(head.x + 28 * s, ty, "RetroForgeDX", 0xFFFFFF, Font::Large);
+        let time = &self.clock.0;
+        c.text(head.x + head.w - 28 * s - Font::Large.width(s, time), ty, time, rgb(200, 220, 245), Font::Large);
+        for (i, &kind) in GAME.iter().enumerate() {
+            let r = self.game_tile(client, i);
+            if r.intersect(&c.clip).is_empty() {
+                continue;
+            }
+            let on = i == self.game_sel;
+            if on {
+                let m = 8 * s;
+                let glow = Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m);
+                c.rounded(glow, 14 * s, false, rgb(120, 200, 255), rgb(40, 120, 220), 90);
+                c.rounded(r, 10 * s, false, rgb(70, 130, 200), rgb(30, 70, 140), 255);
+                c.rounded_outline(r, 10 * s, false, rgb(200, 235, 255), 255);
+            } else {
+                c.rounded(r, 10 * s, false, rgb(44, 58, 84), rgb(28, 38, 58), 255);
+                c.rounded_outline(r, 10 * s, false, rgb(70, 90, 125), 255);
+            }
+            let icon = r.w * 9 / 20;
+            c.icon(kind_icon(kind), r.x + (r.w - icon) / 2, r.y + r.h / 8, icon);
+            let name = self.windows[self.index(kind)].title;
+            let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, name) <= r.w - 16 * s).unwrap_or(Font::Tiny);
+            let ny = r.y + r.h - r.h / 8 - font.h(s);
+            c.text(r.x + (r.w - font.width(s, name)) / 2, ny, name, if on { 0xFFFFFF } else { rgb(200, 212, 230) }, font);
+        }
+        let foot = self.game_footer(client);
+        c.fill(Rect::new(foot.x, foot.y, foot.w, s), rgb(50, 66, 95));
+        let b = self.game_start_box(client);
+        let hint = "A Open   B Desktop   Start Start menu";
+        let room = b.x - foot.x - 48 * s;
+        let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, hint) <= room).unwrap_or(Font::Tiny);
+        c.text_in(Rect::new(foot.x, foot.y, room + 24 * s, foot.h), foot.x + 24 * s, foot.y + (foot.h - font.h(s)) / 2, hint, rgb(170, 190, 215), font);
+        // The start-up option: a box, ticked when on.
+        let tick = Rect::new(b.x, b.y + (b.h - 22 * s) / 2, 22 * s, 22 * s);
+        c.rounded(tick, 3 * s, false, rgb(250, 252, 255), rgb(205, 218, 235), 255);
+        c.rounded_outline(tick, 3 * s, false, rgb(120, 150, 190), 255);
+        if self.prefs.game_start {
+            c.text(tick.x + (tick.w - Font::Small.w(s)) / 2, tick.y + (tick.h - Font::Small.h(s)) / 2, "x", rgb(20, 60, 140), Font::Small);
+        }
+        c.text(tick.x + tick.w + 10 * s, b.y + (b.h - Font::Small.h(s)) / 2, "Start with RetroForgeDX", rgb(220, 230, 245), Font::Small);
+    }
+
+    /// A click in Game Mode: a tile opens its program; the check box turns
+    /// starting in Game Mode on or off (saved to the settings file).
+    fn game_click(&mut self, client: &Rect, x: i32, y: i32) -> Rect {
+        if self.game_start_box(client).contains(x, y) {
+            self.prefs.game_start = !self.prefs.game_start;
+            let saved = self.save_settings();
+            println!("[desktop] Game Mode at start: {}{}", if self.prefs.game_start { "on" } else { "off" }, if saved { ", saved" } else { ", not saved" });
+            return self.game_footer(client);
+        }
+        match (0..GAME.len()).find(|&i| self.game_tile(client, i).contains(x, y)) {
+            Some(i) => self.game_open(i),
+            None => Rect::EMPTY,
+        }
+    }
+    fn game_key(&mut self, k: u8) -> Rect {
+        match k {
+            KEY_LEFT => self.game_step(-1),
+            KEY_RIGHT => self.game_step(1),
+            KEY_UP => self.game_step(-2),
+            KEY_DOWN => self.game_step(2),
+            b'\n' | b'\r' | b' ' => self.game_open(self.game_sel),
+            27 => self.game_mode(false),
+            _ => Rect::EMPTY,
+        }
+    }
+
     fn typed(&mut self, keys: &[(u8, u8)]) -> Rect {
         let mut dirty = Rect::EMPTY;
         for &(k, mods) in keys {
             self.key_mods = mods;
+            if self.popup.is_none() && self.top_kind() == Some(Kind::Games) {
+                dirty = dirty.union(&self.game_key(k));
+                continue;
+            }
             if self.popup.is_some() {
                 // The menu takes the keys: Esc closes it, Enter or a
                 // line's first letter... kept simple: anything closes it.
@@ -4947,6 +5242,7 @@ impl Desktop {
         text.push_str(&format!("text size = {}\n", match p.text_size { 1 => "normal", 2 => "large", _ => "auto" }));
         text.push_str(&format!("font size = {}\n", font_name(p.font)));
         text.push_str(&format!("clock = {}\n", if p.hours24 { "24-hour" } else { "12-hour" }));
+        text.push_str(&format!("game mode at start = {}\n", if p.game_start { "yes" } else { "no" }));
         for sh in shares().iter() {
             text.push_str(&format!("network drive = {}|{}|{}\n", sh.unc(), sh.user, sh.letter));
         }
@@ -8973,8 +9269,8 @@ fn clock(started_us: u64, hours24: bool) -> (String, String) {
 }
 
 /// Windows in the order they are stacked at start, back to front.
-const KINDS_BY_LAYER: [Kind; 9] =
-    [Kind::Welcome, Kind::System, Kind::Notes, Kind::Computer, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::ControlPanel];
+const KINDS_BY_LAYER: [Kind; 10] =
+    [Kind::Welcome, Kind::System, Kind::Notes, Kind::Computer, Kind::Calculator, Kind::Paint, Kind::Photos, Kind::Music, Kind::ControlPanel, Kind::Games];
 
 /// A window's title, where it opens on a `w` x `h` screen at scale `s`, and
 /// whether it is open at start.
@@ -9012,6 +9308,11 @@ fn window_place(kind: Kind, w: i32, h: i32, s: i32) -> (&'static str, Rect, bool
             let (cw, ch) = ((w - 16 * s).min(f(680) * s), (h - 120 * s).min(f(500) * s));
             ("Control Panel", Rect::new((w - cw) / 2, 40 * s, cw, ch), false)
         }
+        // Game Mode usually fills the screen; this is its size when restored.
+        Kind::Games => {
+            let (gw, gh) = ((w - 80 * s).min(1000 * s), (h - 110 * s).min(640 * s));
+            ("Game Mode", Rect::new((w - gw) / 2, 24 * s, gw, gh), false)
+        }
     }
 }
 
@@ -9029,6 +9330,7 @@ fn kind_icon(kind: Kind) -> &'static str {
         Kind::Paint => "paint",
         Kind::System => "system",
         Kind::Welcome => "welcome",
+        Kind::Games => "gamemode",
     }
 }
 
@@ -9245,6 +9547,7 @@ fn saved_prefs() -> Prefs {
                 "text size" => p.text_size = match value { "normal" => 1, "large" => 2, _ => 0 },
                 "font size" => p.font = match value { "smaller" => -1, "larger" => 1, "extra large" => 2, "largest" => 3, _ => 0 },
                 "clock" => p.hours24 = value == "24-hour",
+                "game mode at start" => p.game_start = value == "yes",
                 _ => {}
             }
         }
@@ -9311,6 +9614,10 @@ fn main() -> i64 {
         pad_mouse: 0,
         pad_armed: 0,
         pad_moving: false,
+        pad_eaten: 0,
+        pad_dir: 0,
+        pad_repeat_us: 0,
+        game_sel: 0,
         tree_open: alloc::vec![String::new()],
         tree_kids: Vec::new(),
         popup: None,
@@ -9337,6 +9644,12 @@ fn main() -> i64 {
     let calc = desk.icon_rect(2);
     println!("[desktop] up at {}x{}; Notes title bar at {},{}; Computer icon at {},{}; Calculator icon at {},{}", w, h,
         notes.x + 60 * s, notes.y + 12 * s, icon.x + icon.w / 2, icon.y + icon.h / 2, calc.x + calc.w / 2, calc.y + calc.h / 2);
+    if desk.prefs.game_start {
+        // Set to start in Game Mode (its own check box).
+        let all = desk.game_mode(true);
+        let g = gfx();
+        present(&g.screen, &mut g.canvas, &desk, all);
+    }
 
     let mut keys = [(0u8, 0u8); 64];
     let mut tick = 0u64;
@@ -9456,6 +9769,11 @@ fn main() -> i64 {
             if time != desk.clock {
                 desk.clock = time;
                 dirty = dirty.union(&desk.tray());
+                let at = desk.index(Kind::Games);
+                if desk.windows[at].shown() {
+                    let client = desk.client(&desk.windows[at].rect);
+                    dirty = dirty.union(&desk.game_header(&client));
+                }
                 if desk.menu {
                     dirty = dirty.union(&desk.menu_rect());
                 }
@@ -9485,6 +9803,9 @@ fn main() -> i64 {
             shown = shown.union(&draw(&mut g.canvas, &desk, area));
         }
         show(&g.screen, &g.canvas, shown);
+        if desk.top_kind() == Some(Kind::Games) && aero::clock_us() - t0 > 200_000 {
+            println!("[desktop] Game Mode: a frame took {} ms", (aero::clock_us() - t0) / 1000);
+        }
         if moved && desk.drag.is_none() && desk.resize.is_none() {
             let took = aero::clock_us() - t0;
             moves += 1;

@@ -20,7 +20,8 @@
  *
  * SIGUSR2 (--xinput) plays a short script instead, a report every 50 ms:
  * at rest, the left stick half right, at rest, Start tapped, at rest, B
- * tapped, then at rest for good ("script done" in the log).
+ * tapped, then Guide, d-pad right and A tapped in turn, then at rest for
+ * good ("script done" in the log).
  *
  * SIGUSR1 unplugs the pad (usbredir device disconnect, which QEMU passes on
  * to the guest as an unplug) and the next one plugs it in again.
@@ -196,7 +197,10 @@ static void send_report(void) {
             if (t >= 0.6 && t < 1.1) lx = 16384;
             else if (t >= 1.6 && t < 1.8) buttons = 0x0010;  /* Start */
             else if (t >= 2.4 && t < 2.6) buttons = 0x2000;  /* B */
-            if (t >= 3.0 && t < 3.06) say("script done");
+            else if (t >= 3.0 && t < 3.2) buttons = 0x0400;  /* Guide */
+            else if (t >= 4.4 && t < 4.7) buttons = 0x0008;  /* d-pad right */
+            else if (t >= 5.6 && t < 5.9) buttons = 0x1000;  /* A */
+            if (t >= 6.4 && t < 6.46) say("script done");
         }
         const uint8_t r[20] = {0x00, 0x14, (uint8_t)buttons, (uint8_t)(buttons >> 8), lt, 0,
                                (uint8_t)lx, (uint8_t)(lx >> 8), (uint8_t)ly, (uint8_t)(ly >> 8),
@@ -461,7 +465,7 @@ int main(int argc, char **argv) {
         }
         if (reports_started && now() >= next_report) {
             send_report();
-            next_report = now() + (script_t0 >= 0 && now() - script_t0 < 3.5 ? 0.05 : 1.0);
+            next_report = now() + (script_t0 >= 0 && now() - script_t0 < 6.7 ? 0.05 : 1.0);
         }
         if (usbredirparser_has_data_to_write(parser) && usbredirparser_do_write(parser) != 0) break;
     }
