@@ -2852,7 +2852,7 @@ impl Desktop {
                 0
             };
             if dir != self.pad_dir || (dir != 0 && now >= self.pad_repeat_us) {
-                self.pad_repeat_us = now + if dir != self.pad_dir { 400_000 } else { 150_000 };
+                self.pad_repeat_us = now + if dir != self.pad_dir { 500_000 } else { 150_000 };
                 self.pad_dir = dir;
                 if dir != 0 {
                     dirty = dirty.union(&self.game_step(dir));
