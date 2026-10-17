@@ -1,9 +1,9 @@
 [package]
 name = "aerokernel"
-version = "0.64.0"
+version = "0.67.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AeroKernel: the AeroForge OS kernel core"
+description = "AeroKernel: the RetroForgeDX kernel core"
 
 [[bin]]
 name = "aerokernel"

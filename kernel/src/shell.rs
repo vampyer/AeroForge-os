@@ -64,7 +64,7 @@ impl Shell {
             "" => {}
             "help" => {
                 kprintln!("  help        this list");
-                kprintln!("  about       what AeroForge is");
+                kprintln!("  about       what RetroForgeDX is");
                 kprintln!("  ps          processes and threads, per CPU");
                 kprintln!("  sched       per-CPU run queues and context switches");
                 kprintln!("  wakeups     timer interrupts per CPU over one second");
@@ -103,7 +103,7 @@ impl Shell {
                 kprintln!("  panic       trigger a kernel panic on purpose");
             }
             "about" => {
-                kprintln!("  AeroForge OS 0.9, AeroKernel (Rust) with C++ drivers over the DHI.");
+                kprintln!("  RetroForgeDX (formerly AeroForge OS), AeroKernel (Rust) with C++ drivers over the DHI.");
                 kprintln!("  Preemptive multi-core scheduler, ring-3 processes, capability handles");
                 kprintln!("  and IPC ports. aerosmss is the first user process.");
             }

@@ -511,7 +511,7 @@ impl Host {
         self.cmd(OP_SET_EVENT_MASK, &0x3DBF_F807_FFFB_FFFFu64.to_le_bytes())?;
         self.cmd(OP_WRITE_INQUIRY_MODE, &[2])?; // results with RSSI and extended data
         let mut name = [0u8; 248];
-        name[..9].copy_from_slice(b"AeroForge");
+        name[..12].copy_from_slice(b"RetroForgeDX");
         self.cmd(OP_WRITE_LOCAL_NAME, &name)?;
         // A desktop computer (some gamepads only reconnect to computers),
         // Secure Simple Pairing, role switches allowed, and page scan on so
@@ -1420,7 +1420,7 @@ pub fn hci_error(code: u8) -> String {
         0x08 => "connection timed out (out of range?)",
         0x0D | 0x0E | 0x0F => "the device refused the connection",
         0x13 => "the device disconnected (switched off?)",
-        0x16 => "disconnected by AeroForge",
+        0x16 => "disconnected by RetroForgeDX",
         0x18 => "pairing not allowed",
         0x22 => "the device stopped answering",
         _ => return alloc::format!("HCI error {:#04x}", code),

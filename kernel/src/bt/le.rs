@@ -162,7 +162,7 @@ fn random16() -> [u8; 16] {
 
 fn smp_reason(code: u8) -> &'static str {
     match code {
-        0x03 => "the device needs a pairing method AeroForge does not offer yet (LE Secure Connections or a passkey)",
+        0x03 => "the device needs a pairing method RetroForgeDX does not offer yet (LE Secure Connections or a passkey)",
         0x04 => "confirm value mismatch",
         0x05 => "the device does not allow pairing now (is it in pairing mode?)",
         0x06 => "encryption key too short",

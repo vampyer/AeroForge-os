@@ -80,7 +80,7 @@ LOG=build/boot-test.log
 
 make iso >/dev/null
 ./tools/make-disk.sh >/dev/null
-# AeroForge starts the desktop after boot; the test types at the console
+# RetroForgeDX starts the desktop after boot; the test types at the console
 # first and starts the desktop itself later on.
 { mtype -i build/disk.img@@1M ::/system/session.cfg; echo "console    # boot test: stay at the console"; } > build/session.cfg
 mcopy -o -i build/disk.img@@1M build/session.cfg ::/system/session.cfg
@@ -395,15 +395,15 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at $(row_of / docs); double_click; STAGE=deskdocs
     elif [ $STAGE = deskdocs ] && grep -qi "\[desktop\] Computer: /docs = " "$LOG"; then
         DOCS=$(grep -aio "\[desktop\] Computer: /docs = " "$LOG" | head -1 | sed 's/.*Computer: //; s/ = //')
-        sleep 0.5; point_at $(row_of "$DOCS" "Welcome to AeroForge.txt"); double_click; STAGE=deskfile
-    elif [ $STAGE = deskfile ] && grep -qi "\[desktop\] \(opened /docs/Welcome to AeroForge.txt in Notes\|cannot\)" "$LOG"; then
+        sleep 0.5; point_at $(row_of "$DOCS" "Welcome to RetroForgeDX.txt"); double_click; STAGE=deskfile
+    elif [ $STAGE = deskfile ] && grep -qi "\[desktop\] \(opened /docs/Welcome to RetroForgeDX.txt in Notes\|cannot\)" "$LOG"; then
         # Type into it and save it with Ctrl+S.
         sleep 0.5; type_keys 'hello aero'; type_keys $'\x13'
         sleep 1; monitor "screendump build/gop-desktop.ppm"
         # The file manager: pick the text file in /docs (which brings
         # Computer to the front), copy it, make a folder named Stuff, go in
         # and paste it there.
-        point_at $(row_of "$DOCS" "Welcome to AeroForge.txt"); monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        point_at $(row_of "$DOCS" "Welcome to RetroForgeDX.txt"); monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
         type_keys $'\x03'; sleep 0.3; type_keys $'\x0e'; STAGE=exnew
     elif [ $STAGE = exnew ] && grep -q "\[desktop\] \(new folder /docs/New folder\|Can't\)" "$LOG"; then
         sleep 0.5; type_keys $'Stuff\n'; STAGE=exrenamed
@@ -411,17 +411,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; type_keys $'\n'; STAGE=exstuff
     elif [ $STAGE = exstuff ] && grep -q "\[desktop\] Computer: /docs/Stuff = " "$LOG"; then
         sleep 0.5; type_keys $'\x16'; STAGE=expasted
-    elif [ $STAGE = expasted ] && grep -q "\[desktop\] \(pasted /docs/Welcome to AeroForge.txt as /docs/Stuff/\|paste failed\)" "$LOG"; then
+    elif [ $STAGE = expasted ] && grep -q "\[desktop\] \(pasted /docs/Welcome to RetroForgeDX.txt as /docs/Stuff/\|paste failed\)" "$LOG"; then
         # Back up to /docs and paste again: it becomes "... - Copy.txt";
         # delete that (to the Recycle Bin), undo with Ctrl+Z, delete it again.
         sleep 0.5; type_keys $'\x08'; sleep 0.5; type_keys $'\x16'; STAGE=excopy
-    elif [ $STAGE = excopy ] && grep -q "\[desktop\] \(pasted /docs/Welcome to AeroForge.txt as /docs/Welcome to AeroForge - Copy.txt\|paste failed\)" "$LOG"; then
+    elif [ $STAGE = excopy ] && grep -q "\[desktop\] \(pasted /docs/Welcome to RetroForgeDX.txt as /docs/Welcome to RetroForgeDX - Copy.txt\|paste failed\)" "$LOG"; then
         sleep 0.5; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=exbin
-    elif [ $STAGE = exbin ] && grep -q "\[desktop\] \(moved /docs/Welcome to AeroForge - Copy.txt to the Recycle Bin\|Not deleted\)" "$LOG"; then
+    elif [ $STAGE = exbin ] && grep -q "\[desktop\] \(moved /docs/Welcome to RetroForgeDX - Copy.txt to the Recycle Bin\|Not deleted\)" "$LOG"; then
         sleep 0.5; type_keys $'\x1a'; STAGE=exundo
-    elif [ $STAGE = exundo ] && grep -q "\[desktop\] \(restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Not restored\)" "$LOG"; then
+    elif [ $STAGE = exundo ] && grep -q "\[desktop\] \(restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin\|Not restored\)" "$LOG"; then
         sleep 0.5; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=exbin2
-    elif [ $STAGE = exbin2 ] && [ "$(grep -c "\[desktop\] moved /docs/Welcome to AeroForge - Copy.txt to the Recycle Bin" "$LOG")" -ge 2 ]; then
+    elif [ $STAGE = exbin2 ] && [ "$(grep -c "\[desktop\] moved /docs/Welcome to RetroForgeDX - Copy.txt to the Recycle Bin" "$LOG")" -ge 2 ]; then
         # Open the Recycle Bin from the pane, screenshot it, then delete
         # what is in it for good.
         XY=$(grep -ao "Recycle Bin at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
@@ -429,7 +429,7 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = exbinview ] && grep -q "\[desktop\] Recycle Bin = " "$LOG"; then
         sleep 1; monitor "screendump build/gop-bin.ppm"
         monitor "sendkey home"; sleep 0.3; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=expurged
-    elif [ $STAGE = expurged ] && grep -q "\[desktop\] \(removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Can't\)" "$LOG"; then
+    elif [ $STAGE = expurged ] && grep -q "\[desktop\] \(removed /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin\|Can't\)" "$LOG"; then
         # Up from the Recycle Bin is Computer: screenshot the drives.
         sleep 0.5; type_keys $'\x08'; sleep 1.5; monitor "screendump build/gop-explorer.ppm"
         # Map the Samba share as a network drive: the form, then sign in.
@@ -611,7 +611,7 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at "$DX" "$DY"; monitor "mouse_button 2" "mouse_button 0"; STAGE=emptiedmenu
     elif [ $STAGE = emptiedmenu ] && [ "$(grep -c "\[desktop\] menu: Restore at " "$LOG")" -gt "$NR" ]; then
         sleep 0.5; point_at $(menu_item Restore); monitor "mouse_button 1" "mouse_button 0"; STAGE=emptiedback
-    elif [ $STAGE = emptiedback ] && { [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG")" -ge 2 ] \
+    elif [ $STAGE = emptiedback ] && { [ "$(grep -c "\[desktop\] restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin" "$LOG")" -ge 2 ] \
             || grep -q "\[desktop\] \(undelete failed in /Recycle Bin\|Not restored\)" "$LOG"; }; then
         # Pictures: C:/Pictures from the navigation pane, then a double-click
         # opens Sunset.jpg in Photos.
@@ -680,7 +680,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at 27 780; click; STAGE=paintmenu
     elif [ $STAGE = paintmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
         sleep 0.5
-        XY=$(grep -ao "Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        # Paint by way of "All programs", which lists every program A to Z.
+        XY=$(grep -ao "Start menu open; .*; All programs at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintall
+    elif [ $STAGE = paintall ] && grep -q "\[desktop\] All programs: .* | end" "$LOG"; then
+        AP=$(grep -a "\[desktop\] All programs: .* | end" "$LOG" | tail -1)
+        case "$AP" in
+            *"All programs: Calculator at "*"; Computer at "*"; Control Panel at "*"; Music at "*"; Notes at "*"; Paint at "*"; Photos at "*"; System at "*"; Welcome"*) ;;
+            *) fail "All programs does not list the nine programs A to Z: $AP" ;;
+        esac
+        sleep 0.5; monitor "screendump build/gop-allprograms.ppm"
+        XY=$(echo "$AP" | grep -o "Paint at [0-9]*,[0-9]*" | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintopen
     elif [ $STAGE = paintopen ] && grep -q "\[desktop\] Paint: picture at .* | end" "$LOG"; then
         # A red box from (20,20) to (140,80) of the picture, dragged out.
@@ -739,6 +749,13 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-cpanel.ppm"
         point_at $(cp_at "Large size"); click; STAGE=cplarge
     elif [ $STAGE = cplarge ] && grep -q "\[desktop\] text size: " "$LOG"; then
+        # Smaller text, then back to medium. (Smaller first: bigger text
+        # grows the page, which moves the buttons away from the logged spots.)
+        sleep 0.5; point_at $(cp_at "smaller text"); click; STAGE=cpfontsmaller
+    elif [ $STAGE = cpfontsmaller ] && grep -q "\[desktop\] font size: smaller, saved" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-smaller.ppm"
+        point_at $(cp_at "bigger text"); click; STAGE=cpfontmedium
+    elif [ $STAGE = cpfontmedium ] && grep -q "\[desktop\] font size: medium, saved" "$LOG"; then
         sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback1
     elif [ $STAGE = cpback1 ] && [ "$(cp_count "Control Panel")" -ge 2 ]; then
         # Sound: volume to half, a test sound (heard at a quarter of its
@@ -795,12 +812,24 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Control Panel window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cpclosed
     elif [ $STAGE = cpclosed ] && grep -q "\[desktop\] closed Control Panel" "$LOG"; then
+        # The Xbox pad drives the desktop: at rest, the left stick half right
+        # for half a second moves the pointer right, Start opens the Start
+        # menu and B closes it again.
+        point_at 640 300; kill -USR2 $XPAD_PID; STAGE=padscript
+    elif [ $STAGE = padscript ] && grep -q "\[desktop\] gamepad: B" "$LOG"; then
+        grep -q "\[desktop\] gamepad: Controller ready" "$LOG" || fail "the desktop did not take the Xbox pad once it was at rest"
+        PXY=$(grep -ao "\[desktop\] gamepad: pointer at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        [ -n "$PXY" ] && [ "${PXY#*,}" = 300 ] && [ "${PXY%,*}" -gt 680 ] && [ "${PXY%,*}" -lt 840 ] \
+            || fail "the pad's left stick did not move the pointer right from 640,300 (${PXY:-no move logged})"
+        grep -A3 -a "\[desktop\] gamepad: Start" "$LOG" | grep -q "Start menu open" || fail "the pad's Start button did not open the Start menu"
+        STAGE=padmenu
+    elif [ $STAGE = padmenu ]; then
         # Open the Start menu for a screenshot of it and the Start button.
         sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
         sleep 1; monitor "screendump build/gop-start.ppm"
         # Mouse speed 5 -> 6 with the menu's + button (saved to /AeroForge.ini);
         # then a quick move of 40 counts goes 40 * 10/8 * 3/2 = 75 pixels.
-        point_at 441 555; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        point_at 441 515; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
         monitor "mouse_move 40 0"; sleep 0.5
         monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
@@ -829,7 +858,7 @@ for _ in $(seq "$TIMEOUT"); do
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
         && { [ $STAGE = done ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
-        sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
+        sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/RetroForgeDX/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
         grep -q "\[aerosmss\] all services up" "$LOG" || { fail "aerosmss did not finish startup"; }
         grep -q "mounted at /" "$LOG" || { fail "NVMe FAT32 volume not mounted"; }
@@ -913,7 +942,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (460x290)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
         grep -q "pointer speed 5 of 10" "$LOG" || { fail "the shell's mouse speed command did not set speed 5"; }
         grep -q "\[desktop\] mouse speed 6, saved" "$LOG" || { fail "the Start menu's + button did not raise the mouse speed to 6 and save it"; }
-        grep -q "\[desktop\] pointer ended at 516,555" "$LOG" \
+        grep -q "\[desktop\] pointer ended at 516,515" "$LOG" \
             || { fail "at mouse speed 6 a quick 40-count move did not go 75 pixels ($(grep -ao 'pointer ended at [0-9,]*' "$LOG"))"; }
         mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -q "^mouse speed = 6" \
             || { fail "the mouse speed was not saved to /AeroForge.ini on the NVMe disk"; }
@@ -941,14 +970,14 @@ PY
         grep -q "\[desktop\] Computer: drives = C: / FAT32 at [0-9,]* | D: /sata0p1 FAT32 at [0-9,]* | E: /sata1p1 NTFS at [0-9,]* | F: /usb0p1 FAT32 at " "$LOG" \
             || { fail "the Computer window did not open on the four drives ($(grep -ao 'Computer: drives = [^;]*' "$LOG" | head -1))"; }
         grep -q "\[desktop\] renamed /docs/New folder to /docs/Stuff" "$LOG" || { fail "Ctrl+N and typing a name did not make the folder /docs/Stuff"; }
-        grep -q "\[desktop\] pasted /docs/Welcome to AeroForge.txt as /docs/Stuff/Welcome to AeroForge.txt (1 file)" "$LOG" \
+        grep -q "\[desktop\] pasted /docs/Welcome to RetroForgeDX.txt as /docs/Stuff/Welcome to RetroForgeDX.txt (1 file)" "$LOG" \
             || { fail "Ctrl+C and Ctrl+V did not copy the text file into /docs/Stuff"; }
-        grep -q "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin to /docs/Welcome to AeroForge - Copy.txt" "$LOG" \
+        grep -q "\[desktop\] restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin to /docs/Welcome to RetroForgeDX - Copy.txt" "$LOG" \
             || { fail "Ctrl+Z did not bring a deleted file back from the Recycle Bin"; }
-        grep -q "\[desktop\] Recycle Bin = Welcome to AeroForge - Copy.txt (from /docs/Welcome to AeroForge - Copy.txt)" "$LOG" \
+        grep -q "\[desktop\] Recycle Bin = Welcome to RetroForgeDX - Copy.txt (from /docs/Welcome to RetroForgeDX - Copy.txt)" "$LOG" \
             || { fail "the Recycle Bin did not list the deleted file"; }
-        grep -q "\[desktop\] removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
-        mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to AeroForge.txt" | head -n 1 | grep -q "Welcome to AeroForge OS" \
+        grep -q "\[desktop\] removed /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
+        mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to RetroForgeDX.txt" | head -n 1 | grep -q "Welcome to RetroForgeDX\." \
             || { fail "the copy in /docs/Stuff is not on the NVMe disk image"; }
         # (The deleted copy comes back later, from the files emptied from the Recycle Bin.)
         ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 \
@@ -956,13 +985,13 @@ PY
         [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
             || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
         python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
-        grep -q "\[desktop\] selected 3 items: Stuff | AeroForge-OS-Design.md | Welcome to AeroForge.txt" "$LOG" \
-            && grep -q "\[desktop\] selected 2 items: AeroForge-OS-Design.md | Welcome to AeroForge.txt" "$LOG" \
+        grep -q "\[desktop\] selected 3 items: Stuff | AeroForge-OS-Design.md | Welcome to RetroForgeDX.txt" "$LOG" \
+            && grep -q "\[desktop\] selected 2 items: AeroForge-OS-Design.md | Welcome to RetroForgeDX.txt" "$LOG" \
             || { fail "Ctrl+A and Ctrl+click did not select the right entries in /docs"; }
-        grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Stuff/Welcome to AeroForge.txt | /docs/Welcome to AeroForge.txt)" "$LOG" \
-            || grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Welcome to AeroForge.txt | /docs/Stuff/Welcome to AeroForge.txt)" "$LOG" \
+        grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Stuff/Welcome to RetroForgeDX.txt | /docs/Welcome to RetroForgeDX.txt)" "$LOG" \
+            || grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Welcome to RetroForgeDX.txt | /docs/Stuff/Welcome to RetroForgeDX.txt)" "$LOG" \
             || { fail "searching /docs for \"welcome\" did not find its two copies"; }
-        grep -q "\[desktop\] properties of /docs/.*Welcome to AeroForge.txt: [0-9]* bytes" "$LOG" || { fail "Alt+Enter did not show a search result's properties"; }
+        grep -q "\[desktop\] properties of /docs/.*Welcome to RetroForgeDX.txt: [0-9]* bytes" "$LOG" || { fail "Alt+Enter did not show a search result's properties"; }
         grep -q "\[desktop\] dropped 1 item on /docs/Stuff: move" "$LOG" \
             && grep -q "\[desktop\] moved /docs/AeroForge-OS-Design.md to /docs/Stuff/AeroForge-OS-Design.md" "$LOG" \
             && mdir -i build/disk.img@@1M "::/docs/Stuff/AeroForge-OS-Design.md" >/dev/null 2>&1 \
@@ -1022,7 +1051,7 @@ PY
         grep -q "\[desktop\] clock: 24-hour, saved" "$LOG" && grep -q "\[desktop\] clock: 12-hour, saved" "$LOG" \
             || { fail "Control Panel did not switch the taskbar clock to 24 hours and back"; }
         INI=$(mtype -i build/disk.img@@1M ::/AeroForge.ini)
-        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour"; do
+        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour" "font size = medium"; do
             echo "$INI" | grep -q "^$want" || { fail "/AeroForge.ini does not have \"$want\" ($INI)"; }
         done
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \
@@ -1043,9 +1072,9 @@ PY
             && grep -q "\[desktop\] undeleted /games/Old shopping list.txt" "$LOG" \
             && mtype -i build/disk.img@@1M "::/games/Old shopping list.txt" 2>/dev/null | cmp -s - build/undelete-me.txt \
             || { fail "Show deleted files did not bring back /games/Old shopping list.txt whole"; }
-        grep -q "\[desktop\] deleted files in /Recycle Bin = Welcome to AeroForge - Copy.txt (whole)" "$LOG" \
-            && [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin to /docs/Welcome to AeroForge - Copy.txt" "$LOG")" -ge 2 ] \
-            && mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge - Copy.txt" 2>/dev/null | head -n 1 | grep -q "Welcome to AeroForge OS" \
+        grep -q "\[desktop\] deleted files in /Recycle Bin = Welcome to RetroForgeDX - Copy.txt (whole)" "$LOG" \
+            && [ "$(grep -c "\[desktop\] restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin to /docs/Welcome to RetroForgeDX - Copy.txt" "$LOG")" -ge 2 ] \
+            && mtype -i build/disk.img@@1M "::/docs/Welcome to RetroForgeDX - Copy.txt" 2>/dev/null | head -n 1 | grep -q "Welcome to RetroForgeDX\." \
             || { fail "Show emptied files did not bring back the file emptied from the Recycle Bin"; }
         grep -q "\[desktop\] Computer: / = .*; [1-9][0-9]* dated" "$LOG" || { fail "the files on C: came without the dates they were written"; }
         grep -q "\[desktop\] view: Large icons; first item at [0-9]*,[0-9]*, [2-9] across" "$LOG" \
@@ -1060,19 +1089,19 @@ PY
         grep -q "\[desktop\] preview pane off" "$LOG" || { fail "Alt+P did not close the preview pane"; }
         python3 tools/check-screen.py explorer build/gop-panes.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the two-pane screenshot is wrong"; }
         python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
-        grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
+        grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to RetroForgeDX.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
-        grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \
+        grep -qi "\[desktop\] opened /docs/Welcome to RetroForgeDX.txt in Notes (167 bytes)" "$LOG" \
             || { fail "double-clicking a text file in the Computer window did not open it in Notes"; }
-        grep -q "\[desktop\] notes: Welcome to AeroForge OS\. / .*hello aero" "$LOG" \
+        grep -q "\[desktop\] notes: Welcome to RetroForgeDX\. / .*hello aero" "$LOG" \
             || { fail "the opened file plus keys typed on the desktop were not in the Notes window"; }
         # Moving the pointer redraws only the pointer and what it lights up
         # (it used to redraw big areas, about 100 ms per move under QEMU).
         MOVE_US=$(grep -ao "\[desktop\] pointer moves: [0-9]*, redraw took [0-9]* us on average" "$LOG" | grep -o "took [0-9]*" | grep -o "[0-9]*")
         [ -n "$MOVE_US" ] && [ "$MOVE_US" -lt 30000 ] || { fail "redrawing after a pointer move took ${MOVE_US:-?} us on average (want under 30000)"; }
-        grep -q "\[desktop\] saved /docs/Welcome to AeroForge.txt ([0-9]* bytes, read back the same)" "$LOG" \
+        grep -q "\[desktop\] saved /docs/Welcome to RetroForgeDX.txt ([0-9]* bytes, read back the same)" "$LOG" \
             || { fail "Ctrl+S in Notes did not save the file back to the NVMe disk"; }
-        mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge.txt" | tail -n 1 | grep -q "hello aero$" \
+        mtype -i build/disk.img@@1M "::/docs/Welcome to RetroForgeDX.txt" | tail -n 1 | grep -q "hello aero$" \
             || { fail "the file Notes saved does not end with the typed words on the NVMe disk image"; }
         python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 "${CXY%,*}" "${CXY#*,}" $((CW - 100)) \
             || { fail "the desktop screenshot is wrong"; }
