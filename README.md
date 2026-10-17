@@ -602,14 +602,22 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.68 there is Game Mode, a full-screen program for the couch, opened from its desktop icon,
+the Start menu or the pad's Guide button. It looks like a game launcher: brushed dark metal with
+circuit traces, a neon anvil and name, the system's numbers on the left, the programs as cards in the
+middle, and on the right the one chosen with a big Play button and the controllers connected. The
+sticks or d-pad (or the arrow keys) pick a card, A or Enter opens it full screen, B, Guide or Esc go
+back to the desktop, and Start opens the Start menu. Its "Start with RetroForgeDX" switch, kept as
+`game mode at start` in `/AeroForge.ini`, opens it when the system starts.
+
 Since 0.67 the system is called RetroForgeDX: the boot menu, the start-up banner, the Start menu, the
 Welcome window and file, the shell's `about` and the Bluetooth name all say so. The settings file
 keeps its old name, `/AeroForge.ini`, so saved settings carry over, and so do internal names (the
 `aero` library, `aerosmss`, AeroKernel) and the repository's.
 
 Since 0.66 a gamepad drives the desktop. The left stick moves the pointer (further for a bigger push;
-the right stick moves it slowly for fine aiming), A clicks, X right-clicks, Start or the Guide button
-opens the Start menu, B closes it or a right-click menu, and RB and LB switch between the open windows.
+the right stick moves it slowly for fine aiming), A clicks, X right-clicks, Start opens the Start menu
+(Guide opens Game Mode), B closes it or a right-click menu, and RB and LB switch between the open windows.
 A pad only takes over once it has been seen at rest, so one with a stuck button cannot. Programs move
 the pointer with system call 65 (`Screen::move_pointer` in libaero); only the screen's owner may.
 

@@ -464,9 +464,24 @@ def game_mode():
     return img
 
 
+def anvil():
+    """RetroForgeDX's mark: an anvil drawn as a glowing cyan neon tube."""
+    img = new()
+    shape = poly([(4, 31), (26, 27), (90, 27), (90, 41), (70, 43), (61, 53), (63, 60), (79, 64), (81, 73),
+                  (21, 73), (23, 64), (39, 60), (41, 53), (33, 45), (20, 43), (11, 37)])
+    m = mask(shape)
+    tube = ImageChops.subtract(m, m.filter(ImageFilter.MinFilter(S(3.2) * 2 + 1)))
+    paint(img, tube.filter(ImageFilter.GaussianBlur(S(3.5))), (40, 200, 255, 255))
+    paint(img, tube.filter(ImageFilter.GaussianBlur(S(1.2))), (92, 225, 255, 255))
+    paint(img, ImageChops.subtract(m, m.filter(ImageFilter.MinFilter(S(1.6) * 2 + 1))), (215, 250, 255, 255))
+    # The face of the anvil, lit faintly from the tube.
+    paint(img, m.filter(ImageFilter.MinFilter(S(3.2) * 2 + 1)), (40, 160, 200, 40))
+    return img
+
+
 ICONS = [
     ('computer', computer), ('notes', notes), ('calculator', calculator), ('photos', photos), ('music', music),
-    ('controlpanel', control_panel), ('paint', paint_icon), ('system', system), ('welcome', welcome), ('gamemode', game_mode), ('folder', folder), ('drive', drive),
+    ('controlpanel', control_panel), ('paint', paint_icon), ('system', system), ('welcome', welcome), ('gamemode', game_mode), ('anvil', anvil), ('folder', folder), ('drive', drive),
     ('usb', usb), ('netdrive', network_drive), ('bin', recycle_bin), ('page', lambda: page('blank')),
     ('text', lambda: page('text')), ('sound', lambda: page('sound')), ('picture', lambda: page('picture')),
 ]

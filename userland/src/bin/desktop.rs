@@ -2938,36 +2938,79 @@ impl Desktop {
         let h = 56 * s + grow(s);
         Rect::new(client.x, client.y + client.h - h, client.w, h)
     }
-    /// The "Start with RetroForgeDX" check box in the footer.
+    /// The "Start with RetroForgeDX" switch and its label, in the footer.
     fn game_start_box(&self, client: &Rect) -> Rect {
         let s = self.ui;
         let f = self.game_footer(client);
-        let w = 32 * s + Font::Small.width(s, "Start with RetroForgeDX");
+        let w = 56 * s + Font::Small.width(s, "START WITH RETROFORGEDX");
         Rect::new(f.x + f.w - w - 24 * s, f.y + (f.h - 28 * s) / 2, w, 28 * s)
     }
-    /// Game Mode's tiles: rows of big squares between header and footer,
-    /// as big as fit (up to 196 at medium text).
-    fn game_tile(&self, client: &Rect, i: usize) -> Rect {
+    /// Everything between the header and the footer.
+    fn game_body(&self, client: &Rect) -> Rect {
         let s = self.ui;
         let (head, foot) = (self.game_header(client), self.game_footer(client));
-        let area = Rect::new(client.x + 24 * s, head.y + head.h + 12 * s, client.w - 48 * s, foot.y - head.y - head.h - 24 * s);
-        let gap = 24 * s;
+        let top = head.y + head.h + 14 * s;
+        Rect::new(client.x + 20 * s, top, client.w - 40 * s, foot.y - 10 * s - top)
+    }
+    /// The panel on the left (stats) or the right (the choice, controllers),
+    /// when the screen is wide enough for both beside the tiles.
+    fn game_side(&self, client: &Rect, right: bool) -> Option<Rect> {
+        let s = self.ui;
+        let b = self.game_body(client);
+        let w = (b.w * 21 / 100).clamp(210 * s, 320 * s);
+        if b.w - 2 * (w + 20 * s) < 480 * s {
+            return None;
+        }
+        Some(Rect::new(if right { b.x + b.w - w } else { b.x }, b.y, w, b.h))
+    }
+    /// A panel's heading strip ("VAULT // LIBRARY").
+    fn game_heading_h(&self) -> i32 {
+        Font::Small.h(self.ui) + 12 * self.ui
+    }
+    /// Where the tiles go, under their heading.
+    fn game_grid(&self, client: &Rect) -> Rect {
+        let s = self.ui;
+        let b = self.game_body(client);
+        let (l, r) = match (self.game_side(client, false), self.game_side(client, true)) {
+            (Some(l), Some(r)) => (l.x + l.w + 20 * s, r.x - 20 * s),
+            _ => (b.x, b.x + b.w),
+        };
+        let top = self.game_heading_h() + 4 * s;
+        Rect::new(l, b.y + top, r - l, b.h - top)
+    }
+    /// Game Mode's tiles: cards a little taller than wide, as big as fit
+    /// (up to 220 wide at medium text).
+    fn game_tile(&self, client: &Rect, i: usize) -> Rect {
+        let s = self.ui;
+        let area = self.game_grid(client);
+        let gap = 16 * s;
         let n = GAME.len() as i32;
-        // The biggest tile size whose grid fits the area.
-        let mut size = 196 * s + 2 * grow(s);
+        let mut size = 220 * s + 2 * grow(s);
         let (mut cols, mut rows);
         loop {
             cols = ((area.w + gap) / (size + gap)).clamp(1, n);
             rows = (n + cols - 1) / cols;
-            if rows * size + (rows - 1) * gap <= area.h || size <= 64 * s {
+            if rows * (size * 6 / 5) + (rows - 1) * gap <= area.h || size <= 64 * s {
                 break;
             }
-            size -= 8 * s;
+            size -= 6 * s;
         }
+        let h = size * 6 / 5;
         let (col, row) = (i as i32 % cols, i as i32 / cols);
         let x0 = area.x + (area.w - (cols * size + (cols - 1) * gap)) / 2;
-        let y0 = area.y + (area.h - (rows * size + (rows - 1) * gap)).max(0) / 2;
-        Rect::new(x0 + col * (size + gap), y0 + row * (size + gap), size, size)
+        Rect::new(x0 + col * (size + gap), area.y + row * (h + gap), size, h)
+    }
+    /// The right panel's parts: its box, the picture of the choice, where
+    /// the name goes, and the Play button.
+    fn game_details(&self, client: &Rect) -> Option<(Rect, Rect, i32, Rect)> {
+        let s = self.ui;
+        let p = self.game_side(client, true)?;
+        let top = p.y + self.game_heading_h();
+        let art = Rect::new(p.x + 10 * s, top + 10 * s, p.w - 20 * s, (p.w - 20 * s) * 9 / 16);
+        let name_y = art.y + art.h + 10 * s;
+        let play_y = name_y + Font::Normal.h(s) + Font::Tiny.h(s) + 18 * s;
+        let play = Rect::new(p.x + 10 * s, play_y, p.w - 20 * s, 40 * s + grow(s));
+        Some((Rect::new(p.x, top, p.w, play.y + play.h + 10 * s - top), art, name_y, play))
     }
     fn game_client(&self) -> Rect {
         self.client(&self.windows[self.index(Kind::Games)].rect)
@@ -3036,7 +3079,8 @@ impl Desktop {
         println!("[desktop] Game Mode: chose {}", self.windows[self.index(GAME[self.game_sel])].title);
         let m = 12 * self.ui;
         let around = |r: Rect| Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m);
-        around(old).union(&around(self.game_tile(&client, self.game_sel))).intersect(&client)
+        let side = self.game_side(&client, true).unwrap_or(Rect::EMPTY);
+        around(old).union(&around(self.game_tile(&client, self.game_sel))).intersect(&client).union(&side)
     }
 
     /// Opens a program from Game Mode, filling the screen above the taskbar.
@@ -3055,65 +3099,258 @@ impl Desktop {
         Rect::new(0, 0, self.w, self.h)
     }
 
-    /// Game Mode's inside: a dark backdrop, its name and the time, the
-    /// tiles, and along the bottom what the buttons do and the start-up option.
+    /// Game Mode's inside, in the style of a game launcher: brushed dark
+    /// metal with faint circuit traces, a neon name, the stats on the left,
+    /// the programs as cards, the choice and the controllers on the right,
+    /// and along the bottom what the buttons do and the start-up switch.
     fn game_view(&self, c: &mut Canvas, client: &Rect) {
         let s = self.ui;
-        c.gradient(*client, rgb(18, 26, 44), rgb(6, 9, 18), 255);
+        c.gradient(*client, rgb(30, 34, 41), rgb(11, 13, 17), 255);
+        // Brushed: a faint light line every other row, a little uneven.
+        let mut y = client.y.max(c.clip.y) & !1;
+        while y < (client.y + client.h).min(c.clip.y + c.clip.h) {
+            c.shade(Rect::new(client.x, y, client.w, 1), 0xFFFFFF, 4 + (y as u32 * 7 % 5));
+            y += 2;
+        }
+        for trace in GAME_TRACES {
+            let at = |&(x, y): &(i32, i32)| (client.x + client.w * x / 1000, client.y + client.h * y / 1000);
+            for pair in trace.windows(2) {
+                let ((x0, y0), (x1, y1)) = (at(&pair[0]), at(&pair[1]));
+                c.line(x0, y0, x1, y1, s, rgb(34, 62, 72));
+            }
+            for end in [trace[0], trace[trace.len() - 1]] {
+                let (x, y) = at(&end);
+                c.rounded(Rect::new(x - 3 * s, y - 3 * s, 7 * s, 7 * s), 3 * s, false, rgb(60, 110, 124), rgb(34, 62, 72), 255);
+            }
+        }
+
+        // The header: the anvil, the name in neon, and where you are and the time.
         let head = self.game_header(client);
-        c.gradient(head, rgb(40, 70, 120), rgb(18, 26, 44), 200);
+        c.gradient(head, rgb(40, 46, 55), rgb(22, 26, 32), 255);
+        let mut y = head.y.max(c.clip.y) & !1;
+        while y < (head.y + head.h).min(c.clip.y + c.clip.h) {
+            c.shade(Rect::new(head.x, y, head.w, 1), 0xFFFFFF, 5 + (y as u32 * 3 % 4));
+            y += 2;
+        }
+        let logo = head.h - 20 * s;
+        c.icon("anvil", head.x + 22 * s, head.y + (head.h - logo) / 2, logo);
         let ty = head.y + (head.h - Font::Large.h(s)) / 2;
-        c.text(head.x + 28 * s, ty, "RetroForgeDX", 0xFFFFFF, Font::Large);
-        let time = &self.clock.0;
-        c.text(head.x + head.w - 28 * s - Font::Large.width(s, time), ty, time, rgb(200, 220, 245), Font::Large);
+        c.neon_text(head.x + 34 * s + logo, ty, "RetroForgeDX", NEON, Font::Large);
+        let time = self.clock.0.to_uppercase();
+        let nav: [(&str, u32); 5] = [("GAME MODE", NEON), (" // ", DIM), ("LIBRARY", PALE), (" // ", DIM), (&time, PALE)];
+        let room = head.w / 2 - 28 * s;
+        let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, &nav.map(|n| n.0).concat()) <= room).unwrap_or(Font::Tiny);
+        let mut x = head.x + head.w - 28 * s - font.width(s, &nav.map(|n| n.0).concat());
+        for (part, color) in nav {
+            c.text(x, head.y + (head.h - font.h(s)) / 2, part, color, font);
+            x += font.width(s, part);
+        }
+        // A glowing line under the header.
+        let line = Rect::new(head.x, head.y + head.h - 2 * s, head.w, s);
+        c.shade(Rect::new(line.x, line.y - 2 * s, line.w, 2 * s), NEON, 30);
+        c.fill(line, rgb(60, 170, 200));
+        c.shade(Rect::new(line.x, line.y + s, line.w, 3 * s), NEON, 40);
+
+        let hh = self.game_heading_h();
+        if let Some(p) = self.game_side(client, false) {
+            self.game_left(c, &p, hh);
+        }
+        // The tiles.
+        let grid = self.game_grid(client);
+        c.heading(Rect::new(grid.x, grid.y - hh - 4 * s, grid.w, hh), &["VAULT", "LIBRARY", "PROGRAMS"]);
         for (i, &kind) in GAME.iter().enumerate() {
             let r = self.game_tile(client, i);
             if r.intersect(&c.clip).is_empty() {
                 continue;
             }
-            let on = i == self.game_sel;
-            if on {
-                let m = 8 * s;
-                let glow = Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m);
-                c.rounded(glow, 14 * s, false, rgb(120, 200, 255), rgb(40, 120, 220), 90);
-                c.rounded(r, 10 * s, false, rgb(70, 130, 200), rgb(30, 70, 140), 255);
-                c.rounded_outline(r, 10 * s, false, rgb(200, 235, 255), 255);
-            } else {
-                c.rounded(r, 10 * s, false, rgb(44, 58, 84), rgb(28, 38, 58), 255);
-                c.rounded_outline(r, 10 * s, false, rgb(70, 90, 125), 255);
-            }
-            let icon = r.w * 9 / 20;
-            c.icon(kind_icon(kind), r.x + (r.w - icon) / 2, r.y + r.h / 8, icon);
-            let name = self.windows[self.index(kind)].title;
-            let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, name) <= r.w - 16 * s).unwrap_or(Font::Tiny);
-            let ny = r.y + r.h - r.h / 8 - font.h(s);
-            c.text(r.x + (r.w - font.width(s, name)) / 2, ny, name, if on { 0xFFFFFF } else { rgb(200, 212, 230) }, font);
+            self.game_card(c, r, kind, i == self.game_sel);
         }
+        if let Some(p) = self.game_side(client, true) {
+            self.game_right(c, client, &p, hh);
+        }
+
+        // The footer: what the buttons do, and the start-up switch.
         let foot = self.game_footer(client);
-        c.fill(Rect::new(foot.x, foot.y, foot.w, s), rgb(50, 66, 95));
+        c.gradient(foot, rgb(22, 26, 32), rgb(14, 16, 20), 255);
+        c.fill(Rect::new(foot.x, foot.y, foot.w, s), rgb(50, 64, 74));
         let b = self.game_start_box(client);
-        let hint = "A Open   B Desktop   Start Start menu";
+        let hints: [(&str, u32); 8] = [("[A]", NEON), (" OPEN", PALE), ("  //  ", DIM), ("[B]", NEON), (" DESKTOP", PALE), ("  //  ", DIM), ("[START]", NEON), (" MENU", PALE)];
+        let all = hints.map(|h| h.0).concat();
         let room = b.x - foot.x - 48 * s;
-        let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, hint) <= room).unwrap_or(Font::Tiny);
-        c.text_in(Rect::new(foot.x, foot.y, room + 24 * s, foot.h), foot.x + 24 * s, foot.y + (foot.h - font.h(s)) / 2, hint, rgb(170, 190, 215), font);
-        // The start-up option: a box, ticked when on.
-        let tick = Rect::new(b.x, b.y + (b.h - 22 * s) / 2, 22 * s, 22 * s);
-        c.rounded(tick, 3 * s, false, rgb(250, 252, 255), rgb(205, 218, 235), 255);
-        c.rounded_outline(tick, 3 * s, false, rgb(120, 150, 190), 255);
-        if self.prefs.game_start {
-            c.text(tick.x + (tick.w - Font::Small.w(s)) / 2, tick.y + (tick.h - Font::Small.h(s)) / 2, "x", rgb(20, 60, 140), Font::Small);
+        let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, &all) <= room).unwrap_or(Font::Tiny);
+        let area = Rect::new(foot.x, foot.y, room + 24 * s, foot.h);
+        let mut x = foot.x + 24 * s;
+        for (part, color) in hints {
+            c.text_in(area, x, foot.y + (foot.h - font.h(s)) / 2, part, color, font);
+            x += font.width(s, part);
         }
-        c.text(tick.x + tick.w + 10 * s, b.y + (b.h - Font::Small.h(s)) / 2, "Start with RetroForgeDX", rgb(220, 230, 245), Font::Small);
+        let on = self.prefs.game_start;
+        let track = Rect::new(b.x, b.y + (b.h - 22 * s) / 2, 44 * s, 22 * s);
+        if on {
+            c.rounded(track, 11 * s, false, rgb(60, 200, 230), rgb(20, 120, 150), 255);
+        } else {
+            c.rounded(track, 11 * s, false, rgb(50, 56, 64), rgb(34, 38, 44), 255);
+        }
+        c.rounded_outline(track, 11 * s, false, if on { NEON } else { rgb(80, 90, 100) }, 255);
+        let knob = Rect::new(if on { track.x + track.w - 20 * s } else { track.x + 2 * s }, track.y + 2 * s, 18 * s, 18 * s);
+        c.rounded(knob, 9 * s, false, 0xFFFFFF, if on { rgb(200, 240, 250) } else { rgb(150, 156, 164) }, 255);
+        c.text(track.x + track.w + 12 * s, b.y + (b.h - Font::Small.h(s)) / 2, "START WITH RETROFORGEDX", if on { NEON } else { PALE }, Font::Small);
     }
 
-    /// A click in Game Mode: a tile opens its program; the check box turns
-    /// starting in Game Mode on or off (saved to the settings file).
+    /// One program's card: its picture, its name and a Play button; the
+    /// one chosen glows.
+    fn game_card(&self, c: &mut Canvas, r: Rect, kind: Kind, on: bool) {
+        let s = self.ui;
+        let radius = 6 * s;
+        if on {
+            for (m, a) in [(8, 30), (6, 55), (4, 100), (2, 170)] {
+                let g = Rect::new(r.x - m * s, r.y - m * s, r.w + 2 * m * s, r.h + 2 * m * s);
+                c.rounded_outline(g, radius + m * s, false, NEON, a);
+            }
+        }
+        c.rounded(r, radius, false, rgb(26, 30, 36), rgb(16, 18, 22), 255);
+        let art = Rect::new(r.x + 3 * s, r.y + 3 * s, r.w - 6 * s, r.h * 58 / 100);
+        c.game_art(art, kind);
+        let name = self.windows[self.index(kind)].title.to_uppercase();
+        let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, &name) <= r.w - 16 * s).unwrap_or(Font::Tiny);
+        let name = fit_dots(&name, font, s, r.w - 14 * s);
+        let ny = art.y + art.h + 6 * s;
+        c.text_in(r, r.x + 8 * s, ny, &name, if on { 0xFFFFFF } else { rgb(214, 222, 230) }, font);
+        // The Play button and a bar under "READY", as on a launcher.
+        let by = ny + font.h(s) + 6 * s;
+        let bh = (r.y + r.h - 8 * s - by).min(34 * s);
+        if bh >= 14 * s {
+            let btn = Rect::new(r.x + 8 * s, by, bh * 4 / 3, bh);
+            c.rounded(btn, 3 * s, false, rgb(20, 60, 74), rgb(12, 34, 42), 255);
+            c.rounded_outline(btn, 3 * s, false, if on { NEON } else { rgb(70, 150, 170) }, 255);
+            let t = bh / 2;
+            c.play_mark(Rect::new(btn.x + (btn.w - t * 3 / 4) / 2 + s, btn.y + (bh - t) / 2, t * 3 / 4, t), if on { 0xFFFFFF } else { NEON });
+            let lx = btn.x + btn.w + 8 * s;
+            let lw = r.x + r.w - 10 * s - lx;
+            if lw >= 30 * s && Font::Tiny.h(s) + 8 * s <= bh + 4 * s {
+                c.text_in(Rect::new(lx, by, lw, bh), lx, by, "READY", NEON, Font::Tiny);
+                let bar = Rect::new(lx, by + bh - 6 * s, lw, 5 * s);
+                c.fill(bar, rgb(30, 40, 46));
+                c.fill(Rect::new(bar.x, bar.y, bar.w * if on { 10 } else { 7 } / 10, bar.h), rgb(70, 200, 230));
+            }
+        }
+        c.rounded_outline(r, radius, false, if on { rgb(170, 245, 255) } else { rgb(58, 128, 148) }, 255);
+        if on {
+            c.rounded_outline(Rect::new(r.x + s, r.y + s, r.w - 2 * s, r.h - 2 * s), radius - s, false, NEON, 255);
+        }
+    }
+
+    /// The left panel: the system's numbers, and the collection in view.
+    fn game_left(&self, c: &mut Canvas, p: &Rect, hh: i32) {
+        let s = self.ui;
+        c.heading(Rect::new(p.x, p.y, p.w, hh), &["VAULT", "STATS"]);
+        let pads = (0..8).map_while(|i| aero::gamepad::read(i).ok()).filter(|(st, _)| st.connected != 0).count();
+        let size = font_name(self.prefs.font).to_uppercase();
+        let rows: [(&str, String); 4] = [
+            ("PROGRAMS", format!("[{}]", GAME.len())),
+            ("CONTROLLERS", format!("[{}]", pads)),
+            ("TEXT SIZE", format!("[{}]", size)),
+            ("CLOCK", (if self.prefs.hours24 { "[24-HOUR]" } else { "[12-HOUR]" }).into()),
+        ];
+        // Name and value on one line if they fit, else the value under the name.
+        let fits = |f: Font| rows.iter().all(|(k, v)| f.width(s, k) + f.width(s, v) + 36 * s <= p.w);
+        let (font, two) = match [Font::Small, Font::Tiny].into_iter().find(|&f| fits(f)) {
+            Some(f) => (f, false),
+            None => (Font::Tiny, true),
+        };
+        let row_h = font.h(s) * if two { 2 } else { 1 } + 10 * s;
+        let stats = Rect::new(p.x, p.y + hh, p.w, rows.len() as i32 * row_h + 16 * s);
+        c.panel(stats);
+        for (i, (k, v)) in rows.iter().enumerate() {
+            let y = stats.y + 8 * s + i as i32 * row_h + 5 * s;
+            c.text_in(stats, stats.x + 12 * s, y, &fit_dots(k, font, s, stats.w - 24 * s), PALE, font);
+            let vy = if two { y + font.h(s) } else { y };
+            let v = fit_dots(v, font, s, stats.w - 24 * s);
+            c.text_in(stats, stats.x + stats.w - 12 * s - font.width(s, &v), vy, &v, 0xFFFFFF, font);
+        }
+        let top = stats.y + stats.h + 16 * s;
+        if top + hh + row_h + 16 * s > p.y + p.h {
+            return;
+        }
+        c.heading(Rect::new(p.x, top, p.w, hh), &["COLLECTIONS"]);
+        let list = Rect::new(p.x, top + hh, p.w, row_h + 16 * s);
+        c.panel(list);
+        let pick = Rect::new(list.x + 6 * s, list.y + 8 * s, list.w - 12 * s, row_h);
+        c.rounded(pick, 4 * s, false, rgb(24, 70, 86), rgb(16, 46, 58), 255);
+        c.rounded_outline(pick, 4 * s, false, rgb(70, 170, 200), 255);
+        let n = format!("[{}]", GAME.len());
+        let room = pick.w - 16 * s;
+        if font.width(s, "> ALL PROGRAMS") + font.width(s, &n) + 8 * s <= room {
+            c.text_in(list, pick.x + pick.w - 8 * s - font.width(s, &n), pick.y + 5 * s, &n, NEON, font);
+        }
+        c.text_in(list, pick.x + 8 * s, pick.y + 5 * s, &fit_dots("> ALL PROGRAMS", font, s, room), 0xFFFFFF, font);
+    }
+
+    /// The right panel: the program chosen with a Play button, the
+    /// controllers connected, and the system's state at the bottom.
+    fn game_right(&self, c: &mut Canvas, client: &Rect, p: &Rect, hh: i32) {
+        let s = self.ui;
+        let Some((boxr, art, name_y, play)) = self.game_details(client) else { return };
+        let kind = GAME[self.game_sel.min(GAME.len() - 1)];
+        c.heading(Rect::new(p.x, p.y, p.w, hh), &["SELECTED", "DETAILS"]);
+        c.panel(boxr);
+        c.game_art(art, kind);
+        c.rounded_outline(art, 4 * s, false, rgb(70, 170, 200), 255);
+        let name = self.windows[self.index(kind)].title.to_uppercase();
+        let font = [Font::Normal, Font::Small].into_iter().find(|f| f.width(s, &name) <= boxr.w - 20 * s).unwrap_or(Font::Tiny);
+        c.text_in(boxr, boxr.x + 10 * s, name_y, &fit_dots(&name, font, s, boxr.w - 20 * s), 0xFFFFFF, font);
+        c.text_in(boxr, boxr.x + 10 * s, name_y + Font::Normal.h(s) + 6 * s, &fit_dots(game_blurb(kind), Font::Tiny, s, boxr.w - 20 * s), PALE, Font::Tiny);
+        for (m, a) in [(4, 35), (2, 80)] {
+            c.rounded_outline(Rect::new(play.x - m * s, play.y - m * s, play.w + 2 * m * s, play.h + 2 * m * s), (6 + m) * s, false, NEON, a);
+        }
+        c.rounded(play, 6 * s, false, rgb(24, 80, 98), rgb(12, 40, 50), 255);
+        c.rounded_outline(play, 6 * s, false, NEON, 255);
+        let label = "PLAY // OPEN";
+        let lf = [Font::Large, Font::Normal, Font::Small].into_iter().find(|f| f.width(s, label) <= play.w - 16 * s && f.h(s) <= play.h - 4 * s).unwrap_or(Font::Tiny);
+        c.neon_text(play.x + (play.w - lf.width(s, label)) / 2, play.y + (play.h - lf.h(s)) / 2, label, NEON, lf);
+
+        // The status pill along the bottom, and the controllers above it.
+        let pill = Rect::new(p.x, p.y + p.h - 34 * s - grow(s), p.w, 34 * s + grow(s));
+        let top = boxr.y + boxr.h + 16 * s;
+        let row_h = Font::Tiny.h(s) + 10 * s;
+        if top + hh + row_h + 16 * s <= pill.y - 12 * s {
+            c.heading(Rect::new(p.x, top, p.w, hh), &["CONTROLLERS", "ONLINE"]);
+            let pads: Vec<String> = (0..8).map_while(|i| aero::gamepad::read(i).ok()).filter(|(st, _)| st.connected != 0).map(|(st, _)| String::from(st.name())).collect();
+            let fit = ((pill.y - 12 * s - top - hh - 16 * s) / row_h).max(1) as usize;
+            let list = Rect::new(p.x, top + hh, p.w, pads.len().clamp(1, fit) as i32 * row_h + 16 * s);
+            c.panel(list);
+            if pads.is_empty() {
+                c.text_in(list, list.x + 12 * s, list.y + 13 * s, "[--] NONE CONNECTED", DIM, Font::Tiny);
+            }
+            for (i, name) in pads.iter().take(fit).enumerate() {
+                let y = list.y + 13 * s + i as i32 * row_h;
+                c.text_in(list, list.x + 12 * s, y, "[ON]", rgb(90, 230, 120), Font::Tiny);
+                let x = list.x + 12 * s + Font::Tiny.width(s, "[ON] ");
+                c.text_in(list, x, y, &fit_dots(name, Font::Tiny, s, list.x + list.w - 10 * s - x), PALE, Font::Tiny);
+            }
+        }
+        c.panel(pill);
+        let st = "SYSTEM: ";
+        let sf = if Font::Small.width(s, "SYSTEM: [READY]") + 50 * s <= pill.w { Font::Small } else { Font::Tiny };
+        let ty = pill.y + (pill.h - sf.h(s)) / 2;
+        c.text(pill.x + 12 * s, ty, st, NEON, sf);
+        c.text(pill.x + 12 * s + sf.width(s, st), ty, "[READY]", rgb(90, 230, 120), sf);
+        let dot = Rect::new(pill.x + pill.w - 26 * s, pill.y + (pill.h - 14 * s) / 2, 14 * s, 14 * s);
+        c.rounded(dot, 2 * s, false, rgb(120, 255, 140), rgb(40, 170, 70), 255);
+        c.rounded_outline(dot, 2 * s, false, rgb(180, 255, 190), 255);
+    }
+
+    /// A click in Game Mode: a tile or Play opens its program; the switch
+    /// turns starting in Game Mode on or off (saved to the settings file).
     fn game_click(&mut self, client: &Rect, x: i32, y: i32) -> Rect {
         if self.game_start_box(client).contains(x, y) {
             self.prefs.game_start = !self.prefs.game_start;
             let saved = self.save_settings();
             println!("[desktop] Game Mode at start: {}{}", if self.prefs.game_start { "on" } else { "off" }, if saved { ", saved" } else { ", not saved" });
             return self.game_footer(client);
+        }
+        if self.game_details(client).is_some_and(|(_, _, _, play)| play.contains(x, y)) {
+            return self.game_open(self.game_sel);
         }
         match (0..GAME.len()).find(|&i| self.game_tile(client, i).contains(x, y)) {
             Some(i) => self.game_open(i),
@@ -9265,6 +9502,135 @@ fn clock(started_us: u64, hours24: bool) -> (String, String) {
     match aero::now() {
         Some(t) => (time_text(t.hour, t.minute, hours24), format!("{}/{}/{}", t.month, t.day, t.year)),
         None => (uptime(aero::clock_us() - started_us), String::from("uptime")),
+    }
+}
+
+/// Game Mode's colours: neon cyan, pale text and the dim separators.
+const NEON: u32 = 0x5CE1FF;
+const PALE: u32 = 0xA9B8C4;
+const DIM: u32 = 0x5A6874;
+
+/// Faint circuit traces behind Game Mode, in thousandths of its width and
+/// height: each runs along, turns at 45 degrees, and ends in a pad.
+const GAME_TRACES: [&[(i32, i32)]; 11] = [
+    &[(0, 140), (60, 140), (90, 190), (150, 190)],
+    &[(0, 930), (110, 930), (150, 880), (260, 880)],
+    &[(330, 985), (380, 985), (410, 950), (560, 950)],
+    &[(640, 990), (700, 990), (730, 955), (850, 955)],
+    &[(1000, 150), (930, 150), (900, 200), (850, 200)],
+    &[(1000, 860), (900, 860), (870, 900), (760, 900)],
+    &[(480, 130), (520, 130), (545, 165), (610, 165)],
+    &[(200, 100), (260, 100), (280, 125), (330, 125)],
+    &[(0, 560), (40, 560), (70, 600), (70, 700), (130, 760)],
+    &[(1000, 520), (960, 520), (930, 560), (930, 640)],
+    &[(700, 125), (760, 125), (790, 100), (880, 100)],
+];
+
+/// `text` cut short with ".." to fit `w` pixels in `font`.
+fn fit_dots(text: &str, font: Font, ui: i32, w: i32) -> String {
+    if font.width(ui, text) <= w {
+        return text.into();
+    }
+    let n = (w / font.w(ui).max(1) - 2).max(0) as usize;
+    let mut cut: String = text.chars().take(n).collect();
+    cut.truncate(cut.trim_end().len());
+    cut + ".."
+}
+
+/// A line about each program, under its name in Game Mode.
+fn game_blurb(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Computer => "Drives, folders and files",
+        Kind::Notes => "Write and keep notes",
+        Kind::Calculator => "Work out sums",
+        Kind::Paint => "Draw and paint",
+        Kind::Photos => "Look at your pictures",
+        Kind::Music => "Play songs",
+        Kind::ControlPanel => "Screen, sound, mouse, time",
+        Kind::System => "What the machine is doing",
+        Kind::Welcome => "Getting started",
+        Kind::Games => "Your games",
+    }
+}
+
+impl Canvas {
+    /// Text lit like a neon tube: a darker halo around it.
+    fn neon_text(&mut self, x: i32, y: i32, s: &str, color: u32, font: Font) {
+        let ui = self.ui;
+        let halo = blend(0, color, 110);
+        for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, 1), (-1, 1), (1, -1)] {
+            self.text(x + dx * ui, y + dy * ui, s, halo, font);
+        }
+        self.text(x, y, s, color, font);
+    }
+
+    /// A Game Mode heading: words in neon parted by " // ", the last one
+    /// white, as "VAULT // LIBRARY".
+    fn heading(&mut self, r: Rect, words: &[&str]) {
+        let ui = self.ui;
+        let mut words = words;
+        while words.len() > 1 && Font::Tiny.width(ui, &words.join(" // ")) > r.w {
+            words = &words[1..];
+        }
+        let all = words.join(" // ");
+        let font = if Font::Small.width(ui, &all) <= r.w { Font::Small } else { Font::Tiny };
+        let y = r.y + (r.h - font.h(ui)) / 2;
+        let mut x = r.x;
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 {
+                self.text_in(r, x, y, " // ", DIM, font);
+                x += font.width(ui, " // ");
+            }
+            let color = if i + 1 == words.len() && words.len() > 1 { 0xE8F2F8 } else { NEON };
+            self.text_in(r, x, y, w, color, font);
+            x += font.width(ui, w);
+        }
+    }
+
+    /// A Game Mode panel: dark glass with a thin steel edge.
+    fn panel(&mut self, r: Rect) {
+        let ui = self.ui;
+        self.rounded(r, 5 * ui, false, rgb(20, 24, 30), rgb(14, 16, 20), 230);
+        self.rounded_outline(r, 5 * ui, false, rgb(64, 78, 88), 255);
+    }
+
+    /// A program's picture on its Game Mode card: a coloured backdrop
+    /// with scan lines like an old screen, and the program's icon.
+    fn game_art(&mut self, r: Rect, kind: Kind) {
+        let ui = self.ui;
+        let (top, bottom) = match kind {
+            Kind::Computer => (rgb(44, 96, 170), rgb(10, 26, 56)),
+            Kind::Notes => (rgb(160, 126, 44), rgb(46, 32, 10)),
+            Kind::Calculator => (rgb(52, 150, 96), rgb(12, 44, 28)),
+            Kind::Paint => (rgb(176, 62, 146), rgb(50, 14, 46)),
+            Kind::Photos => (rgb(210, 112, 52), rgb(58, 24, 14)),
+            Kind::Music => (rgb(126, 64, 206), rgb(32, 14, 66)),
+            Kind::ControlPanel => (rgb(48, 136, 176), rgb(10, 38, 56)),
+            Kind::System => (rgb(96, 106, 126), rgb(24, 28, 38)),
+            Kind::Welcome | Kind::Games => (rgb(40, 166, 176), rgb(8, 48, 58)),
+        };
+        self.rounded(r, 4 * ui, false, top, bottom, 255);
+        // A soft glow behind the icon.
+        let size = (r.w.min(r.h) * 7 / 10).max(8);
+        for k in [10, 8, 6] {
+            let g = size * k / 10;
+            self.rounded(Rect::new(r.x + (r.w - g) / 2, r.y + (r.h - g) / 2, g, g), g / 2, false, 0xFFFFFF, top, 26);
+        }
+        self.icon(kind_icon(kind), r.x + (r.w - size) / 2, r.y + (r.h - size) / 2, size);
+        let mut y = r.y + 2 * ui;
+        while y < r.y + r.h - 2 * ui {
+            self.shade(Rect::new(r.x + 2 * ui, y, r.w - 4 * ui, ui.max(1)), 0, 40);
+            y += 3 * ui;
+        }
+    }
+
+    /// A Play triangle pointing right, filling `r`.
+    fn play_mark(&mut self, r: Rect, color: u32) {
+        let half = (r.h / 2).max(1);
+        for y in 0..r.h {
+            let w = r.w * (half - (y - half).abs()).max(0) / half;
+            self.fill(Rect::new(r.x, r.y + y, w, 1), color);
+        }
     }
 }
 
