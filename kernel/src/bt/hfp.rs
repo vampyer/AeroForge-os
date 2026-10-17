@@ -57,7 +57,7 @@ impl Ag {
                 return;
             }
             "AT+CHLD=?" => say(replies, "+CHLD: (0,1,2,3)"),
-            "AT+COPS?" => say(replies, "+COPS: 0,0,\"AeroForge\""),
+            "AT+COPS?" => say(replies, "+COPS: 0,0,\"RetroForgeDX\""),
             "AT+CNUM" | "AT+CLCC" | "AT+BTRH?" => {}
             c if ["AT+CKPD", "AT+VGS", "AT+VGM", "AT+CMEE", "AT+CLIP", "AT+CCWA", "AT+NREC", "AT+BIA", "AT+XAPL",
                 "AT+IPHONEACCEV", "AT+COPS=", "AT+BAC", "AT+XEVENT", "AT+CSRSF", "AT+APLSIRI", "AT+BCC"]

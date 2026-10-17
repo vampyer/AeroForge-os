@@ -442,9 +442,46 @@ def paint_icon():
     return img
 
 
+def game_mode():
+    img = new()
+    # A glossy dark-violet gamepad: a body with two grips.
+    def body(d):
+        d.rounded_rectangle([S(12), S(28), S(84), S(62)], radius=S(16), fill=255)
+        d.ellipse([S(6), S(36), S(38), S(80)], fill=255)
+        d.ellipse([S(58), S(36), S(90), S(80)], fill=255)
+    shadow(img, body)
+    paint(img, mask(body), gradient(rgba(0x8A7BF0), rgba(0x2E1F7A), 28, 80))
+    gloss(img, rrect((16, 30, 80, 50), 12), 160, 20, 1.0, (0, 30, 0, 50))
+    outline(img, body, rgba(0x1A1050), 1.0)
+    # A white d-pad on the left.
+    paint(img, mask(rrect((19, 42, 37, 49), 1.5)), (255, 255, 255, 255))
+    paint(img, mask(rrect((24.5, 36.5, 31.5, 54.5), 1.5)), (255, 255, 255, 255))
+    # Four coloured buttons on the right.
+    for (cx, cy), col in [((68, 37), 0xFFD84A), ((61, 45), 0x4AA8FF), ((75, 45), 0xFF5A4A), ((68, 53), 0x5AE07A)]:
+        b = (cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5)
+        paint(img, mask(ellipse(b)), gradient(rgba(0xFFFFFF), rgba(col), cy - 6, cy + 3))
+        outline(img, ellipse(b), rgba(0x1A1050), 0.6)
+    return img
+
+
+def anvil():
+    """RetroForgeDX's mark: an anvil drawn as a glowing cyan neon tube."""
+    img = new()
+    shape = poly([(4, 31), (26, 27), (90, 27), (90, 41), (70, 43), (61, 53), (63, 60), (79, 64), (81, 73),
+                  (21, 73), (23, 64), (39, 60), (41, 53), (33, 45), (20, 43), (11, 37)])
+    m = mask(shape)
+    tube = ImageChops.subtract(m, m.filter(ImageFilter.MinFilter(S(3.2) * 2 + 1)))
+    paint(img, tube.filter(ImageFilter.GaussianBlur(S(3.5))), (40, 200, 255, 255))
+    paint(img, tube.filter(ImageFilter.GaussianBlur(S(1.2))), (92, 225, 255, 255))
+    paint(img, ImageChops.subtract(m, m.filter(ImageFilter.MinFilter(S(1.6) * 2 + 1))), (215, 250, 255, 255))
+    # The face of the anvil, lit faintly from the tube.
+    paint(img, m.filter(ImageFilter.MinFilter(S(3.2) * 2 + 1)), (40, 160, 200, 40))
+    return img
+
+
 ICONS = [
     ('computer', computer), ('notes', notes), ('calculator', calculator), ('photos', photos), ('music', music),
-    ('controlpanel', control_panel), ('paint', paint_icon), ('system', system), ('welcome', welcome), ('folder', folder), ('drive', drive),
+    ('controlpanel', control_panel), ('paint', paint_icon), ('system', system), ('welcome', welcome), ('gamemode', game_mode), ('anvil', anvil), ('folder', folder), ('drive', drive),
     ('usb', usb), ('netdrive', network_drive), ('bin', recycle_bin), ('page', lambda: page('blank')),
     ('text', lambda: page('text')), ('sound', lambda: page('sound')), ('picture', lambda: page('picture')),
 ]

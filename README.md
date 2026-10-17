@@ -1,8 +1,8 @@
-# AeroForge OS
+# RetroForgeDX
 
 [![boot test](https://github.com/vampyer/AeroForge-os/actions/workflows/boot-test.yml/badge.svg)](https://github.com/vampyer/AeroForge-os/actions/workflows/boot-test.yml)
 
-A from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C++
+RetroForgeDX (called AeroForge OS until 0.67) is a from-scratch x86-64 operating system: a Rust kernel core ("AeroKernel") with C++
 drivers behind a narrow C ABI (the Driver Host Interface). The full plan lives in
 [`docs/AeroForge-OS-Design.md`](docs/AeroForge-OS-Design.md). Every CI run uploads the built ISO as a workflow artifact (Actions tab, "boot test" run, Artifacts).
 
@@ -68,7 +68,7 @@ interrupt channels over L2CAP. A small HID report-descriptor parser finds the st
 triggers (X, Y, Z, Rx, Ry, Rz, gas, brake), the d-pad (hat switch) and up to 32 buttons, so any
 standard gamepad works without a per-model driver; `gamepad` shows what each pad is pressing.
 A paired pad reconnects by itself when switched on (the adapter keeps page scan on and accepts
-only paired devices). Pairings live in memory until AeroForge gets a writable disk, so pads have
+only paired devices). Pairings live in memory until RetroForgeDX gets a writable disk, so pads have
 to be paired again after a restart. Programs cannot read the gamepad yet. The simulated adapter also plays a classic gamepad that
 pairs, sends input, switches off and on and reconnects, which the boot test drives through the
 shell.
@@ -80,7 +80,7 @@ answers the headset's AT commands as a phone with no call would, until the servi
 connection is up. `mic record [seconds]` then opens a voice (SCO) link, 16-bit samples at 8 kHz
 over CVSD, which arrive through the adapter's isochronous USB endpoint (the xHCI driver
 switches the voice interface's alternate setting and queues isochronous transfers), and reports
-the length, peak and RMS level and the pitch; `mic` lists headsets. AeroForge also answers SDP
+the length, peak and RMS level and the pitch; `mic` lists headsets. RetroForgeDX also answers SDP
 queries for its own audio gateway record, so a paired headset that is switched on reconnects by
 itself. There is no sound output or audio API for programs yet: that comes with the HDA driver.
 The simulated headset pairs, holds a 440 Hz tone up to its microphone, switches off and on and
@@ -139,7 +139,7 @@ to 255). For Xbox style USB pads that layout is exact; for other pads it is a gu
 database like SDL's arrives, and `exact` tells programs which. The `padtest` program prints every
 pad that way, and the boot test checks its output for all four simulated pads.
 
-Since 0.16 USB devices can be plugged in and unplugged while AeroForge runs. The xHCI driver
+Since 0.16 USB devices can be plugged in and unplugged while RetroForgeDX runs. The xHCI driver
 acts on the controller's port status change events for root ports and asks each hub's ports for
 changes a few times a second; a new device is set up as at start-up (keyboards, mice, gamepads,
 Bluetooth adapters, disks), and an unplugged one (with everything behind it, for a hub) gives
@@ -149,7 +149,7 @@ same port takes its old place in the list. The simulated pads unplug and replug 
 the boot test, one on a root port and one behind the hub. An adapter's Bluetooth host does not
 restart after a replug yet.
 
-Since 0.17 a USB stick or drive plugged in while AeroForge runs is registered (the first free
+Since 0.17 a USB stick or drive plugged in while RetroForgeDX runs is registered (the first free
 `usbN` name), its partitions are read and its FAT32 volumes mounted at `/usbNp1` and so on;
 pulling it out unmounts them and removes the disk. The mount list can change at run time now
 (lookups hold a reference to their volume, so a read in progress finishes safely). The boot test
@@ -390,7 +390,7 @@ console afterwards, on the firmware framebuffer (`tools/boot-test.sh`) and on vi
 (`tools/display-test.sh`). The `display` shell command shows the screen size, what drives it and
 who has it.
 
-Since 0.37 AeroForge drives the display engine of AMD Radeon graphics with DCN 2.1 (the Vega
+Since 0.37 RetroForgeDX drives the display engine of AMD Radeon graphics with DCN 2.1 (the Vega
 graphics in Renoir, Lucienne and Cezanne APUs, such as the Ryzen 9 5900HX). The firmware's screen
 mode stays as it is. A new C++ driver (`drivers/amdgpu/dcn.cpp`, with register offsets from AMD's
 MIT-licensed Linux headers) finds the display pipe the firmware shows its screen on, and moves the
@@ -458,7 +458,7 @@ pointer moves are exact, then raises it to 6 from the Start menu and checks the 
 a quick move goes.
 Since 0.48 the xHCI driver also takes absolute pointers: a HID interface whose report descriptor has
 absolute X and Y (tablets, touchscreens, QEMU's `usb-tablet`) puts the pointer exactly where it points,
-whatever the mouse speed. A virtual PC can use one so the AeroForge pointer sits under the host's own.
+whatever the mouse speed. A virtual PC can use one so the RetroForgeDX pointer sits under the host's own.
 The desktop now draws every changed piece of a frame first and presents them once. The boot test plugs
 in a `usb-tablet`, points it through QMP (`tools/qemu-qmp.py`) and checks the shell's `mouse` reading.
 
@@ -527,9 +527,9 @@ Since 0.57 NTFS drives (the ones Windows uses) can be written to. They still sta
 the drive in Computer and choose "Allow changes" (or `writable /<device> on` in the shell), and "Make
 read-only" turns it off again. Writing is only allowed when Windows left the drive clean: not marked for
 chkdsk, nothing left in its journal, and not hibernated (Windows' Fast Startup hibernates too, so shut
-Windows down with Shift held, or turn Fast Startup off). AeroForge saves over files, makes files and
+Windows down with Shift held, or turn Fast Startup off). RetroForgeDX saves over files, makes files and
 folders, and deletes them; folder indexes grow and split as Windows' do, and the file table grows when
-it is full. To keep the drive safe if AeroForge stops part way (no journal is kept, as with ntfs-3g):
+it is full. To keep the drive safe if RetroForgeDX stops part way (no journal is kept, as with ntfs-3g):
 the journal is emptied before the first change, every change runs between setting and clearing the
 drive's dirty flag, so Windows runs chkdsk if one was cut off, and space is taken before it is used and
 freed only after nothing refers to it. Compressed, encrypted and sparse files, links, and Windows' own
@@ -550,7 +550,7 @@ dirty-flag bracket as other changes. `tools/ntfs-write-test.sh` renames and move
 (including files with DOS short names) and checks the volume with ntfsprogs, and the boot test moves files
 and folders on a SATA FAT32 disk, the exFAT stick and the NTFS drive from the shell.
 
-Also since 0.58 AeroForge goes straight to the desktop: aerosmss starts it once the programs in
+Also since 0.58 RetroForgeDX goes straight to the desktop: aerosmss starts it once the programs in
 `/system/session.cfg` are running. Esc or Start > Exit to console leaves it at the console, and `run
 desktop` brings it back. A line `console` in session.cfg keeps the machine at the console instead (the
 boot test adds one, as it types at the console first); the display test checks that the desktop comes up
@@ -576,7 +576,7 @@ it in **Photos**, fitted to the window (never enlarged past its own size); "<" a
 keys) go through the other pictures in the same folder. Double-clicking a WAV or MP3 song opens **Music**:
 it plays the song through the sound card, shows a bar (click it to jump) and the time, has Previous,
 Play/Pause, Stop and Next buttons (Space plays and pauses) and goes on to the next song in the folder.
-Pictures are decoded by zune-jpeg and zune-png, BMP files (1, 4, 8, 24 and 32 bits) by AeroForge's own
+Pictures are decoded by zune-jpeg and zune-png, BMP files (1, 4, 8, 24 and 32 bits) by RetroForgeDX's own
 code, and MP3 by nanomp3 (a Rust port of minimp3); WAV files can be 8, 16, 24 or 32-bit PCM with one to
 eight channels. Songs are decoded a piece at a time and resampled to the sound card's 48 kHz stereo.
 C:/Pictures and C:/Music on the test disk hold a few original pictures and songs made by
@@ -602,6 +602,32 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.68 there is Game Mode, a full-screen program for the couch, opened from its desktop icon,
+the Start menu or the pad's Guide button. It looks like a game launcher: brushed dark metal with
+circuit traces, a neon anvil and name, the system's numbers on the left, the programs as cards in the
+middle, and on the right the one chosen with a big Play button and the controllers connected. The
+sticks or d-pad (or the arrow keys) pick a card, A or Enter opens it full screen, B, Guide or Esc go
+back to the desktop, and Start opens the Start menu. Its "Start with RetroForgeDX" switch, kept as
+`game mode at start` in `/AeroForge.ini`, opens it when the system starts.
+
+Since 0.67 the system is called RetroForgeDX: the boot menu, the start-up banner, the Start menu, the
+Welcome window and file, the shell's `about` and the Bluetooth name all say so. The settings file
+keeps its old name, `/AeroForge.ini`, so saved settings carry over, and so do internal names (the
+`aero` library, `aerosmss`, AeroKernel) and the repository's.
+
+Since 0.66 a gamepad drives the desktop. The left stick moves the pointer (further for a bigger push;
+the right stick moves it slowly for fine aiming), A clicks, X right-clicks, Start opens the Start menu
+(Guide opens Game Mode), B closes it or a right-click menu, and RB and LB switch between the open windows.
+A pad only takes over once it has been seen at rest, so one with a stuck button cannot. Programs move
+the pointer with system call 65 (`Screen::move_pointer` in libaero); only the screen's owner may.
+
+Since 0.65 Control Panel's Display page has a text size with − and + buttons, in five steps from Small to Largest (the two biggest
+draw the 32 px font scaled up). It changes the text
+everywhere (windows, menus, the taskbar and the desktop icons' names) without making the whole screen
+twice as big, so it works on any screen; Welcome, System, Notes, Paint, Music, Computer and the Start menu grow to fit, taskbar buttons
+narrow when there are many, and the choice is kept in `/AeroForge.ini` as `font size`. The Start menu's
+"All programs" lists every program from A to Z, with Back to return.
+
 Since 0.64 there is Paint, in the Start menu: draw with a pencil or a round brush in three sizes, rub out
 with the eraser, fill an area with the paint bucket, or drag out straight lines and boxes, in fourteen
 colours. Ctrl+Z takes back the last strokes (up to eight), Ctrl+N starts a new picture and Ctrl+S (or
@@ -609,12 +635,12 @@ Save) keeps it as a 24-bit BMP file in Pictures, `Painting.bmp` the first time, 
 
 Since 0.63 the icons are pictures, not shapes drawn in code: Computer, Notes, Calculator, Photos, Music,
 Control Panel, System and Welcome, folders, hard drives, USB sticks, network drives, the Recycle Bin and
-text, sound and picture files. They are AeroForge's own artwork, drawn by `tools/make-icons.py` (Python
+text, sound and picture files. They are RetroForgeDX's own artwork, drawn by `tools/make-icons.py` (Python
 with Pillow) at 96 x 96 into `userland/src/icons.bin`, which the desktop builds in and shrinks to each
 size it needs (48 on the desktop, 32 in the Start menu, 24 on the taskbar, 16 in lists). Run
 `python3 tools/make-icons.py --sheet icons.png` to see them all.
 
-Since 0.62 Music plays FLAC and OGG songs as well as MP3 and WAV. FLAC is decoded by AeroForge's own
+Since 0.62 Music plays FLAC and OGG songs as well as MP3 and WAV. FLAC is decoded by RetroForgeDX's own
 decoder (`userland/src/flac.rs`: 4 to 32-bit samples, fixed and LPC subframes, every stereo mode), and OGG
 files with Vorbis sound by lewton, a pure Rust Vorbis decoder kept in `userland/vendor/lewton` and changed
 to build without the standard library (the few float functions it needs are written out there); the Ogg

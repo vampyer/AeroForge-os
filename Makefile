@@ -1,4 +1,4 @@
-# AeroForge OS build orchestration.
+# RetroForgeDX build orchestration.
 #   make            build the UEFI boot ISO (build/aeroforge.iso)
 #   make run        boot it in QEMU with a window
 #   make run-headless   boot with serial on stdout, no display (CI)
