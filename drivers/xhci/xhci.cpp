@@ -203,7 +203,14 @@ private:
 };
 
 enum class HidKind : uint8_t { None, Keyboard, Mouse, Tablet };
-enum class PadKind : uint8_t { None, Hid, XInput };
+enum class PadKind : uint8_t { None, Hid, XInput, Switch };
+
+// Nintendo Switch Pro Controller (wired). Its report descriptor does not
+// describe the reports it really sends, so the driver shakes hands with it
+// (80 02, answered by 81 02), keeps it on USB (80 04), asks for full input
+// reports (sub-command 03 30) and turns each 0x30 report into the XInput
+// style report below.
+constexpr uint16_t kNintendo = 0x057E, kSwitchPro = 0x2009;
 
 // The report the driver turns each Xbox 360 (XInput) input report into, so
 // the kernel decodes every USB gamepad with its HID parser: hat (4 bits, 8 =
@@ -309,6 +316,7 @@ struct Device {
     uint16_t pad_mps = 0, pad_out_mps = 0, pad_desc_len = 0;
     Ring pad_ring{}, pad_out_ring{};
     dhi_dma pad_bufs{};                    // kPadTrbs reports, an OUT packet, then the report descriptor
+    bool pad_switch_ready = false;         // Switch Pro: handshake answered, full reports asked for
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -717,6 +725,7 @@ private:
         }
         if (d.bt >= 0) l.s(", Bluetooth adapter");
         if (d.pad == PadKind::XInput) l.s(", gamepad (Xbox 360 style)");
+        if (d.pad == PadKind::Switch) l.s(", gamepad (Switch Pro style)");
         if (d.pad == PadKind::Hid) l.s(", HID gamepad");
         const bool hub = d.info.dev_class == 9 || d.info.iface_class == 9;
         if (hub) l.s(", hub");
@@ -1082,7 +1091,10 @@ private:
                     c.mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
                     c.interval = b[off + 6];
                     if (c.desc_len) ++candidates_;
-                    in_candidate = -1;
+                } else if (!(addr & 0x80) && (attr & 3) == 3 && c.out_dci == 0) {  // its OUT endpoint, if any
+                    c.out_dci = uint8_t((addr & 0xF) * 2);
+                    c.out_mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
+                    c.out_interval = b[off + 6];
                 }
             } else if (type == 5 && off + 7 <= len && in_xinput && (b[off + 3] & 3) == 3) {  // XInput endpoints
                 const uint8_t addr = b[off + 2];
@@ -1353,18 +1365,27 @@ private:
                 const uint16_t want = c.desc_len < kPadDesc ? c.desc_len : uint16_t(kPadDesc);
                 const int n = control(d, 0x81, 6, 0x2200, c.iface, want, desc_phys);  // GET_DESCRIPTOR(report)
                 if (n <= 0 || !describes_gamepad(desc, n)) continue;
-                d.pad = PadKind::Hid;
+                const bool pro = d.info.vendor == kNintendo && d.info.product == kSwitchPro && c.out_dci;
+                d.pad = pro ? PadKind::Switch : PadKind::Hid;
                 d.pad_iface = c.iface;
                 d.pad_in_dci = c.dci;
                 d.pad_mps = c.mps;
                 d.pad_interval = c.interval;
                 d.pad_desc_len = uint16_t(n);
+                if (pro) {
+                    d.pad_out_dci = c.out_dci;
+                    d.pad_out_mps = c.out_mps;
+                    d.pad_out_interval = c.out_interval;
+                    d.pad_switch_ready = false;
+                    for (uint32_t k = 0; k < sizeof(kXInputReportDesc); ++k) desc[k] = kXInputReportDesc[k];
+                    d.pad_desc_len = sizeof(kXInputReportDesc);
+                }
             }
             if (d.pad == PadKind::None) {
                 ops_->dma_free(&d.pad_bufs);
                 return false;
             }
-            control(d, 0x21, 0x0A, 0, d.pad_iface, 0, 0);  // SET_IDLE(0): report only on change
+            if (d.pad == PadKind::Hid) control(d, 0x21, 0x0A, 0, d.pad_iface, 0, 0);  // SET_IDLE(0): report only on change
         }
         if (!d.pad_ring.init(ops_) || (d.pad_out_dci && !d.pad_out_ring.init(ops_))) return false;
         const IntrEp eps[2] = {{d.pad_in_dci, d.pad_mps, d.pad_interval, &d.pad_ring},
@@ -1382,8 +1403,22 @@ private:
             d.pad_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), 3, trb_type(kTrbNormal) | kTrbIoc);
             ring_doorbell(d.slot, d.pad_out_dci);
         }
+        if (d.pad == PadKind::Switch) {
+            const uint8_t handshake[2] = {0x80, 0x02};
+            pad_send(d, 0, handshake, 2);
+        }
         d.pad_index = int8_t(pad_count_++);
         return true;
+    }
+
+    // Sends `n` bytes to the pad's OUT endpoint from slot `at` (0 or 1, 32
+    // bytes each) of its OUT packet buffer.
+    void pad_send(Device& d, int at, const uint8_t* bytes, uint32_t n) {
+        auto* out = static_cast<uint8_t*>(d.pad_bufs.virt) + kPadTrbs * kPadBuf + at * 32;
+        for (uint32_t i = 0; i < n; ++i) out[i] = bytes[i];
+        const uint64_t phys = d.pad_bufs.phys + kPadTrbs * kPadBuf + uint64_t(at) * 32;
+        d.pad_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), n, trb_type(kTrbNormal) | kTrbIoc);
+        ring_doorbell(d.slot, d.pad_out_dci);
     }
 
     void queue_pad(Device& d, uint32_t slot) {
@@ -1423,6 +1458,51 @@ private:
             }
             r[11] = src[4];
             r[12] = src[5];
+            src = r;
+            len = kXInputReport;
+        } else if (d.pad == PadKind::Switch) {
+            if (len >= 2 && src[0] == 0x81 && src[1] == 0x02 && !d.pad_switch_ready) {
+                // Handshake answered: stay on USB, and send full input reports.
+                d.pad_switch_ready = true;
+                const uint8_t usb_only[2] = {0x80, 0x04};
+                const uint8_t full[12] = {0x01, 0x00, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x03, 0x30};
+                pad_send(d, 0, usb_only, 2);
+                pad_send(d, 1, full, 12);
+                return;
+            }
+            // Full input report: 30, timer, battery, buttons (right, shared,
+            // left), then each stick as two 12-bit values (up positive).
+            if (len < 12 || src[0] != 0x30) return;
+            static constexpr uint8_t kHat[16] = {8, 0, 4, 8, 6, 7, 5, 6, 2, 1, 3, 2, 8, 0, 4, 8};
+            const uint8_t right = src[3], shared = src[4], left = src[5];
+            // By the labels on the buttons: A, B, X and Y as printed.
+            const uint16_t buttons = uint16_t(
+                (right >> 3 & 1) |                 // A
+                (right >> 2 & 1) << 1 |            // B
+                (right >> 1 & 1) << 2 |            // X
+                (right & 1) << 3 |                 // Y
+                (left >> 6 & 1) << 4 |             // L
+                (right >> 6 & 1) << 5 |            // R
+                (shared & 1) << 6 |                // Minus as Back
+                (shared >> 1 & 1) << 7 |           // Plus as Start
+                (shared >> 3 & 1) << 8 |           // left stick click
+                (shared >> 2 & 1) << 9 |           // right stick click
+                (shared >> 4 & 1) << 10);          // Home as Guide
+            const uint8_t dpad = uint8_t((left >> 1 & 1) | (left & 1) << 1 | (left >> 3 & 1) << 2 | (left >> 2 & 1) << 3);
+            r[0] = kHat[dpad];
+            r[1] = uint8_t(buttons);
+            r[2] = uint8_t(buttons >> 8);
+            for (int a = 0; a < 4; ++a) {
+                const uint8_t* p = src + (a < 2 ? 6 : 9);
+                const int32_t raw = (a & 1) ? (p[1] >> 4 | p[2] << 4) : (p[0] | (p[1] & 0xF) << 8);
+                int32_t v = (raw - 2048) * 21;
+                if (a & 1) v = -v;  // HID has down positive
+                v = v < -32767 ? -32767 : v > 32767 ? 32767 : v;
+                r[3 + 2 * a] = uint8_t(v);
+                r[4 + 2 * a] = uint8_t(v >> 8);
+            }
+            r[11] = (left & 0x80) ? 255 : 0;   // ZL
+            r[12] = (right & 0x80) ? 255 : 0;  // ZR
             src = r;
             len = kXInputReport;
         }
@@ -2159,8 +2239,8 @@ private:
     HidKind hid_kind_ = HidKind::None;
     uint16_t hid_mps_ = 8;
     struct PadCandidate {
-        uint8_t iface = 0, dci = 0, interval = 0;
-        uint16_t mps = 0, desc_len = 0;
+        uint8_t iface = 0, dci = 0, interval = 0, out_dci = 0, out_interval = 0;
+        uint16_t mps = 0, desc_len = 0, out_mps = 0;
     };
     PadCandidate candidate_[kPadCandidates]{};
     int candidates_ = 0;

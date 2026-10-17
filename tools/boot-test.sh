@@ -16,10 +16,11 @@
 # four notes through the audio system calls; last, 'bt pair' and 'gamepad' for
 # the simulated LE gamepad: it must pair (SMP), be read over HID over GATT,
 # report its input, reconnect on its own with the stored long-term key and
-# report again. Two simulated USB gamepads (tools/fakepad), an Xbox 360 style
-# one and a HID one behind the hub, must show up in 'gamepad' with their
-# input decoded, and the Xbox style one must get its player 1 LED command;
-# then the 'padtest' program must read all four gamepads through the
+# report again. Three simulated USB gamepads (tools/fakepad), an Xbox 360 style
+# one and a HID one and a Switch Pro Controller behind the hub, must show up
+# in 'gamepad' with their input decoded, the Xbox style one must get its
+# player 1 LED command and the Switch one its USB set-up (handshake, USB
+# only, full reports); then the 'padtest' program must read all five gamepads through the
 # gamepad system call, in the Xbox layout; last, both USB pads unplug
 # themselves and plug back in (hot-plug on a root port and behind the hub),
 # and 'padtest' must read them again; a second USB stick, formatted exFAT,
@@ -105,6 +106,8 @@ build/fakepad build/xpad.sock --xinput 2>"$FAKEPAD_LOG" &
 XPAD_PID=$!
 build/fakepad build/hidpad.sock --hid 2>>"$FAKEPAD_LOG" &
 HIDPAD_PID=$!
+build/fakepad build/swpad.sock --switch 2>>"$FAKEPAD_LOG" &
+SWPAD_PID=$!
 : >build/echo-server.log
 # Appending: the host client below writes to the same log.
 python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
@@ -112,7 +115,7 @@ ECHO_PID=$!
 # A Samba share for the network drive checks (smbtest and the desktop).
 SMBD_PID=$(./tools/smb-server.sh) || { echo "FAIL: could not start the Samba server (tools/smb-server.sh)"; exit 1; }
 SUDO=$([ "$(id -u)" = 0 ] && echo "" || echo sudo)
-for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
+for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && [ -S build/swpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm build/gop-panes.ppm build/gop-preview.ppm
 
@@ -128,6 +131,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
     -chardev socket,id=xpad,path=build/xpad.sock -device usb-redir,chardev=xpad,bus=xhci.0,port=4 \
     -chardev socket,id=hidpad,path=build/hidpad.sock -device usb-redir,chardev=hidpad,bus=xhci.0,port=1.3 \
+    -chardev socket,id=swpad,path=build/swpad.sock -device usb-redir,chardev=swpad,bus=xhci.0,port=1.5 \
     -nic user,model=igb,hostfwd=tcp:127.0.0.1:5580-:7070 -nic user,model=e1000e \
     -device ich9-intel-hda,id=hda -device hda-output,bus=hda.0,audiodev=snd -audiodev wav,id=snd,path=build/sound.wav \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
@@ -135,7 +139,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
 QEMU_PID=$!
 # set -e stops the test without a word; say where.
 trap 'echo "FAIL: boot-test.sh stopped at line $LINENO (test stage ${STAGE:-none})"' ERR
-trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null; $SUDO kill $SMBD_PID 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $SWPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null; $SUDO kill $SMBD_PID 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
 fail() {
@@ -1156,11 +1160,16 @@ PY
             || { fail "the gamepad system call did not give the Xbox style pad in the Xbox layout"; }
         grep -q "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS, d-pad left, left stick -32766 +0, right stick +32766 +0, triggers 0 0" "$LOG" \
             || { fail "the gamepad system call did not give the HID pad"; }
-        grep -q "\[padtest\] 4 gamepad(s)" "$LOG" || { fail "the gamepad system call did not list all four gamepads"; }
+        grep -q "Switch Pro style gamepad \"Pro Controller\" on USB .* hub [0-9]* port 5" "$LOG" || { fail "Switch Pro Controller behind the hub not set up" "$FAKEPAD_LOG"; }
+        grep -q "fakepad(switch): handshake" "$FAKEPAD_LOG" && grep -q "fakepad(switch): USB only" "$FAKEPAD_LOG" \
+            && grep -q "fakepad(switch): full input reports" "$FAKEPAD_LOG" || { fail "the Switch Pro Controller was not set up for USB" "$FAKEPAD_LOG"; }
+        grep -q "\[padtest\] .*\"Pro Controller\" (USB, Xbox layout): A RB Start, d-pad up, left stick +3[0-9]* +0, right stick +0 -3[0-9]*, triggers 255 0" "$LOG" \
+            || { fail "the gamepad system call did not give the Switch Pro Controller in the Xbox layout" "$FAKEPAD_LOG"; }
+        grep -q "\[padtest\] 5 gamepad(s)" "$LOG" || { fail "the gamepad system call did not list all five gamepads"; }
         grep -q "xhci: port 8, slot [0-9]*: 045e:028e \"Controller\" unplugged" "$LOG" || { fail "unplugging the Xbox style pad from its root port went unnoticed" "$FAKEPAD_LOG"; }
         grep -q "xhci: hub [0-9]* port 3, slot [0-9]*: 0079:0006 \"Generic USB Joystick\" unplugged" "$LOG" || { fail "unplugging the HID pad from the hub went unnoticed" "$FAKEPAD_LOG"; }
         [ "$(grep -c "\[padtest\] .*\"Controller\" (USB, Xbox layout): A Y LB Start" "$LOG")" -ge 2 ] && [ "$(grep -c "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS" "$LOG")" -ge 2 ] \
-            && [ "$(grep -c "\[padtest\] 4 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
+            && [ "$(grep -c "\[padtest\] 5 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
         grep -q "USB disk usb1 plugged in: .*USB \"QEMU QEMU HARDDISK\" serial AEROUSB2" "$LOG" || { fail "the USB stick plugged in later was not registered"; }
         grep -q "exFAT volume \"HOTSTICK\" on usb1p1 mounted at /usb1p1" "$LOG" || { fail "the exFAT USB stick plugged in later was not mounted"; }
         grep -q "48976 bytes, 561 lines, fnv1a fd53da30847dce45  /usb1p1/AeroForge-OS-Design.md" "$LOG" || { fail "a many-cluster file on the exFAT stick did not read back right"; }
@@ -1236,7 +1245,7 @@ PY
             || { fail "a folder index on the NTFS volume is out of order"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
         grep -q "\[aerosmss\] staying at the console (/system/session.cfg says so)" "$LOG" || { fail "aerosmss did not keep the console for the test as session.cfg asks"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, and a note each from 24-bit and mono FLAC, stereo and mono OGG, 8-bit, 24-bit and floating point WAV and a 64 kbit/s MP3, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style, a HID and a Switch Pro USB gamepad, and a user program read all five gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, and a note each from 24-bit and mono FLAC, stereo and mono OGG, 8-bit, 24-bit and floating point WAV and a 64 kbit/s MP3, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

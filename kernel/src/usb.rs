@@ -147,8 +147,11 @@ fn sync_pads(ctrl: i32, location: &str, hotplug: bool) {
         } else {
             alloc::format!("USB {} port {}", location, d.port)
         };
-        let xinput = d.iface_class == 0xFF;
-        let kind = if xinput { "Xbox 360 style " } else { "" };
+        // The driver hands Xbox 360 and Switch Pro pads over as one exact
+        // Xbox style report.
+        let switch_pro = d.vendor == 0x057E && d.product == 0x2009;
+        let xinput = d.iface_class == 0xFF || switch_pro;
+        let kind = if switch_pro { "Switch Pro style " } else if xinput { "Xbox 360 style " } else { "" };
         crate::kok!("{}gamepad \"{}\" {} {} ({})", kind, name, if hotplug { "plugged in on" } else { "on" }, place,
             layout.summary());
         {

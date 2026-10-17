@@ -602,6 +602,13 @@ quarter of its level, mutes and unmutes, double-clicks the test folder, sets the
 swaps the buttons (then swaps them back with the other button), sets the clock and switches to the 24-hour
 clock and back, then reads the settings back from the disk image.
 
+Since 0.69 a wired Nintendo Switch Pro Controller works too. Its report descriptor does not describe
+the reports it really sends, so the xHCI driver shakes hands with it, keeps it on USB and asks for
+full input reports, then turns each one into the same Xbox style report as an Xbox 360 pad: the
+buttons by their printed letters (A, B, X, Y), L and R as the bumpers, ZL and ZR as the triggers,
+Minus as Back, Plus as Start and Home as Guide. In QEMU on Windows a pad plugged into the PC reaches
+the guest with `-device usb-host,vendorid=0x057e,productid=0x2009`, which needs the UsbDk driver.
+
 Since 0.68 there is Game Mode, a full-screen program for the couch, opened from its desktop icon,
 the Start menu or the pad's Guide button. It looks like a game launcher: brushed dark metal with
 circuit traces, a neon anvil and name, the system's numbers on the left, the programs as cards in the
