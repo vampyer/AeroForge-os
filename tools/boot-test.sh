@@ -16,10 +16,11 @@
 # four notes through the audio system calls; last, 'bt pair' and 'gamepad' for
 # the simulated LE gamepad: it must pair (SMP), be read over HID over GATT,
 # report its input, reconnect on its own with the stored long-term key and
-# report again. Two simulated USB gamepads (tools/fakepad), an Xbox 360 style
-# one and a HID one behind the hub, must show up in 'gamepad' with their
-# input decoded, and the Xbox style one must get its player 1 LED command;
-# then the 'padtest' program must read all four gamepads through the
+# report again. Three simulated USB gamepads (tools/fakepad), an Xbox 360 style
+# one and a HID one and a Switch Pro Controller behind the hub, must show up
+# in 'gamepad' with their input decoded, the Xbox style one must get its
+# player 1 LED command and the Switch one its USB set-up (handshake, USB
+# only, full reports); then the 'padtest' program must read all five gamepads through the
 # gamepad system call, in the Xbox layout; last, both USB pads unplug
 # themselves and plug back in (hot-plug on a root port and behind the hub),
 # and 'padtest' must read them again; a second USB stick, formatted exFAT,
@@ -80,7 +81,7 @@ LOG=build/boot-test.log
 
 make iso >/dev/null
 ./tools/make-disk.sh >/dev/null
-# AeroForge starts the desktop after boot; the test types at the console
+# RetroForgeDX starts the desktop after boot; the test types at the console
 # first and starts the desktop itself later on.
 { mtype -i build/disk.img@@1M ::/system/session.cfg; echo "console    # boot test: stay at the console"; } > build/session.cfg
 mcopy -o -i build/disk.img@@1M build/session.cfg ::/system/session.cfg
@@ -105,6 +106,8 @@ build/fakepad build/xpad.sock --xinput 2>"$FAKEPAD_LOG" &
 XPAD_PID=$!
 build/fakepad build/hidpad.sock --hid 2>>"$FAKEPAD_LOG" &
 HIDPAD_PID=$!
+build/fakepad build/swpad.sock --switch 2>>"$FAKEPAD_LOG" &
+SWPAD_PID=$!
 : >build/echo-server.log
 # Appending: the host client below writes to the same log.
 python3 tools/echo-server.py >>build/echo-server.log 2>&1 &
@@ -112,7 +115,7 @@ ECHO_PID=$!
 # A Samba share for the network drive checks (smbtest and the desktop).
 SMBD_PID=$(./tools/smb-server.sh) || { echo "FAIL: could not start the Samba server (tools/smb-server.sh)"; exit 1; }
 SUDO=$([ "$(id -u)" = 0 ] && echo "" || echo sudo)
-for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && break; sleep 0.1; done
+for _ in $(seq 50); do [ -S build/fakebt.sock ] && [ -S build/xpad.sock ] && [ -S build/hidpad.sock ] && [ -S build/swpad.sock ] && break; sleep 0.1; done
 cp "$OVMF_VARS" build/test-vars.fd
 rm -f "$LOG" build/qmp.sock build/qemu-monitor.sock build/sound.wav build/gop-draw.ppm build/gop-console.ppm build/gop-desktop.ppm build/gop-snap.ppm build/gop-start.ppm build/gop-bin.ppm build/gop-explorer.ppm build/gop-network.ppm build/gop-search.ppm build/gop-props.ppm build/gop-panes.ppm build/gop-preview.ppm
 
@@ -128,6 +131,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
     -chardev socket,id=fakebt,path=build/fakebt.sock -device usb-redir,chardev=fakebt,bus=xhci.0,port=3 \
     -chardev socket,id=xpad,path=build/xpad.sock -device usb-redir,chardev=xpad,bus=xhci.0,port=4 \
     -chardev socket,id=hidpad,path=build/hidpad.sock -device usb-redir,chardev=hidpad,bus=xhci.0,port=1.3 \
+    -chardev socket,id=swpad,path=build/swpad.sock -device usb-redir,chardev=swpad,bus=xhci.0,port=1.5 \
     -nic user,model=igb,hostfwd=tcp:127.0.0.1:5580-:7070 -nic user,model=e1000e \
     -device ich9-intel-hda,id=hda -device hda-output,bus=hda.0,audiodev=snd -audiodev wav,id=snd,path=build/sound.wav \
     -cdrom build/aeroforge.iso -serial file:"$LOG" -display none \
@@ -135,7 +139,7 @@ qemu-system-x86_64 -M q35 -cpu max -m 512M -smp 4 -no-reboot \
 QEMU_PID=$!
 # set -e stops the test without a word; say where.
 trap 'echo "FAIL: boot-test.sh stopped at line $LINENO (test stage ${STAGE:-none})"' ERR
-trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null; $SUDO kill $SMBD_PID 2>/dev/null || true' EXIT
+trap 'kill $QEMU_PID $FAKEBT_PID $XPAD_PID $HIDPAD_PID $SWPAD_PID $ECHO_PID ${CLIENT_PID:-} 2>/dev/null; $SUDO kill $SMBD_PID 2>/dev/null || true' EXIT
 
 # In GitHub Actions a failure also becomes an annotation, readable without the log.
 fail() {
@@ -395,15 +399,15 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at $(row_of / docs); double_click; STAGE=deskdocs
     elif [ $STAGE = deskdocs ] && grep -qi "\[desktop\] Computer: /docs = " "$LOG"; then
         DOCS=$(grep -aio "\[desktop\] Computer: /docs = " "$LOG" | head -1 | sed 's/.*Computer: //; s/ = //')
-        sleep 0.5; point_at $(row_of "$DOCS" "Welcome to AeroForge.txt"); double_click; STAGE=deskfile
-    elif [ $STAGE = deskfile ] && grep -qi "\[desktop\] \(opened /docs/Welcome to AeroForge.txt in Notes\|cannot\)" "$LOG"; then
+        sleep 0.5; point_at $(row_of "$DOCS" "Welcome to RetroForgeDX.txt"); double_click; STAGE=deskfile
+    elif [ $STAGE = deskfile ] && grep -qi "\[desktop\] \(opened /docs/Welcome to RetroForgeDX.txt in Notes\|cannot\)" "$LOG"; then
         # Type into it and save it with Ctrl+S.
         sleep 0.5; type_keys 'hello aero'; type_keys $'\x13'
         sleep 1; monitor "screendump build/gop-desktop.ppm"
         # The file manager: pick the text file in /docs (which brings
         # Computer to the front), copy it, make a folder named Stuff, go in
         # and paste it there.
-        point_at $(row_of "$DOCS" "Welcome to AeroForge.txt"); monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        point_at $(row_of "$DOCS" "Welcome to RetroForgeDX.txt"); monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
         type_keys $'\x03'; sleep 0.3; type_keys $'\x0e'; STAGE=exnew
     elif [ $STAGE = exnew ] && grep -q "\[desktop\] \(new folder /docs/New folder\|Can't\)" "$LOG"; then
         sleep 0.5; type_keys $'Stuff\n'; STAGE=exrenamed
@@ -411,17 +415,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; type_keys $'\n'; STAGE=exstuff
     elif [ $STAGE = exstuff ] && grep -q "\[desktop\] Computer: /docs/Stuff = " "$LOG"; then
         sleep 0.5; type_keys $'\x16'; STAGE=expasted
-    elif [ $STAGE = expasted ] && grep -q "\[desktop\] \(pasted /docs/Welcome to AeroForge.txt as /docs/Stuff/\|paste failed\)" "$LOG"; then
+    elif [ $STAGE = expasted ] && grep -q "\[desktop\] \(pasted /docs/Welcome to RetroForgeDX.txt as /docs/Stuff/\|paste failed\)" "$LOG"; then
         # Back up to /docs and paste again: it becomes "... - Copy.txt";
         # delete that (to the Recycle Bin), undo with Ctrl+Z, delete it again.
         sleep 0.5; type_keys $'\x08'; sleep 0.5; type_keys $'\x16'; STAGE=excopy
-    elif [ $STAGE = excopy ] && grep -q "\[desktop\] \(pasted /docs/Welcome to AeroForge.txt as /docs/Welcome to AeroForge - Copy.txt\|paste failed\)" "$LOG"; then
+    elif [ $STAGE = excopy ] && grep -q "\[desktop\] \(pasted /docs/Welcome to RetroForgeDX.txt as /docs/Welcome to RetroForgeDX - Copy.txt\|paste failed\)" "$LOG"; then
         sleep 0.5; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=exbin
-    elif [ $STAGE = exbin ] && grep -q "\[desktop\] \(moved /docs/Welcome to AeroForge - Copy.txt to the Recycle Bin\|Not deleted\)" "$LOG"; then
+    elif [ $STAGE = exbin ] && grep -q "\[desktop\] \(moved /docs/Welcome to RetroForgeDX - Copy.txt to the Recycle Bin\|Not deleted\)" "$LOG"; then
         sleep 0.5; type_keys $'\x1a'; STAGE=exundo
-    elif [ $STAGE = exundo ] && grep -q "\[desktop\] \(restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Not restored\)" "$LOG"; then
+    elif [ $STAGE = exundo ] && grep -q "\[desktop\] \(restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin\|Not restored\)" "$LOG"; then
         sleep 0.5; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=exbin2
-    elif [ $STAGE = exbin2 ] && [ "$(grep -c "\[desktop\] moved /docs/Welcome to AeroForge - Copy.txt to the Recycle Bin" "$LOG")" -ge 2 ]; then
+    elif [ $STAGE = exbin2 ] && [ "$(grep -c "\[desktop\] moved /docs/Welcome to RetroForgeDX - Copy.txt to the Recycle Bin" "$LOG")" -ge 2 ]; then
         # Open the Recycle Bin from the pane, screenshot it, then delete
         # what is in it for good.
         XY=$(grep -ao "Recycle Bin at [0-9]*,[0-9]*" "$LOG" | head -1 | grep -o "[0-9]*,[0-9]*")
@@ -429,7 +433,7 @@ for _ in $(seq "$TIMEOUT"); do
     elif [ $STAGE = exbinview ] && grep -q "\[desktop\] Recycle Bin = " "$LOG"; then
         sleep 1; monitor "screendump build/gop-bin.ppm"
         monitor "sendkey home"; sleep 0.3; monitor "sendkey delete"; sleep 0.5; type_keys $'\n'; STAGE=expurged
-    elif [ $STAGE = expurged ] && grep -q "\[desktop\] \(removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin\|Can't\)" "$LOG"; then
+    elif [ $STAGE = expurged ] && grep -q "\[desktop\] \(removed /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin\|Can't\)" "$LOG"; then
         # Up from the Recycle Bin is Computer: screenshot the drives.
         sleep 0.5; type_keys $'\x08'; sleep 1.5; monitor "screendump build/gop-explorer.ppm"
         # Map the Samba share as a network drive: the form, then sign in.
@@ -611,7 +615,7 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at "$DX" "$DY"; monitor "mouse_button 2" "mouse_button 0"; STAGE=emptiedmenu
     elif [ $STAGE = emptiedmenu ] && [ "$(grep -c "\[desktop\] menu: Restore at " "$LOG")" -gt "$NR" ]; then
         sleep 0.5; point_at $(menu_item Restore); monitor "mouse_button 1" "mouse_button 0"; STAGE=emptiedback
-    elif [ $STAGE = emptiedback ] && { [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG")" -ge 2 ] \
+    elif [ $STAGE = emptiedback ] && { [ "$(grep -c "\[desktop\] restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin" "$LOG")" -ge 2 ] \
             || grep -q "\[desktop\] \(undelete failed in /Recycle Bin\|Not restored\)" "$LOG"; }; then
         # Pictures: C:/Pictures from the navigation pane, then a double-click
         # opens Sunset.jpg in Photos.
@@ -680,7 +684,17 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 0.5; point_at 27 780; click; STAGE=paintmenu
     elif [ $STAGE = paintmenu ] && [ "$(grep -c "\[desktop\] Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG")" -ge 2 ]; then
         sleep 0.5
-        XY=$(grep -ao "Start menu open; .*; Paint at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        # Paint by way of "All programs", which lists every program A to Z.
+        XY=$(grep -ao "Start menu open; .*; All programs at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintall
+    elif [ $STAGE = paintall ] && grep -q "\[desktop\] All programs: .* | end" "$LOG"; then
+        AP=$(grep -a "\[desktop\] All programs: .* | end" "$LOG" | tail -1)
+        case "$AP" in
+            *"All programs: Calculator at "*"; Computer at "*"; Control Panel at "*"; Music at "*"; Notes at "*"; Paint at "*"; Photos at "*"; System at "*"; Welcome"*) ;;
+            *) fail "All programs does not list the nine programs A to Z: $AP" ;;
+        esac
+        sleep 0.5; monitor "screendump build/gop-allprograms.ppm"
+        XY=$(echo "$AP" | grep -o "Paint at [0-9]*,[0-9]*" | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=paintopen
     elif [ $STAGE = paintopen ] && grep -q "\[desktop\] Paint: picture at .* | end" "$LOG"; then
         # A red box from (20,20) to (140,80) of the picture, dragged out.
@@ -739,6 +753,13 @@ for _ in $(seq "$TIMEOUT"); do
         sleep 1; monitor "screendump build/gop-cpanel.ppm"
         point_at $(cp_at "Large size"); click; STAGE=cplarge
     elif [ $STAGE = cplarge ] && grep -q "\[desktop\] text size: " "$LOG"; then
+        # Smaller text, then back to medium. (Smaller first: bigger text
+        # grows the page, which moves the buttons away from the logged spots.)
+        sleep 0.5; point_at $(cp_at "smaller text"); click; STAGE=cpfontsmaller
+    elif [ $STAGE = cpfontsmaller ] && grep -q "\[desktop\] font size: smaller, saved" "$LOG"; then
+        sleep 1; monitor "screendump build/gop-smaller.ppm"
+        point_at $(cp_at "bigger text"); click; STAGE=cpfontmedium
+    elif [ $STAGE = cpfontmedium ] && grep -q "\[desktop\] font size: medium, saved" "$LOG"; then
         sleep 0.5; point_at $(cp_at Back); click; STAGE=cpback1
     elif [ $STAGE = cpback1 ] && [ "$(cp_count "Control Panel")" -ge 2 ]; then
         # Sound: volume to half, a test sound (heard at a quarter of its
@@ -795,12 +816,44 @@ for _ in $(seq "$TIMEOUT"); do
         XY=$(grep -ao "Control Panel window at .*; close at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
         point_at "${XY%,*}" "${XY#*,}"; click; STAGE=cpclosed
     elif [ $STAGE = cpclosed ] && grep -q "\[desktop\] closed Control Panel" "$LOG"; then
+        # The Xbox pad drives the desktop: at rest, the left stick half right
+        # for half a second moves the pointer right, Start opens the Start
+        # menu and B closes it again; Guide brings up Game Mode, d-pad right
+        # picks its second tile (Notes) and A opens it.
+        point_at 640 300; kill -USR2 $XPAD_PID; STAGE=padscript
+    elif [ $STAGE = padscript ] && grep -q "\[desktop\] Game Mode: opened \|fakepad(xinput): script done" "$LOG" "$FAKEPAD_LOG"; then
+        sleep 1
+        grep -q "\[desktop\] gamepad: Controller ready" "$LOG" || fail "the desktop did not take the Xbox pad once it was at rest"
+        PXY=$(grep -ao "\[desktop\] gamepad: pointer at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        [ -n "$PXY" ] && [ "${PXY#*,}" = 300 ] && [ "${PXY%,*}" -gt 680 ] && [ "${PXY%,*}" -lt 840 ] \
+            || fail "the pad's left stick did not move the pointer right from 640,300 (${PXY:-no move logged})"
+        grep -A3 -a "\[desktop\] gamepad: Start" "$LOG" | grep -q "Start menu open" || fail "the pad's Start button did not open the Start menu"
+        grep -q "\[desktop\] gamepad: B" "$LOG" || fail "the pad's B button was not seen"
+        grep -q "\[desktop\] Game Mode: Computer at .*; Notes at .*; start option at [0-9]*,[0-9]* | end" "$LOG" \
+            && grep -q "\[desktop\] Game Mode: chose Notes" "$LOG" \
+            || fail "the pad's Guide button did not bring up Game Mode, or its d-pad did not move to Notes"
+        grep -q "\[desktop\] Game Mode: opened Notes" "$LOG" || fail "the pad's A button did not open Notes from Game Mode"
+        # Game Mode from the Start menu, and its start-up option turned on.
+        GMC=$(grep -c "\[desktop\] Start menu: Game Mode at" "$LOG")
+        sleep 0.5; point_at 27 780; click; STAGE=gmmenu
+    elif [ $STAGE = gmmenu ] && [ "$(grep -c "\[desktop\] Start menu: Game Mode at" "$LOG")" -gt "$GMC" ]; then
+        XY=$(grep -ao "Start menu: Game Mode at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        sleep 0.5; point_at "${XY%,*}" "${XY#*,}"; click; STAGE=gmopen
+    elif [ $STAGE = gmopen ] && [ "$(grep -c "\[desktop\] Game Mode: .*start option at" "$LOG")" -ge 2 ]; then
+        sleep 1; monitor "screendump build/gop-gamemode.ppm"
+        XY=$(grep -ao "start option at [0-9]*,[0-9]*" "$LOG" | tail -1 | grep -o "[0-9]*,[0-9]*$")
+        point_at "${XY%,*}" "${XY#*,}"; click; STAGE=gmstart
+    elif [ $STAGE = gmstart ] && grep -q "\[desktop\] Game Mode at start: on, saved" "$LOG"; then
+        sleep 0.5; monitor "sendkey esc"; STAGE=gmaway
+    elif [ $STAGE = gmaway ] && grep -q "\[desktop\] Game Mode put away" "$LOG"; then
+        STAGE=padmenu
+    elif [ $STAGE = padmenu ]; then
         # Open the Start menu for a screenshot of it and the Start button.
         sleep 0.5; point_at 27 780; monitor "mouse_button 1" "mouse_button 0"; point_at 640 300
         sleep 1; monitor "screendump build/gop-start.ppm"
         # Mouse speed 5 -> 6 with the menu's + button (saved to /AeroForge.ini);
         # then a quick move of 40 counts goes 40 * 10/8 * 3/2 = 75 pixels.
-        point_at 441 555; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
+        point_at 441 515; monitor "mouse_button 1" "mouse_button 0"; sleep 0.5
         monitor "mouse_move 40 0"; sleep 0.5
         monitor "sendkey esc"; STAGE=deskdone
     elif [ $STAGE = deskdone ] && grep -q "\[desktop\] closed, screen given back" "$LOG"; then
@@ -829,7 +882,7 @@ for _ in $(seq "$TIMEOUT"); do
         && grep -q "ping 10.0.2.2: \|WARN.*\(eth\|DHCP\|Ethernet\)" "$LOG" \
         && { [ $STAGE = done ] || grep -q "WARN.*hci0\|bt pair:\|mic: " "$LOG"; }; then
         sleep 1
-        sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/AeroForge OS/,$p'
+        sed 's/\x1b\[[0-9;=]*[a-zA-Z]//g' "$LOG" | sed -n '/RetroForgeDX/,$p'
         grep -q "SMP: 4 of 4" "$LOG" || { fail "not all CPUs came online"; }
         grep -q "\[aerosmss\] all services up" "$LOG" || { fail "aerosmss did not finish startup"; }
         grep -q "mounted at /" "$LOG" || { fail "NVMe FAT32 volume not mounted"; }
@@ -913,7 +966,7 @@ for _ in $(seq "$TIMEOUT"); do
         grep -q "\[desktop\] moved Welcome to [0-9]*,[0-9]* (460x290)" "$LOG" || { fail "dragging the snapped Welcome window away did not give back its size"; }
         grep -q "pointer speed 5 of 10" "$LOG" || { fail "the shell's mouse speed command did not set speed 5"; }
         grep -q "\[desktop\] mouse speed 6, saved" "$LOG" || { fail "the Start menu's + button did not raise the mouse speed to 6 and save it"; }
-        grep -q "\[desktop\] pointer ended at 516,555" "$LOG" \
+        grep -q "\[desktop\] pointer ended at 516,515" "$LOG" \
             || { fail "at mouse speed 6 a quick 40-count move did not go 75 pixels ($(grep -ao 'pointer ended at [0-9,]*' "$LOG"))"; }
         mtype -i build/disk.img@@1M ::/AeroForge.ini | grep -q "^mouse speed = 6" \
             || { fail "the mouse speed was not saved to /AeroForge.ini on the NVMe disk"; }
@@ -941,14 +994,14 @@ PY
         grep -q "\[desktop\] Computer: drives = C: / FAT32 at [0-9,]* | D: /sata0p1 FAT32 at [0-9,]* | E: /sata1p1 NTFS at [0-9,]* | F: /usb0p1 FAT32 at " "$LOG" \
             || { fail "the Computer window did not open on the four drives ($(grep -ao 'Computer: drives = [^;]*' "$LOG" | head -1))"; }
         grep -q "\[desktop\] renamed /docs/New folder to /docs/Stuff" "$LOG" || { fail "Ctrl+N and typing a name did not make the folder /docs/Stuff"; }
-        grep -q "\[desktop\] pasted /docs/Welcome to AeroForge.txt as /docs/Stuff/Welcome to AeroForge.txt (1 file)" "$LOG" \
+        grep -q "\[desktop\] pasted /docs/Welcome to RetroForgeDX.txt as /docs/Stuff/Welcome to RetroForgeDX.txt (1 file)" "$LOG" \
             || { fail "Ctrl+C and Ctrl+V did not copy the text file into /docs/Stuff"; }
-        grep -q "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin to /docs/Welcome to AeroForge - Copy.txt" "$LOG" \
+        grep -q "\[desktop\] restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin to /docs/Welcome to RetroForgeDX - Copy.txt" "$LOG" \
             || { fail "Ctrl+Z did not bring a deleted file back from the Recycle Bin"; }
-        grep -q "\[desktop\] Recycle Bin = Welcome to AeroForge - Copy.txt (from /docs/Welcome to AeroForge - Copy.txt)" "$LOG" \
+        grep -q "\[desktop\] Recycle Bin = Welcome to RetroForgeDX - Copy.txt (from /docs/Welcome to RetroForgeDX - Copy.txt)" "$LOG" \
             || { fail "the Recycle Bin did not list the deleted file"; }
-        grep -q "\[desktop\] removed /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
-        mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to AeroForge.txt" | head -n 1 | grep -q "Welcome to AeroForge OS" \
+        grep -q "\[desktop\] removed /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin" "$LOG" || { fail "deleting in the Recycle Bin did not remove the file for good"; }
+        mtype -i build/disk.img@@1M "::/docs/Stuff/Welcome to RetroForgeDX.txt" | head -n 1 | grep -q "Welcome to RetroForgeDX\." \
             || { fail "the copy in /docs/Stuff is not on the NVMe disk image"; }
         # (The deleted copy comes back later, from the files emptied from the Recycle Bin.)
         ! mdir -i build/disk.img@@1M "::/docs/New folder" >/dev/null 2>&1 \
@@ -956,13 +1009,13 @@ PY
         [ -z "$(mtype -i build/disk.img@@1M "::/Recycle Bin/info.txt")" ] && ! mdir -i build/disk.img@@1M "::/Recycle Bin/R0001" >/dev/null 2>&1 \
             || { fail "the Recycle Bin on the NVMe disk image is not empty after deleting for good"; }
         python3 tools/check-screen.py explorer build/gop-explorer.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the Computer window's drives screenshot is wrong"; }
-        grep -q "\[desktop\] selected 3 items: Stuff | AeroForge-OS-Design.md | Welcome to AeroForge.txt" "$LOG" \
-            && grep -q "\[desktop\] selected 2 items: AeroForge-OS-Design.md | Welcome to AeroForge.txt" "$LOG" \
+        grep -q "\[desktop\] selected 3 items: Stuff | AeroForge-OS-Design.md | Welcome to RetroForgeDX.txt" "$LOG" \
+            && grep -q "\[desktop\] selected 2 items: AeroForge-OS-Design.md | Welcome to RetroForgeDX.txt" "$LOG" \
             || { fail "Ctrl+A and Ctrl+click did not select the right entries in /docs"; }
-        grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Stuff/Welcome to AeroForge.txt | /docs/Welcome to AeroForge.txt)" "$LOG" \
-            || grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Welcome to AeroForge.txt | /docs/Stuff/Welcome to AeroForge.txt)" "$LOG" \
+        grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Stuff/Welcome to RetroForgeDX.txt | /docs/Welcome to RetroForgeDX.txt)" "$LOG" \
+            || grep -q "\[desktop\] search for \"welcome\" in /docs: 2 found (/docs/Welcome to RetroForgeDX.txt | /docs/Stuff/Welcome to RetroForgeDX.txt)" "$LOG" \
             || { fail "searching /docs for \"welcome\" did not find its two copies"; }
-        grep -q "\[desktop\] properties of /docs/.*Welcome to AeroForge.txt: [0-9]* bytes" "$LOG" || { fail "Alt+Enter did not show a search result's properties"; }
+        grep -q "\[desktop\] properties of /docs/.*Welcome to RetroForgeDX.txt: [0-9]* bytes" "$LOG" || { fail "Alt+Enter did not show a search result's properties"; }
         grep -q "\[desktop\] dropped 1 item on /docs/Stuff: move" "$LOG" \
             && grep -q "\[desktop\] moved /docs/AeroForge-OS-Design.md to /docs/Stuff/AeroForge-OS-Design.md" "$LOG" \
             && mdir -i build/disk.img@@1M "::/docs/Stuff/AeroForge-OS-Design.md" >/dev/null 2>&1 \
@@ -1022,7 +1075,7 @@ PY
         grep -q "\[desktop\] clock: 24-hour, saved" "$LOG" && grep -q "\[desktop\] clock: 12-hour, saved" "$LOG" \
             || { fail "Control Panel did not switch the taskbar clock to 24 hours and back"; }
         INI=$(mtype -i build/disk.img@@1M ::/AeroForge.ini)
-        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour"; do
+        for want in "background = Aero blue" "volume = 100" "muted = no" "double-click = 500" "swap buttons = no" "clock = 12-hour" "font size = medium" "game mode at start = yes"; do
             echo "$INI" | grep -q "^$want" || { fail "/AeroForge.ini does not have \"$want\" ($INI)"; }
         done
         grep -q "\[desktop\] copying window up: 12595257 bytes to copy; Cancel at " "$LOG" \
@@ -1043,9 +1096,9 @@ PY
             && grep -q "\[desktop\] undeleted /games/Old shopping list.txt" "$LOG" \
             && mtype -i build/disk.img@@1M "::/games/Old shopping list.txt" 2>/dev/null | cmp -s - build/undelete-me.txt \
             || { fail "Show deleted files did not bring back /games/Old shopping list.txt whole"; }
-        grep -q "\[desktop\] deleted files in /Recycle Bin = Welcome to AeroForge - Copy.txt (whole)" "$LOG" \
-            && [ "$(grep -c "\[desktop\] restored /docs/Welcome to AeroForge - Copy.txt from the Recycle Bin to /docs/Welcome to AeroForge - Copy.txt" "$LOG")" -ge 2 ] \
-            && mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge - Copy.txt" 2>/dev/null | head -n 1 | grep -q "Welcome to AeroForge OS" \
+        grep -q "\[desktop\] deleted files in /Recycle Bin = Welcome to RetroForgeDX - Copy.txt (whole)" "$LOG" \
+            && [ "$(grep -c "\[desktop\] restored /docs/Welcome to RetroForgeDX - Copy.txt from the Recycle Bin to /docs/Welcome to RetroForgeDX - Copy.txt" "$LOG")" -ge 2 ] \
+            && mtype -i build/disk.img@@1M "::/docs/Welcome to RetroForgeDX - Copy.txt" 2>/dev/null | head -n 1 | grep -q "Welcome to RetroForgeDX\." \
             || { fail "Show emptied files did not bring back the file emptied from the Recycle Bin"; }
         grep -q "\[desktop\] Computer: / = .*; [1-9][0-9]* dated" "$LOG" || { fail "the files on C: came without the dates they were written"; }
         grep -q "\[desktop\] view: Large icons; first item at [0-9]*,[0-9]*, [2-9] across" "$LOG" \
@@ -1060,19 +1113,19 @@ PY
         grep -q "\[desktop\] preview pane off" "$LOG" || { fail "Alt+P did not close the preview pane"; }
         python3 tools/check-screen.py explorer build/gop-panes.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the two-pane screenshot is wrong"; }
         python3 tools/check-screen.py explorer build/gop-network.ppm "${CXY%,*}" "${CXY#*,}" || { fail "the network drive screenshot is wrong"; }
-        grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to AeroForge.txt;" "$LOG" \
+        grep -qi "\[desktop\] Computer: /docs = AeroForge-OS-Design.md | Welcome to RetroForgeDX.txt;" "$LOG" \
             || { fail "double-clicking docs in the Computer window did not list /docs"; }
-        grep -qi "\[desktop\] opened /docs/Welcome to AeroForge.txt in Notes (167 bytes)" "$LOG" \
+        grep -qi "\[desktop\] opened /docs/Welcome to RetroForgeDX.txt in Notes (167 bytes)" "$LOG" \
             || { fail "double-clicking a text file in the Computer window did not open it in Notes"; }
-        grep -q "\[desktop\] notes: Welcome to AeroForge OS\. / .*hello aero" "$LOG" \
+        grep -q "\[desktop\] notes: Welcome to RetroForgeDX\. / .*hello aero" "$LOG" \
             || { fail "the opened file plus keys typed on the desktop were not in the Notes window"; }
         # Moving the pointer redraws only the pointer and what it lights up
         # (it used to redraw big areas, about 100 ms per move under QEMU).
         MOVE_US=$(grep -ao "\[desktop\] pointer moves: [0-9]*, redraw took [0-9]* us on average" "$LOG" | grep -o "took [0-9]*" | grep -o "[0-9]*")
         [ -n "$MOVE_US" ] && [ "$MOVE_US" -lt 30000 ] || { fail "redrawing after a pointer move took ${MOVE_US:-?} us on average (want under 30000)"; }
-        grep -q "\[desktop\] saved /docs/Welcome to AeroForge.txt ([0-9]* bytes, read back the same)" "$LOG" \
+        grep -q "\[desktop\] saved /docs/Welcome to RetroForgeDX.txt ([0-9]* bytes, read back the same)" "$LOG" \
             || { fail "Ctrl+S in Notes did not save the file back to the NVMe disk"; }
-        mtype -i build/disk.img@@1M "::/docs/Welcome to AeroForge.txt" | tail -n 1 | grep -q "hello aero$" \
+        mtype -i build/disk.img@@1M "::/docs/Welcome to RetroForgeDX.txt" | tail -n 1 | grep -q "hello aero$" \
             || { fail "the file Notes saved does not end with the typed words on the NVMe disk image"; }
         python3 tools/check-screen.py desktop build/gop-desktop.ppm 466 414 "${CXY%,*}" "${CXY#*,}" $((CW - 100)) \
             || { fail "the desktop screenshot is wrong"; }
@@ -1107,11 +1160,16 @@ PY
             || { fail "the gamepad system call did not give the Xbox style pad in the Xbox layout"; }
         grep -q "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS, d-pad left, left stick -32766 +0, right stick +32766 +0, triggers 0 0" "$LOG" \
             || { fail "the gamepad system call did not give the HID pad"; }
-        grep -q "\[padtest\] 4 gamepad(s)" "$LOG" || { fail "the gamepad system call did not list all four gamepads"; }
+        grep -q "Switch Pro style gamepad \"Pro Controller\" on USB .* hub [0-9]* port 5" "$LOG" || { fail "Switch Pro Controller behind the hub not set up" "$FAKEPAD_LOG"; }
+        grep -q "fakepad(switch): handshake" "$FAKEPAD_LOG" && grep -q "fakepad(switch): USB only" "$FAKEPAD_LOG" \
+            && grep -q "fakepad(switch): full input reports" "$FAKEPAD_LOG" || { fail "the Switch Pro Controller was not set up for USB" "$FAKEPAD_LOG"; }
+        grep -q "\[padtest\] .*\"Pro Controller\" (USB, Xbox layout): A RB Start, d-pad up, left stick +3[0-9]* +0, right stick +0 -3[0-9]*, triggers 255 0" "$LOG" \
+            || { fail "the gamepad system call did not give the Switch Pro Controller in the Xbox layout" "$FAKEPAD_LOG"; }
+        grep -q "\[padtest\] 5 gamepad(s)" "$LOG" || { fail "the gamepad system call did not list all five gamepads"; }
         grep -q "xhci: port 8, slot [0-9]*: 045e:028e \"Controller\" unplugged" "$LOG" || { fail "unplugging the Xbox style pad from its root port went unnoticed" "$FAKEPAD_LOG"; }
         grep -q "xhci: hub [0-9]* port 3, slot [0-9]*: 0079:0006 \"Generic USB Joystick\" unplugged" "$LOG" || { fail "unplugging the HID pad from the hub went unnoticed" "$FAKEPAD_LOG"; }
         [ "$(grep -c "\[padtest\] .*\"Controller\" (USB, Xbox layout): A Y LB Start" "$LOG")" -ge 2 ] && [ "$(grep -c "\[padtest\] .*\"Generic USB Joystick\" (USB, Xbox layout guessed): B RS" "$LOG")" -ge 2 ] \
-            && [ "$(grep -c "\[padtest\] 4 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
+            && [ "$(grep -c "\[padtest\] 5 gamepad(s)" "$LOG")" -ge 2 ] || { fail "the USB pads did not work again after being plugged back in" "$FAKEPAD_LOG"; }
         grep -q "USB disk usb1 plugged in: .*USB \"QEMU QEMU HARDDISK\" serial AEROUSB2" "$LOG" || { fail "the USB stick plugged in later was not registered"; }
         grep -q "exFAT volume \"HOTSTICK\" on usb1p1 mounted at /usb1p1" "$LOG" || { fail "the exFAT USB stick plugged in later was not mounted"; }
         grep -q "48976 bytes, 561 lines, fnv1a fd53da30847dce45  /usb1p1/AeroForge-OS-Design.md" "$LOG" || { fail "a many-cluster file on the exFAT stick did not read back right"; }
@@ -1187,7 +1245,7 @@ PY
             || { fail "a folder index on the NTFS volume is out of order"; }
         grep -q "read /system/session.cfg" "$LOG" || { fail "aerosmss did not read its config from disk"; }
         grep -q "\[aerosmss\] staying at the console (/system/session.cfg says so)" "$LOG" || { fail "aerosmss did not keep the console for the test as session.cfg asks"; }
-        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style and a HID USB gamepad, and a user program read all four gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, and a note each from 24-bit and mono FLAC, stereo and mono OGG, 8-bit, 24-bit and floating point WAV and a 64 kbit/s MP3, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
+        echo "PASS: booted, mounted the NVMe and SATA disks and a USB stick, set up the USB keyboard and mouse behind a hub, brought up igb and e1000e cards, got an address over DHCP and pinged the gateway, loaded MediaTek Bluetooth firmware, found the gamepads in a scan, paired the classic gamepad, read its input and saw it reconnect, paired a headset and recorded its microphone before and after it reconnected, played a 440 Hz tone on the HD Audio card and a user program's melody through the audio system calls, paired an LE gamepad, read its input over GATT and saw it reconnect, read an Xbox style, a HID and a Switch Pro USB gamepad, and a user program read all five gamepads through the gamepad system call, before and after the USB pads were unplugged and plugged back in, mounted, read, wrote and unmounted an exFAT USB stick plugged in while running, wrote to the NVMe, SATA and USB disks and found the data in their images, saved, overwrote and deleted files on all three FAT32 volumes (fsck.fat clean, read back with mtools), read folders and fragmented and sparse files on an NTFS drive, then once writing was turned on saved, made, deleted and made a folder on it (ntfsfix and ntfsresize clean) and its menu turned writing off and on, five programs kept their x87, SSE and AVX registers while switched against each other, a program's threads shared a lock and a heap and were all ended when it exited, a program drew on the whole screen and gave it back to the console, a desktop program's window was dragged with the mouse and typed into, and its Computer window, opened by double-clicking its icon, listed the four drives, was resized by its corner, made, renamed and filled a folder with Ctrl+N, Ctrl+C and Ctrl+V, deleted a file to the Recycle Bin, undid it with Ctrl+Z and deleted it for good from the Recycle Bin, mapped a Samba share as a network drive (signed NTLMv2) and made a folder on it, selected with Ctrl+A and Ctrl+click, searched a folder, showed Properties of a file and of a drive, dragged a file into a folder, opened a second tab, split it into two panes and copied a file from one side to the other, previewed a text file as text and as hex and a saved game as hex, opened and closed a folder tree, used right-click menus, switched to Large icons and back, showed the dates files were written, brought back a file deleted for good and one emptied from the Recycle Bin, showed a JPEG, a BMP and a PNG picture in Photos, played a WAV and then an MP3 song in Music and heard them on the sound card, and a note each from 24-bit and mono FLAC, stereo and mono OGG, 8-bit, 24-bit and floating point WAV and a 64 kbit/s MP3, changed the background, volume (heard at a quarter level at 50%), double-click speed, mouse buttons (swapped and back) and clock in Control Panel and kept them in /AeroForge.ini, a window snapped to half the screen and back, Calculator worked out a sum, the Start menu raised the mouse speed and saved it, a USB tablet put the pointer where it pointed, listed folders and opened a text file in Notes and saved it back with Ctrl+S, an SMB 2 client signed in to a Samba share and listed, read, wrote, renamed and deleted on it, idle CPUs took waiting threads from busy ones, a high-priority thread ran ahead of busy ones, sleeps and futex timeouts were precise to well under a tick, busy CPUs evened out their threads, an idle CPU went tickless, the USB, NVMe and SATA controllers and the igb card raised interrupts, the security self-test passed, aerosmss read its config, IPC round trips completed"; exit 0
     fi
     sleep 1
 done

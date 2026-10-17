@@ -18,11 +18,23 @@
  * report ID 1: X at minimum, Y centred, Z at maximum, Rz centred, hat left,
  * buttons 2 and 10 held.
  *
+ * --switch: a wired Nintendo Switch Pro Controller (057e:2009), whose report
+ * descriptor does not describe its real reports. It sends nothing until the
+ * host shakes hands (80 02, answered 81 02), keeps it on USB (80 04) and asks
+ * for full input reports (sub-command 03 30); then every second a 0x30
+ * report: A, R and Plus held, d-pad up, ZL pressed, left stick right, right
+ * stick down. It logs each step of the set-up.
+ *
+ * SIGUSR2 (--xinput) plays a short script instead, a report every 50 ms:
+ * at rest, the left stick half right, at rest, Start tapped, at rest, B
+ * tapped, then Guide, d-pad right and A tapped in turn, then at rest for
+ * good ("script done" in the log).
+ *
  * SIGUSR1 unplugs the pad (usbredir device disconnect, which QEMU passes on
  * to the guest as an unplug) and the next one plugs it in again.
  *
  * Build: cc -O2 -o build/fakepad tools/fakepad/fakepad.c -lusbredirparser
- * Run:   build/fakepad <socket> --xinput|--hid */
+ * Run:   build/fakepad <socket> --xinput|--hid|--switch */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -42,10 +54,14 @@
 static struct usbredirparser *parser;
 static int sock = -1;
 static int xinput;
+static int nswitch;      /* --switch */
+static int switch_full;  /* the host asked for full input reports */
 static int reports_started;
 static double next_report;
 static int reports_sent;
 static volatile sig_atomic_t toggle_plug;
+static volatile sig_atomic_t script_go;
+static double script_t0 = -1;
 static int plugged;
 
 static void on_usr1(int sig) {
@@ -53,10 +69,15 @@ static void on_usr1(int sig) {
     toggle_plug = 1;
 }
 
+static void on_usr2(int sig) {
+    (void)sig;
+    script_go = 1;
+}
+
 static void say(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "fakepad(%s): ", xinput ? "xinput" : "hid");
+    fprintf(stderr, "fakepad(%s): ", xinput ? "xinput" : nswitch ? "switch" : "hid");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -70,12 +91,12 @@ static double now(void) {
 
 /* ---- descriptors ---------------------------------------------------------- */
 
-#define EP_IN (xinput ? 0x81 : 0x82)   /* the gamepad's interrupt IN endpoint */
+#define EP_IN (xinput || nswitch ? 0x81 : 0x82)   /* the gamepad's interrupt IN endpoint */
 #define EP_OUT 0x01                     /* XInput: LED and rumble commands */
 #define EP_CONSUMER 0x81                /* HID mode: the consumer control interface */
 
-static uint16_t vendor_id(void) { return xinput ? 0x045E : 0x0079; }
-static uint16_t product_id(void) { return xinput ? 0x028E : 0x0006; }
+static uint16_t vendor_id(void) { return xinput ? 0x045E : nswitch ? 0x057E : 0x0079; }
+static uint16_t product_id(void) { return xinput ? 0x028E : nswitch ? 0x2009 : 0x0006; }
 
 static int device_descriptor(uint8_t *d) {
     const uint8_t desc[18] = {18, 1, 0x00, 0x02, xinput ? 0xFF : 0x00, xinput ? 0xFF : 0x00, xinput ? 0xFF : 0x00, 8,
@@ -104,7 +125,30 @@ static const uint8_t pad_report_desc[] = {
     0xC0,
 };
 
+/* Like the real pad's: a joystick collection of vendor-defined reports. */
+static const uint8_t switch_report_desc[] = {
+    0x05, 0x01, 0x15, 0x00, 0x09, 0x04, 0xA1, 0x01,
+    0x85, 0x30, 0x06, 0x01, 0xFF, 0x09, 0x01, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x3F, 0x81, 0x02,
+    0x85, 0x21, 0x09, 0x02, 0x95, 0x3F, 0x81, 0x02,
+    0x85, 0x81, 0x09, 0x03, 0x95, 0x3F, 0x81, 0x02,
+    0x85, 0x01, 0x09, 0x04, 0x95, 0x3F, 0x91, 0x02,
+    0x85, 0x80, 0x09, 0x05, 0x95, 0x3F, 0x91, 0x02,
+    0xC0,
+};
+
 static int config_descriptor(uint8_t *d) {
+    if (nswitch) {
+        const uint8_t desc[] = {
+            9, 2, 0, 0, 1, 1, 0, 0xA0, 250,
+            9, 4, 0, 0, 2, 0x03, 0x00, 0x00, 0,
+            9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof switch_report_desc, 0,
+            7, 5, 0x81, 3, 64, 0, 8,
+            7, 5, 0x01, 3, 64, 0, 8,
+        };
+        memcpy(d, desc, sizeof desc);
+        d[2] = sizeof desc;
+        return sizeof desc;
+    }
     if (xinput) {
         /* Interface 0: the controller. Interface 1: the headset port, which
          * the host must leave alone. */
@@ -142,8 +186,8 @@ static int string_descriptor(uint8_t index, uint8_t *d) {
         memcpy(d, langs, 4);
         return 4;
     }
-    const char *s = index == 1 ? (xinput ? "Generic X-Box pad" : "DragonRise Inc.")
-                  : index == 2 ? (xinput ? "Controller" : "Generic USB Joystick")
+    const char *s = index == 1 ? (xinput ? "Generic X-Box pad" : nswitch ? "Nintendo Co., Ltd." : "DragonRise Inc.")
+                  : index == 2 ? (xinput ? "Controller" : nswitch ? "Pro Controller" : "Generic USB Joystick")
                   : index == 3 ? "AERO0PAD"
                   : NULL;
     if (s == NULL) return -1;
@@ -171,14 +215,36 @@ static void send_report(void) {
             send_in(led, sizeof led);
         }
         /* 00 14, buttons, LT, RT, LX, LY, RX, RY, 6 reserved bytes. */
-        const uint16_t buttons = 0x0002 | 0x0008     /* d-pad down, right */
+        uint16_t buttons = 0x0002 | 0x0008           /* d-pad down, right */
                                | 0x0010              /* Start */
                                | 0x0100              /* LB */
                                | 0x1000 | 0x8000;    /* A, Y */
-        const int16_t lx = 32767, ly = 32767, rx = -32768, ry = 0;
-        const uint8_t r[20] = {0x00, 0x14, (uint8_t)buttons, (uint8_t)(buttons >> 8), 255, 0,
+        int16_t lx = 32767, ly = 32767, rx = -32768, ry = 0;
+        uint8_t lt = 255;
+        if (script_t0 >= 0) {
+            const double t = now() - script_t0;
+            buttons = 0;
+            lx = ly = rx = ry = 0;
+            lt = 0;
+            if (t >= 0.6 && t < 1.1) lx = 16384;
+            else if (t >= 1.6 && t < 1.8) buttons = 0x0010;  /* Start */
+            else if (t >= 2.4 && t < 2.6) buttons = 0x2000;  /* B */
+            else if (t >= 3.0 && t < 3.2) buttons = 0x0400;  /* Guide */
+            else if (t >= 4.4 && t < 4.6) buttons = 0x0008;  /* d-pad right */
+            else if (t >= 5.6 && t < 5.9) buttons = 0x1000;  /* A */
+            if (t >= 6.4 && t < 6.46) say("script done");
+        }
+        const uint8_t r[20] = {0x00, 0x14, (uint8_t)buttons, (uint8_t)(buttons >> 8), lt, 0,
                                (uint8_t)lx, (uint8_t)(lx >> 8), (uint8_t)ly, (uint8_t)(ly >> 8),
                                (uint8_t)rx, (uint8_t)(rx >> 8), (uint8_t)ry, (uint8_t)(ry >> 8)};
+        send_in(r, sizeof r);
+    } else if (nswitch) {
+        /* 30, timer, battery, buttons right/shared/left, sticks (12-bit, up positive). */
+        static uint8_t timer;
+        const int lx = 2048 + 1500, ly = 2048, rx = 2048, ry = 2048 - 1500;
+        uint8_t r[64] = {0x30, timer++, 0x91, 0x08 | 0x40, 0x02, 0x02 | 0x80,
+                         (uint8_t)lx, (uint8_t)((lx >> 8) | (ly << 4)), (uint8_t)(ly >> 4),
+                         (uint8_t)rx, (uint8_t)((rx >> 8) | (ry << 4)), (uint8_t)(ry >> 4)};
         send_in(r, sizeof r);
     } else {
         /* Report ID 1: X Y Z Rz, hat (6 = left), 12 buttons (2 and 10). */
@@ -205,6 +271,10 @@ static void control_packet(void *priv, uint64_t id, struct usb_redir_control_pac
         case 2: n = config_descriptor(reply); break;
         case 3: n = string_descriptor(c->value & 0xFF, reply); break;
         }
+    } else if (nswitch && c->requesttype == 0x81 && c->request == 6 && c->value >> 8 == 0x22) {
+        n = (int)sizeof switch_report_desc;
+        memcpy(reply, switch_report_desc, n);
+        say("report descriptor read");
     } else if (!xinput && c->requesttype == 0x81 && c->request == 6 && c->value >> 8 == 0x22) { /* report descriptor */
         const uint8_t *desc = c->index == 0 ? consumer_report_desc : pad_report_desc;
         n = c->index == 0 ? (int)sizeof consumer_report_desc : (int)sizeof pad_report_desc;
@@ -239,7 +309,26 @@ static void control_packet(void *priv, uint64_t id, struct usb_redir_control_pac
 static void interrupt_packet(void *priv, uint64_t id, struct usb_redir_interrupt_packet_header *h,
                              uint8_t *data, int len) {
     (void)priv;
-    if (h->endpoint == EP_OUT) {
+    if (h->endpoint == EP_OUT && nswitch) {
+        if (len >= 2 && data[0] == 0x80 && data[1] == 0x02) {
+            say("handshake");
+            const uint8_t ack[64] = {0x81, 0x02};
+            send_in(ack, sizeof ack);
+        } else if (len >= 2 && data[0] == 0x80 && data[1] == 0x04) {
+            say("USB only, no time-out");
+        } else if (len >= 12 && data[0] == 0x01 && data[10] == 0x03 && data[11] == 0x30) {
+            say("full input reports");
+            const uint8_t ack[64] = {0x21, 0, 0x91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x03};
+            send_in(ack, sizeof ack);
+            switch_full = 1;
+            next_report = now() + 0.2;
+        } else {
+            say("OUT %d bytes: %02x %02x", len, len > 0 ? data[0] : 0, len > 1 ? data[1] : 0);
+        }
+        struct usb_redir_interrupt_packet_header r = *h;
+        r.status = usb_redir_success;
+        usbredirparser_send_interrupt_packet(parser, id, &r, NULL, 0);
+    } else if (h->endpoint == EP_OUT) {
         if (len == 3 && data[0] == 0x01 && data[1] == 0x03 && data[2] >= 6 && data[2] <= 9)
             say("LED: player %d", data[2] - 5);
         else
@@ -309,7 +398,7 @@ static void interface_and_ep_info(void) {
     memset(ep.type, usb_redir_type_invalid, sizeof ep.type);
     ep.type[0] = ep.type[16] = usb_redir_type_control;
     ep.max_packet_size[0] = ep.max_packet_size[16] = 8;
-    ii.interface_count = 2;
+    ii.interface_count = nswitch ? 1 : 2;
     for (int i = 0; i < 2; ++i) {
         ii.interface[i] = (uint8_t)i;
         ii.interface_class[i] = xinput ? 0xFF : 0x03;
@@ -323,7 +412,12 @@ static void interface_and_ep_info(void) {
         {1, 32, 8, 0},
         {2, 32, 4, 1},
     };
-    for (int i = 0; i < (xinput ? 4 : 2); ++i) {
+    if (nswitch) {
+        ep.type[17] = ep.type[1] = usb_redir_type_interrupt;
+        ep.max_packet_size[17] = ep.max_packet_size[1] = 64;
+        ep.interval[17] = ep.interval[1] = 8;
+    }
+    for (int i = 0; i < (nswitch ? 0 : xinput ? 4 : 2); ++i) {
         ep.type[eps[i].index] = usb_redir_type_interrupt;
         ep.max_packet_size[eps[i].index] = (uint16_t)eps[i].mps;
         ep.interval[eps[i].index] = (uint8_t)eps[i].interval;
@@ -369,12 +463,14 @@ static int write_cb(void *priv, uint8_t *data, int count) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3 || (strcmp(argv[2], "--xinput") != 0 && strcmp(argv[2], "--hid") != 0)) {
-        fprintf(stderr, "usage: %s <socket> --xinput|--hid\n", argv[0]);
+    if (argc < 3 || (strcmp(argv[2], "--xinput") != 0 && strcmp(argv[2], "--hid") != 0 && strcmp(argv[2], "--switch") != 0)) {
+        fprintf(stderr, "usage: %s <socket> --xinput|--hid|--switch\n", argv[0]);
         return 2;
     }
     xinput = strcmp(argv[2], "--xinput") == 0;
+    nswitch = strcmp(argv[2], "--switch") == 0;
     signal(SIGUSR1, on_usr1);
+    signal(SIGUSR2, on_usr2);
 
     int listener = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -423,16 +519,22 @@ int main(int argc, char **argv) {
             toggle_plug = 0;
             if (plugged) {
                 usbredirparser_send_device_disconnect(parser);
-                plugged = reports_started = 0;
+                plugged = reports_started = switch_full = 0;
                 say("unplugged");
             } else {
                 say("plugged in again");
                 present();
             }
         }
-        if (reports_started && now() >= next_report) {
+        if (script_go) {
+            script_go = 0;
+            script_t0 = now();
+            next_report = 0;
+            say("script started");
+        }
+        if (reports_started && (!nswitch || switch_full) && now() >= next_report) {
             send_report();
-            next_report = now() + 1.0;
+            next_report = now() + (script_t0 >= 0 && now() - script_t0 < 6.7 ? 0.05 : 1.0);
         }
         if (usbredirparser_has_data_to_write(parser) && usbredirparser_do_write(parser) != 0) break;
     }

@@ -77,6 +77,7 @@ pub mod sys {
     pub const AUDIO_VOLUME: u64 = 62;
     pub const MOUSE_BUTTONS: u64 = 63;
     pub const TIME_SET: u64 = 64;
+    pub const POINTER_MOVE: u64 = 65;
 }
 
 pub mod rights {
@@ -527,6 +528,13 @@ pub mod display {
                 presses: (v >> 40) as u32 & 0xF_FFFF,
                 doubles: (v >> 60) as u8 & 0x7,
             })
+        }
+
+        /// Moves the pointer by (dx, dy) and, with Some, sets its buttons
+        /// (bit 0 primary, bit 1 secondary): how a gamepad drives the pointer.
+        pub fn move_pointer(&self, dx: i32, dy: i32, buttons: Option<u8>) -> Result<(), i64> {
+            let b = buttons.map_or(0, |b| 0x100 | (b as u64 & 3));
+            check(unsafe { syscall(sys::POINTER_MOVE, dx as i64 as u64, dy as i64 as u64, b, 0) }).map(|_| ())
         }
 
         /// Keys typed since the last call (ASCII; Enter is 10, Esc 27,

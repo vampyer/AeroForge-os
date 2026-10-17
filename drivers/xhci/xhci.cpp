@@ -203,7 +203,14 @@ private:
 };
 
 enum class HidKind : uint8_t { None, Keyboard, Mouse, Tablet };
-enum class PadKind : uint8_t { None, Hid, XInput };
+enum class PadKind : uint8_t { None, Hid, XInput, Switch };
+
+// Nintendo Switch Pro Controller (wired). Its report descriptor does not
+// describe the reports it really sends, so the driver shakes hands with it
+// (80 02, answered by 81 02), keeps it on USB (80 04), asks for full input
+// reports (sub-command 03 30) and turns each 0x30 report into the XInput
+// style report below.
+constexpr uint16_t kNintendo = 0x057E, kSwitchPro = 0x2009;
 
 // The report the driver turns each Xbox 360 (XInput) input report into, so
 // the kernel decodes every USB gamepad with its HID parser: hat (4 bits, 8 =
@@ -308,7 +315,12 @@ struct Device {
     uint8_t pad_iface = 0, pad_in_dci = 0, pad_out_dci = 0, pad_interval = 0, pad_out_interval = 0;
     uint16_t pad_mps = 0, pad_out_mps = 0, pad_desc_len = 0;
     Ring pad_ring{}, pad_out_ring{};
-    dhi_dma pad_bufs{};                    // kPadTrbs reports, an OUT packet, then the report descriptor
+    dhi_dma pad_bufs{};                    // kPadTrbs reports, an OUT packet, the report descriptor, two Switch commands
+    bool pad_switch_ready = false;         // Switch Pro: handshake answered, full reports asked for
+    uint8_t pad_switch_tries = 0;          // Switch Pro: handshakes sent
+    uint8_t pad_switch_seen = 0;           // Switch Pro: reports logged so far (the first few are)
+    uint8_t pad_halt_in = 0, pad_halt_out = 0;  // completion code that halted an endpoint, until poll() resets it
+    uint8_t pad_errors = 0;                // endpoint resets so far
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -364,7 +376,9 @@ public:
         process_events();
         service_ports();
         recover_hid();
+        recover_pads();
         if (++polls_ % 32 == 0) poll_hubs();
+        if (polls_ % 256 == 0) retry_switch();
         int32_t n = 0;
         while (n < max && q_tail_ != q_head_) {
             out[n++] = queue_[q_tail_];
@@ -717,6 +731,7 @@ private:
         }
         if (d.bt >= 0) l.s(", Bluetooth adapter");
         if (d.pad == PadKind::XInput) l.s(", gamepad (Xbox 360 style)");
+        if (d.pad == PadKind::Switch) l.s(", gamepad (Switch Pro style)");
         if (d.pad == PadKind::Hid) l.s(", HID gamepad");
         const bool hub = d.info.dev_class == 9 || d.info.iface_class == 9;
         if (hub) l.s(", hub");
@@ -1082,7 +1097,10 @@ private:
                     c.mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
                     c.interval = b[off + 6];
                     if (c.desc_len) ++candidates_;
-                    in_candidate = -1;
+                } else if (!(addr & 0x80) && (attr & 3) == 3 && c.out_dci == 0) {  // its OUT endpoint, if any
+                    c.out_dci = uint8_t((addr & 0xF) * 2);
+                    c.out_mps = uint16_t((b[off + 4] | b[off + 5] << 8) & 0x7FF);
+                    c.out_interval = b[off + 6];
                 }
             } else if (type == 5 && off + 7 <= len && in_xinput && (b[off + 3] & 3) == 3) {  // XInput endpoints
                 const uint8_t addr = b[off + 2];
@@ -1341,7 +1359,7 @@ private:
     // Starts the device's gamepad interface: the XInput one parse_config
     // found, or the first HID interface whose report descriptor is a gamepad's.
     bool start_pad(Device& d) {
-        if (ops_->dma_alloc((kPadTrbs + 1) * kPadBuf + kPadDesc, &d.pad_bufs) != 0) return false;
+        if (ops_->dma_alloc((kPadTrbs + 1) * kPadBuf + kPadDesc + 2 * kPadBuf, &d.pad_bufs) != 0) return false;
         auto* desc = static_cast<uint8_t*>(d.pad_bufs.virt) + (kPadTrbs + 1) * kPadBuf;
         const uint64_t desc_phys = d.pad_bufs.phys + (kPadTrbs + 1) * kPadBuf;
         if (d.pad == PadKind::XInput) {
@@ -1353,19 +1371,30 @@ private:
                 const uint16_t want = c.desc_len < kPadDesc ? c.desc_len : uint16_t(kPadDesc);
                 const int n = control(d, 0x81, 6, 0x2200, c.iface, want, desc_phys);  // GET_DESCRIPTOR(report)
                 if (n <= 0 || !describes_gamepad(desc, n)) continue;
-                d.pad = PadKind::Hid;
+                const bool pro = d.info.vendor == kNintendo && d.info.product == kSwitchPro && c.out_dci;
+                d.pad = pro ? PadKind::Switch : PadKind::Hid;
                 d.pad_iface = c.iface;
                 d.pad_in_dci = c.dci;
                 d.pad_mps = c.mps;
                 d.pad_interval = c.interval;
                 d.pad_desc_len = uint16_t(n);
+                if (pro) {
+                    d.pad_out_dci = c.out_dci;
+                    d.pad_out_mps = c.out_mps;
+                    d.pad_out_interval = c.out_interval;
+                    d.pad_switch_ready = false;
+                    d.pad_switch_tries = d.pad_switch_seen = 0;
+                    for (uint32_t k = 0; k < sizeof(kXInputReportDesc); ++k) desc[k] = kXInputReportDesc[k];
+                    d.pad_desc_len = sizeof(kXInputReportDesc);
+                }
             }
             if (d.pad == PadKind::None) {
                 ops_->dma_free(&d.pad_bufs);
                 return false;
             }
-            control(d, 0x21, 0x0A, 0, d.pad_iface, 0, 0);  // SET_IDLE(0): report only on change
+            if (d.pad == PadKind::Hid) control(d, 0x21, 0x0A, 0, d.pad_iface, 0, 0);  // SET_IDLE(0): report only on change
         }
+        d.pad_halt_in = d.pad_halt_out = d.pad_errors = 0;
         if (!d.pad_ring.init(ops_) || (d.pad_out_dci && !d.pad_out_ring.init(ops_))) return false;
         const IntrEp eps[2] = {{d.pad_in_dci, d.pad_mps, d.pad_interval, &d.pad_ring},
                                {d.pad_out_dci, d.pad_out_mps, d.pad_out_interval, &d.pad_out_ring}};
@@ -1382,8 +1411,38 @@ private:
             d.pad_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), 3, trb_type(kTrbNormal) | kTrbIoc);
             ring_doorbell(d.slot, d.pad_out_dci);
         }
+        // A Switch Pro gets its handshake from poll() a moment later: one
+        // sent straight after set-up can be stalled.
         d.pad_index = int8_t(pad_count_++);
         return true;
+    }
+
+    // Switch Pro: asks for the USB handshake (80 02). poll() sends it again
+    // now and then until the pad answers, in case it was not ready.
+    void switch_handshake(Device& d) {
+        const uint8_t handshake[2] = {0x80, 0x02};
+        ++d.pad_switch_tries;
+        ops_->log(Line().s("xhci: slot ").u(d.slot).s(" Pro Controller: handshake sent (try ").u(d.pad_switch_tries).s(")").str());
+        pad_send(d, 0, handshake, 2);
+    }
+    void retry_switch() {
+        for (int i = 0; i < count_; ++i) {
+            Device& d = devices_[i];
+            if (d.alive && d.pad == PadKind::Switch && !d.pad_switch_ready && d.pad_switch_tries < 8) switch_handshake(d);
+        }
+    }
+
+    // Sends `n` bytes to the Switch Pro's OUT endpoint from command slot `at`
+    // (0 or 1), padded with zeros to a whole 64-byte output report as its
+    // report descriptor (and Windows) has it.
+    void pad_send(Device& d, int at, const uint8_t* bytes, uint32_t n) {
+        const uint32_t base = (kPadTrbs + 1) * kPadBuf + kPadDesc + uint32_t(at) * kPadBuf;
+        const uint32_t size = d.pad_out_mps && d.pad_out_mps < kPadBuf ? d.pad_out_mps : kPadBuf;
+        auto* out = static_cast<uint8_t*>(d.pad_bufs.virt) + base;
+        for (uint32_t i = 0; i < size; ++i) out[i] = i < n ? bytes[i] : 0;
+        const uint64_t phys = d.pad_bufs.phys + base;
+        d.pad_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), size, trb_type(kTrbNormal) | kTrbIoc);
+        ring_doorbell(d.slot, d.pad_out_dci);
     }
 
     void queue_pad(Device& d, uint32_t slot) {
@@ -1394,10 +1453,19 @@ private:
     }
 
     void pad_received(Device& d, uint32_t slot, uint32_t code, uint32_t left) {
+        if (d.pad == PadKind::Switch && code != kCcSuccess && code != kCcShortPacket && d.pad_switch_seen < 8) {
+            ++d.pad_switch_seen;
+            ops_->log(Line().s("xhci: slot ").u(d.slot).s(" Pro Controller: transfer error (code ").u(code).s(")").str());
+        }
         if (code != kCcSuccess && code != kCcShortPacket) return;
         const uint32_t size = d.pad_mps < kPadBuf ? d.pad_mps : kPadBuf;
         uint32_t len = left < size ? size - left : 0;
         const auto* src = static_cast<const uint8_t*>(d.pad_bufs.virt) + slot * kPadBuf;
+        if (d.pad == PadKind::Switch && d.pad_switch_seen < 8 && len >= 2) {
+            ++d.pad_switch_seen;
+            ops_->log(Line().s("xhci: slot ").u(d.slot).s(" Pro Controller: report ").x4(uint16_t(src[0] << 8 | src[1]))
+                          .s(", ").u(len).s(" bytes").str());
+        }
         uint8_t r[kPadBuf];
         if (d.pad == PadKind::XInput) {
             // Input report: 00 14, buttons (2 bytes), LT, RT, LX LY RX RY (signed 16-bit, up positive).
@@ -1423,6 +1491,51 @@ private:
             }
             r[11] = src[4];
             r[12] = src[5];
+            src = r;
+            len = kXInputReport;
+        } else if (d.pad == PadKind::Switch) {
+            if (len >= 2 && src[0] == 0x81 && src[1] == 0x02 && !d.pad_switch_ready) {
+                // Handshake answered: stay on USB, and send full input reports.
+                d.pad_switch_ready = true;
+                const uint8_t usb_only[2] = {0x80, 0x04};
+                const uint8_t full[12] = {0x01, 0x00, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x03, 0x30};
+                pad_send(d, 0, usb_only, 2);
+                pad_send(d, 1, full, 12);
+                return;
+            }
+            // Full input report: 30, timer, battery, buttons (right, shared,
+            // left), then each stick as two 12-bit values (up positive).
+            if (len < 12 || src[0] != 0x30) return;
+            static constexpr uint8_t kHat[16] = {8, 0, 4, 8, 6, 7, 5, 6, 2, 1, 3, 2, 8, 0, 4, 8};
+            const uint8_t right = src[3], shared = src[4], left = src[5];
+            // By the labels on the buttons: A, B, X and Y as printed.
+            const uint16_t buttons = uint16_t(
+                (right >> 3 & 1) |                 // A
+                (right >> 2 & 1) << 1 |            // B
+                (right >> 1 & 1) << 2 |            // X
+                (right & 1) << 3 |                 // Y
+                (left >> 6 & 1) << 4 |             // L
+                (right >> 6 & 1) << 5 |            // R
+                (shared & 1) << 6 |                // Minus as Back
+                (shared >> 1 & 1) << 7 |           // Plus as Start
+                (shared >> 3 & 1) << 8 |           // left stick click
+                (shared >> 2 & 1) << 9 |           // right stick click
+                (shared >> 4 & 1) << 10);          // Home as Guide
+            const uint8_t dpad = uint8_t((left >> 1 & 1) | (left & 1) << 1 | (left >> 3 & 1) << 2 | (left >> 2 & 1) << 3);
+            r[0] = kHat[dpad];
+            r[1] = uint8_t(buttons);
+            r[2] = uint8_t(buttons >> 8);
+            for (int a = 0; a < 4; ++a) {
+                const uint8_t* p = src + (a < 2 ? 6 : 9);
+                const int32_t raw = (a & 1) ? (p[1] >> 4 | p[2] << 4) : (p[0] | (p[1] & 0xF) << 8);
+                int32_t v = (raw - 2048) * 21;
+                if (a & 1) v = -v;  // HID has down positive
+                v = v < -32767 ? -32767 : v > 32767 ? 32767 : v;
+                r[3 + 2 * a] = uint8_t(v);
+                r[4 + 2 * a] = uint8_t(v >> 8);
+            }
+            r[11] = (left & 0x80) ? 255 : 0;   // ZL
+            r[12] = (right & 0x80) ? 255 : 0;  // ZR
             src = r;
             len = kXInputReport;
         }
@@ -1874,6 +1987,33 @@ private:
         }
     }
 
+    // Restarts gamepad endpoints that an error halted, as recover_hid() does
+    // for keyboards: the IN endpoint gets all its transfers queued again; a
+    // halted OUT endpoint just takes the next command. Gives up after many.
+    void recover_pads() {
+        for (int i = 0; i < count_; ++i) {
+            Device& d = devices_[i];
+            if (!d.alive || d.pad == PadKind::None || !(d.pad_halt_in || d.pad_halt_out)) continue;
+            if (d.pad_errors >= kHidMaxErrors) continue;
+            ++d.pad_errors;
+            const uint8_t halts[2][2] = {{d.pad_in_dci, d.pad_halt_in}, {d.pad_out_dci, d.pad_halt_out}};
+            for (int k = 0; k < 2; ++k) {
+                const uint8_t dci = halts[k][0], code = halts[k][1];
+                if (!code) continue;
+                if (d.pad_errors <= 3 || d.pad_errors == kHidMaxErrors)
+                    ops_->log(Line().s("xhci: slot ").u(d.slot).s(" gamepad: ").s(k ? "OUT" : "IN").s(" endpoint error (code ")
+                                  .u(code).s(d.pad_errors >= kHidMaxErrors ? "), giving up" : "), endpoint reset").str());
+                Ring& ring = k ? d.pad_out_ring : d.pad_ring;
+                command(0, 0, trb_type(kTrbResetEndpoint) | (uint32_t(dci) << 16) | (uint32_t(d.slot) << 24), nullptr);
+                command(ring.dequeue_for_reset(), 0, trb_type(kTrbSetTrDequeue) | (uint32_t(dci) << 16) | (uint32_t(d.slot) << 24), nullptr);
+                if (code == kCcStall) control(d, 0x02, 1, 0, uint16_t((k ? 0 : 0x80) | dci / 2), 0, 0);  // CLEAR_FEATURE(ENDPOINT_HALT)
+            }
+            if (d.pad_halt_in)
+                for (uint32_t k = 0; k < kPadTrbs; ++k) queue_pad(d, k);
+            d.pad_halt_in = d.pad_halt_out = 0;
+        }
+    }
+
     // Queues one interrupt-IN transfer into the next report buffer. Transfers
     // finish in order and each is queued again only after its report is read,
     // so a buffer is never in use twice. (The ring's 255 TRBs are not a
@@ -1989,9 +2129,15 @@ private:
             if (buf < d->pad_bufs.phys || buf >= d->pad_bufs.phys + kPadTrbs * kPadBuf) return;
             const uint32_t slot = uint32_t((buf - d->pad_bufs.phys) / kPadBuf);
             pad_received(*d, slot, code, d2 & 0xFFFFFF);
-            queue_pad(*d, slot);
+            if (code == kCcSuccess || code == kCcShortPacket) queue_pad(*d, slot);
+            else if (!d->pad_halt_in) d->pad_halt_in = uint8_t(code);  // the endpoint halted; poll() restarts it
         } else if (d->pad != PadKind::None && ep == d->pad_out_dci) {
-            // The player LED command went out.
+            // The player LED command (or a Switch Pro set-up command) went out.
+            if (code != kCcSuccess && code != kCcShortPacket) {
+                if (d->pad == PadKind::Switch)
+                    ops_->log(Line().s("xhci: slot ").u(d->slot).s(" Pro Controller: command not sent (code ").u(code).s(")").str());
+                if (!d->pad_halt_out) d->pad_halt_out = uint8_t(code);
+            }
         } else if (ep == d->dci) {
             if (code == kCcSuccess || code == kCcShortPacket) {
                 const uint64_t buf = d->intr.buffer_of(ptr);
@@ -2159,8 +2305,8 @@ private:
     HidKind hid_kind_ = HidKind::None;
     uint16_t hid_mps_ = 8;
     struct PadCandidate {
-        uint8_t iface = 0, dci = 0, interval = 0;
-        uint16_t mps = 0, desc_len = 0;
+        uint8_t iface = 0, dci = 0, interval = 0, out_dci = 0, out_interval = 0;
+        uint16_t mps = 0, desc_len = 0, out_mps = 0;
     };
     PadCandidate candidate_[kPadCandidates]{};
     int candidates_ = 0;
