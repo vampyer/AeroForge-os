@@ -317,6 +317,8 @@ struct Device {
     Ring pad_ring{}, pad_out_ring{};
     dhi_dma pad_bufs{};                    // kPadTrbs reports, an OUT packet, then the report descriptor
     bool pad_switch_ready = false;         // Switch Pro: handshake answered, full reports asked for
+    uint8_t pad_switch_tries = 0;          // Switch Pro: handshakes sent
+    uint8_t pad_switch_seen = 0;           // Switch Pro: reports logged so far (the first few are)
 };
 
 // HID usage (keyboard page) to ASCII, unshifted and shifted, for 0x04..0x38.
@@ -373,6 +375,7 @@ public:
         service_ports();
         recover_hid();
         if (++polls_ % 32 == 0) poll_hubs();
+        if (polls_ % 256 == 0) retry_switch();
         int32_t n = 0;
         while (n < max && q_tail_ != q_head_) {
             out[n++] = queue_[q_tail_];
@@ -1377,6 +1380,7 @@ private:
                     d.pad_out_mps = c.out_mps;
                     d.pad_out_interval = c.out_interval;
                     d.pad_switch_ready = false;
+                    d.pad_switch_tries = d.pad_switch_seen = 0;
                     for (uint32_t k = 0; k < sizeof(kXInputReportDesc); ++k) desc[k] = kXInputReportDesc[k];
                     d.pad_desc_len = sizeof(kXInputReportDesc);
                 }
@@ -1403,12 +1407,24 @@ private:
             d.pad_out_ring.push(uint32_t(phys), uint32_t(phys >> 32), 3, trb_type(kTrbNormal) | kTrbIoc);
             ring_doorbell(d.slot, d.pad_out_dci);
         }
-        if (d.pad == PadKind::Switch) {
-            const uint8_t handshake[2] = {0x80, 0x02};
-            pad_send(d, 0, handshake, 2);
-        }
+        if (d.pad == PadKind::Switch) switch_handshake(d);
         d.pad_index = int8_t(pad_count_++);
         return true;
+    }
+
+    // Switch Pro: asks for the USB handshake (80 02). poll() sends it again
+    // now and then until the pad answers, in case it was not ready.
+    void switch_handshake(Device& d) {
+        const uint8_t handshake[2] = {0x80, 0x02};
+        ++d.pad_switch_tries;
+        ops_->log(Line().s("xhci: slot ").u(d.slot).s(" Pro Controller: handshake sent (try ").u(d.pad_switch_tries).s(")").str());
+        pad_send(d, 0, handshake, 2);
+    }
+    void retry_switch() {
+        for (int i = 0; i < count_; ++i) {
+            Device& d = devices_[i];
+            if (d.alive && d.pad == PadKind::Switch && !d.pad_switch_ready && d.pad_switch_tries < 8) switch_handshake(d);
+        }
     }
 
     // Sends `n` bytes to the pad's OUT endpoint from slot `at` (0 or 1, 32
@@ -1429,10 +1445,19 @@ private:
     }
 
     void pad_received(Device& d, uint32_t slot, uint32_t code, uint32_t left) {
+        if (d.pad == PadKind::Switch && code != kCcSuccess && code != kCcShortPacket && d.pad_switch_seen < 8) {
+            ++d.pad_switch_seen;
+            ops_->log(Line().s("xhci: slot ").u(d.slot).s(" Pro Controller: transfer error (code ").u(code).s(")").str());
+        }
         if (code != kCcSuccess && code != kCcShortPacket) return;
         const uint32_t size = d.pad_mps < kPadBuf ? d.pad_mps : kPadBuf;
         uint32_t len = left < size ? size - left : 0;
         const auto* src = static_cast<const uint8_t*>(d.pad_bufs.virt) + slot * kPadBuf;
+        if (d.pad == PadKind::Switch && d.pad_switch_seen < 8 && len >= 2) {
+            ++d.pad_switch_seen;
+            ops_->log(Line().s("xhci: slot ").u(d.slot).s(" Pro Controller: report ").x4(uint16_t(src[0] << 8 | src[1]))
+                          .s(", ").u(len).s(" bytes").str());
+        }
         uint8_t r[kPadBuf];
         if (d.pad == PadKind::XInput) {
             // Input report: 00 14, buttons (2 bytes), LT, RT, LX LY RX RY (signed 16-bit, up positive).
@@ -2071,7 +2096,9 @@ private:
             pad_received(*d, slot, code, d2 & 0xFFFFFF);
             queue_pad(*d, slot);
         } else if (d->pad != PadKind::None && ep == d->pad_out_dci) {
-            // The player LED command went out.
+            // The player LED command (or a Switch Pro set-up command) went out.
+            if (d->pad == PadKind::Switch && code != kCcSuccess && code != kCcShortPacket)
+                ops_->log(Line().s("xhci: slot ").u(d->slot).s(" Pro Controller: command not sent (code ").u(code).s(")").str());
         } else if (ep == d->dci) {
             if (code == kCcSuccess || code == kCcShortPacket) {
                 const uint64_t buf = d->intr.buffer_of(ptr);
