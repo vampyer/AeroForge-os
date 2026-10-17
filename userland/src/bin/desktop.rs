@@ -1834,7 +1834,7 @@ impl Desktop {
         };
         match win.kind {
             Kind::Welcome => {
-                say(c, "Welcome to AeroForge OS.", rgb(0, 51, 153));
+                say(c, "Welcome to RetroForgeDX.", rgb(0, 51, 153));
                 say(c, "", 0);
                 say(c, "Drag a window by its title bar.", 0x202020);
                 say(c, "Click a window to bring it forward.", 0x202020);
@@ -2127,7 +2127,7 @@ impl Desktop {
         c.text(rx, m.y + 16 * s, &self.clock.0, 0xFFFFFF, Font::Large);
         let g = grow(s);
         c.text(rx, m.y + 56 * s + g, &self.clock.1, rgb(210, 230, 250), Font::Normal);
-        c.text(rx, m.y + 84 * s + 2 * g, "AeroForge", rgb(210, 230, 250), Font::Normal);
+        c.text(rx, m.y + 84 * s + 2 * g, "RetroForgeDX", rgb(210, 230, 250), Font::Normal);
         // Mouse speed: - and + buttons with ten bars between them.
         c.text(rx, m.y + 128 * s + 3 * g, &format!("Mouse speed {}", self.mouse_speed), 0xFFFFFF, Font::Normal);
         for faster in [false, true] {

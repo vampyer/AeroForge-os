@@ -208,7 +208,7 @@ pub fn draw_scene(fb: &mut Fb) -> Layout {
     fb.blend(0, taskbar_y, w, 1, 0xFFFFFF, 90);
     fb.disc(28, (taskbar_y + TASKBAR_H / 2) as isize, 16, rgb(0x7f, 0xd8, 0xff), rgb(0x0b, 0x5c, 0x9e));
     fb.blend(18, taskbar_y + 6, 20, 7, 0xFFFFFF, 90);
-    fb.text(56, taskbar_y + 12, "AeroForge OS", 0xFFFFFF, 2, 2);
+    fb.text(56, taskbar_y + 12, "RetroForgeDX", 0xFFFFFF, 2, 2);
 
     let pad = 10;
     Layout {

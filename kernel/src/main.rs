@@ -1,4 +1,4 @@
-//! AeroKernel: the AeroForge OS kernel core.
+//! AeroKernel: the RetroForgeDX kernel core.
 
 #![no_std]
 #![no_main]
@@ -122,7 +122,7 @@ extern "C" fn kmain() -> ! {
         }
     }
 
-    console::print_colored(console::CYAN, format_args!("AeroForge OS {}", VERSION));
+    console::print_colored(console::CYAN, format_args!("RetroForgeDX {}", VERSION));
     kprintln!("  |  AeroKernel (Rust core, C++ drivers)");
     if let Some(info) = BOOTLOADER_INFO_REQ.response() {
         console::print_colored(console::DIM, format_args!(
